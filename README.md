@@ -39,7 +39,7 @@ To set up the environment for Draco AI V1, please install the following dependen
 ```bash
 pip install numpy
 pip install torch torchvision torchaudio
-
+```
 🤝 Community & Contribution
 We believe in the power of open-source and community-driven AI. Draco AI V1 is a product of Draco Studio (Vietnam). We welcome all developers, researchers, and AI enthusiasts to contribute!
 
