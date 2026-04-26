@@ -322,15 +322,21 @@ class MoELayer:
         self.experts     = [ExpertFFN(d_model, d_ff) for _ in range(n_experts)]
         self.shared      = ExpertFFN(d_model, d_ff)
         self.norm_w      = np.ones(d_model, dtype=np.float32)
-    def forward(self, x: np.ndarray, add_noise: bool = True) -> Tuple[np.ndarray, Dict]:
+    def forward(self, x: np.ndarray,
+                add_noise: bool = True,
+                intent_bias: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
         """
         x: (batch=1, seq, d_model)
         Returns: (output, aux_losses_dict)
         FIX MOE-NOISE: Gumbel noise injected when add_noise=True (inference).
+        intent_bias: optional (n_experts,) array — engine bias added to router logits.
         """
         bsz, seq, d = x.shape
         x_flat = x.reshape(seq, d)
         logits = x_flat @ self.W_router + self.router_bias
+        # Kết nối Engine → Router: cộng intent_bias (đã nhân với INTENT_BIAS_ALPHA ở ngoài)
+        if intent_bias is not None:
+            logits = logits + intent_bias.reshape(1, -1)
         # FIX MOE-NOISE
         if add_noise and seq > 0:
             noise = np.random.gumbel(size=logits.shape).astype(np.float32) * MOE_NOISE_SCALE
@@ -418,11 +424,14 @@ class TransformerBlock:
         self.norm1     = np.ones(d_model, dtype=np.float32)
         self.norm2     = np.ones(d_model, dtype=np.float32)
     def forward(self, x: np.ndarray, cache: KVCache,
-                add_noise: bool = True) -> Tuple[np.ndarray, Dict]:
+                add_noise: bool = True,
+                intent_bias: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
         h     = rms_norm(x, self.norm1)
         h     = self.attn.forward(h, cache, self.layer_idx)
         x     = x + h
-        h, aux = self.moe.forward(rms_norm(x, self.norm2), add_noise=add_noise)
+        h, aux = self.moe.forward(rms_norm(x, self.norm2),
+                                  add_noise=add_noise,
+                                  intent_bias=intent_bias)
         x = x + h
         return x, aux
 # ─────────────────────────────────────────────────────────────────────
@@ -468,7 +477,8 @@ class DracoTransformerV1:
     # ── Forward pass ─────────────────────────────────────────────────
     def forward(self, token_ids: List[int], cache: KVCache,
                 intent_boost: Optional[np.ndarray] = None,
-                add_noise: bool = True
+                add_noise: bool = True,
+                intent_bias: Optional[np.ndarray] = None      # ← tham số mới
                 ) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
         """
         Returns: (l1, l2, aux_list)
@@ -481,7 +491,9 @@ class DracoTransformerV1:
         x   = self.embedding[ids][None]
         aux_list = []
         for block in self.blocks:
-            x, aux = block.forward(x, cache, add_noise=add_noise)
+            x, aux = block.forward(x, cache,
+                                   add_noise=add_noise,
+                                   intent_bias=intent_bias)
             aux_list.append(aux)
         x  = rms_norm(x, self.norm_f)
         l1 = x @ self.lm_head.T
@@ -599,6 +611,7 @@ class DracoTransformerV1:
         debug:           bool  = False,
         stream_cb:       Optional[Callable[[int, float], None]] = None,
         intent_boost:    Optional[np.ndarray] = None,
+        intent_bias:     Optional[np.ndarray] = None,   # ← tham số mới
     ) -> List[int]:
         """
         Generate up to max_new_tokens tokens from prompt_ids.
@@ -639,7 +652,10 @@ class DracoTransformerV1:
         # Prefill
         cur = ids
         while n_generated < max_new_tokens:
-            l1, l2, _ = self.forward(cur, cache, intent_boost, add_noise=True)
+            l1, l2, _ = self.forward(cur, cache,
+                                      intent_boost=intent_boost,
+                                      add_noise=True,
+                                      intent_bias=intent_bias)
             last_logits = l1[0, -1].copy().astype(np.float64)
             if debug:
                 self._sanity_checks(last_logits, f"step={n_generated}")
@@ -698,7 +714,10 @@ class DracoTransformerV1:
                     # This mirrors exactly what the normal sampling path does:
                     # forward(nid) → get fresh l2_new → try_speculative(l2_new) for T+3.
                     l1_new, l2_new, _ = self.forward(
-                        [nid], cache, intent_boost, add_noise=True
+                        [nid], cache,
+                        intent_boost=intent_boost,
+                        add_noise=True,
+                        intent_bias=intent_bias
                     )
                     last_logits_new = l1_new[0, -1].copy().astype(np.float64)
                     if debug:
@@ -761,7 +780,10 @@ class DracoTransformerV1:
                         stream_cb(verify_id, conf)
                     if verify_id == eos_id:
                         # Forward EOS so cache is consistent, then terminate
-                        self.forward([verify_id], cache, intent_boost, add_noise=True)
+                        self.forward([verify_id], cache,
+                                     intent_boost=intent_boost,
+                                     add_noise=True,
+                                     intent_bias=intent_bias)
                         spec_pending    = None
                         spec_snap       = None
                         pre_spec_logits = None

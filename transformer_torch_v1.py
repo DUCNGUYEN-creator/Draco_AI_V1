@@ -315,14 +315,21 @@ if HAS_TORCH:
             self.shared      = ExpertFFNTorch(d_model, d_ff)
             self.norm        = nn.RMSNorm(d_model)
 
-        def forward(self, x, add_noise: bool = False):
+        def forward(self, x,
+                    add_noise: bool = False,
+                    intent_bias: Optional[torch.Tensor] = None):
             """
             add_noise=True for inference only (mirrors NumPy MoELayer).
             Training uses aux_loss for expert diversity.
+            intent_bias: optional (n_experts,) tensor — engine bias added to router logits.
             """
             bsz, seq, d = x.shape
             x_flat  = x.reshape(seq, d)
             logits  = self.W_router(x_flat) + self.router_bias
+
+            # Kết nối Engine → Router: cộng intent_bias (đã nhân với INTENT_BIAS_ALPHA ở ngoài)
+            if intent_bias is not None:
+                logits = logits + intent_bias.reshape(1, -1)
 
             # FIX MOE-NOISE-TRAIN: Gumbel noise at inference time only
             if add_noise and not self.training:
@@ -411,10 +418,14 @@ if HAS_TORCH:
             self.norm1 = nn.RMSNorm(d_model)
             self.norm2 = nn.RMSNorm(d_model)
 
-        def forward(self, x, cache, add_noise: bool = False):
+        def forward(self, x, cache,
+                    add_noise: bool = False,
+                    intent_bias: Optional[torch.Tensor] = None):
             h = self.attn(self.norm1(x), cache, self.layer_idx)
             x = x + h
-            h, aux = self.moe(self.norm2(x), add_noise=add_noise)
+            h, aux = self.moe(self.norm2(x),
+                              add_noise=add_noise,
+                              intent_bias=intent_bias)
             x = x + h
             return x, aux
 
@@ -465,7 +476,8 @@ if HAS_TORCH:
         def forward(self, token_ids: "torch.Tensor",
                     cache: Optional["KVCacheTorch"] = None,
                     return_aux: bool = True,
-                    add_noise: bool = False):
+                    add_noise: bool = False,
+                    intent_bias: Optional[torch.Tensor] = None):
             """
             token_ids: (batch, seq)
             Returns: (l1, l2, aux_total)
@@ -474,6 +486,7 @@ if HAS_TORCH:
               aux_total: scalar tensor — sum of MoE load-balance losses
 
             FIX LOGITS-STABILITY: l1/l2 clamped to [-100, 100].
+            intent_bias: optional (n_experts,) tensor — engine bias added to router logits.
             """
             x = self.embedding(token_ids)
 
@@ -485,7 +498,9 @@ if HAS_TORCH:
 
             aux_total = torch.tensor(0.0, device=x.device)
             for block in self.blocks:
-                x, aux = block(x, cache, add_noise=add_noise)
+                x, aux = block(x, cache,
+                               add_noise=add_noise,
+                               intent_bias=intent_bias)
                 if return_aux:
                     aux_total = aux_total + aux
 
@@ -819,4 +834,3 @@ if HAS_TORCH:
 #
 #     if step % 1000 == 0:
 #         model.save_checkpoint("checkpoints/", step=step)
-
