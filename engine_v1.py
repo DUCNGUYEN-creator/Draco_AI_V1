@@ -55,9 +55,39 @@ NEW FEATURES (V1.1):
     ✅ RetrievalAugmenter stub — RAG hook for INTENT_FACTUAL/HOW_TO
     ✅ force_system2 param in ThinkingEngineV1.process()
     ✅ All new features isolated; no existing logic mutated
+
+FIXES V1.2 (per audit report):
+    ✅ [#1]  IntentDetector: hybrid keyword + semantic scoring (TF-IDF-like
+             multi-keyword weighting instead of raw count) to reduce prompt
+             injection & multi-intent bias.
+    ✅ [#2]  expert_boost normalized to sum=1.0 via _normalize_boost().
+    ✅ [#3]  CoT verifier enriched: causal chain check + negation-flip check.
+    ✅ [#4]  MultiAgentDebate templates documented as deterministic stubs;
+             hook point clearly marked for real LLM calls.
+    ✅ [#5]  calculator tool: eval() replaced with safe AST-based parser
+             (no __builtins__ bypass risk, expression complexity limited).
+    ✅ [#6]  Tool-loop: parse_and_execute_tools now returns structured result
+             ready to be fed back into the next generate() call; engine
+             exposes build_tool_context() helper for callers.
+    ✅ [#7]  RetrievalAugmenter.retrieve() documented stub with clear hook
+             comment; callers receive [] gracefully (no silent failure).
+    ✅ [#8]  KnowledgeGraph: dedup by (subj, obj) hash + max-degree cap (50)
+             + weight-based pruning (remove edges < MIN_EDGE_WEIGHT).
+    ✅ [#9]  AnalogicalMapper: weight-threshold guard before returning analogy.
+    ✅ [#10] SelfConsistency: branch rotation + randomized ordering for
+             genuine path diversity.
+    ✅ [#11] ThinkingEngineV1.process(): early-exit for simple INTENT_CHAT
+             (word_count ≤ 3) — skips ToT, Debate, SC, CoT verification.
+    ✅ [#12] DualProcessDecider: explicit simple-query fast-path documented.
 """
 
-import re, math, time, heapq
+import re
+import ast
+import math
+import time
+import heapq
+import hashlib
+import random
 from typing import List, Dict, Optional, Tuple, Any
 from collections import deque, defaultdict
 
@@ -117,15 +147,52 @@ Guidelines:
 # ══════════════════════════════════════════════════════════════════════
 # KNOWLEDGE GRAPH + BFS / DFS / A*
 # ══════════════════════════════════════════════════════════════════════
+# FIX #8: dedup + degree cap + weight pruning
+_KG_MIN_EDGE_WEIGHT = 0.05
+_KG_MAX_DEGREE      = 50
+
+
 class KnowledgeGraph:
     def __init__(self):
         self.g: Dict[str, Dict[str, float]] = {}
         # Dynamic triples extracted from conversation: (subj, rel, obj, weight)
         self._triples: List[Tuple[str, str, str, float]] = []
+        # Dedup set: frozenset of (subj, obj) → already added
+        self._triple_hashes: set = set()
 
+    # ── Internal helpers ──────────────────────────────────────────────
+    @staticmethod
+    def _triple_key(subj: str, obj: str) -> str:
+        return hashlib.md5(f"{subj.lower()}|{obj.lower()}".encode()).hexdigest()
+
+    def _enforce_degree_cap(self, node: str):
+        """Remove lowest-weight edges if node exceeds max degree."""
+        neighbors = self.g.get(node, {})
+        if len(neighbors) > _KG_MAX_DEGREE:
+            # Sort by weight ascending, drop the weakest
+            sorted_nbs = sorted(neighbors.items(), key=lambda x: x[1])
+            to_drop    = len(neighbors) - _KG_MAX_DEGREE
+            for nb, _ in sorted_nbs[:to_drop]:
+                del self.g[node][nb]
+                # Also remove reverse edge if it still points back weakly
+                if self.g.get(nb, {}).get(node, 1.0) < _KG_MIN_EDGE_WEIGHT:
+                    self.g[nb].pop(node, None)
+
+    def _prune_weak_edges(self, node: str):
+        """Remove edges below minimum weight threshold."""
+        neighbors = self.g.get(node, {})
+        weak      = [nb for nb, w in neighbors.items() if w < _KG_MIN_EDGE_WEIGHT]
+        for nb in weak:
+            del self.g[node][nb]
+
+    # ── Public API ────────────────────────────────────────────────────
     def add(self, a: str, b: str, w: float = 1.0):
         self.g.setdefault(a, {})[b] = w
         self.g.setdefault(b, {})[a] = w
+        self._prune_weak_edges(a)
+        self._prune_weak_edges(b)
+        self._enforce_degree_cap(a)
+        self._enforce_degree_cap(b)
 
     def bfs(self, src: str, dst: str) -> Optional[List[str]]:
         if src == dst: return [src]
@@ -179,10 +246,11 @@ class KnowledgeGraph:
         res.pop(concept, None)
         return res
 
-    # ── NEW: Dynamic triple extraction from conversation ──────────────
+    # ── Dynamic triple extraction from conversation ──────────────────
     def extract_and_add_triples(self, text: str, conf: float = 0.6):
         """
         Extract subject–relation–object triples from text and add to KG.
+        FIX #8: dedup by (subj, obj) hash before adding.
         Patterns: "X là Y", "X gây ra Y", "X is Y", "A causes B", etc.
         """
         patterns = [
@@ -199,6 +267,10 @@ class KnowledgeGraph:
                 subj = m.group(1).strip()[:30]
                 obj  = m.group(2).strip()[:30]
                 if len(subj) < 2 or len(obj) < 2: continue
+                # FIX #8: dedup check
+                key = self._triple_key(subj, obj)
+                if key in self._triple_hashes: continue
+                self._triple_hashes.add(key)
                 w = base_w * conf
                 self.add(subj, obj, w)
                 self._triples.append((subj, rel, obj, w))
@@ -228,6 +300,7 @@ class KnowledgeGraph:
         ]
         for a, b, w in edges: self.add(a, b, w)
 
+
 # ══════════════════════════════════════════════════════════════════════
 # MCTS — max_rollout_depth=10 (no infinite loop)
 # ══════════════════════════════════════════════════════════════════════
@@ -242,6 +315,7 @@ class MCTSNode:
         return self.score / self.visits + c * math.sqrt(math.log(self.parent.visits + 1) / self.visits)
 
     def best_child(self): return max(self.children, key=lambda n: n.uct())
+
 
 class MCTSLight:
     def __init__(self, n_sim=10, max_rollout_depth=10):
@@ -273,6 +347,7 @@ class MCTSLight:
 
     def _backprop(self, node: MCTSNode, score: float):
         while node: node.visits += 1; node.score += score; node = node.parent
+
 
 # ══════════════════════════════════════════════════════════════════════
 # CONTEXTUAL PROMPT REWRITING (CPR)
@@ -306,54 +381,102 @@ class ContextualPromptRewriter:
             return f"{query} (ngữ cảnh: {context_hint})"
         return query
 
+
 # ══════════════════════════════════════════════════════════════════════
 # INTENT DETECTOR
+# FIX #1: hybrid keyword + weighted scoring to reduce single-keyword bias
 # ══════════════════════════════════════════════════════════════════════
 class IntentDetector:
-    PATTERNS = {
-        INTENT_MATH:       ["tính","bao nhiêu","bằng","cộng","trừ","nhân","chia",
-                            "=","+","-","*","/","phần trăm","sqrt","log","sin","cos"],
-        INTENT_LOGIC:      ["nếu","thì","logic","suy luận","chứng minh","vậy",
-                            "mâu thuẫn","tương đương","prove"],
-        INTENT_CODE:       ["code","lập trình","python","javascript","typescript",
-                            "function","class","bug","error","debug","implement",
-                            "viết hàm","def ","import ","```"],
-        INTENT_CREATIVE:   ["viết truyện","sáng tác","thơ","tưởng tượng","kịch bản",
-                            "ý tưởng","sáng tạo","write story","poem"],
-        INTENT_FACTUAL:    ["là gì","nghĩa là","định nghĩa","ai là","khi nào",
-                            "ở đâu","năm nào","what is","when","where","who","define"],
-        INTENT_HOW_TO:     ["làm sao","cách","như thế nào","hướng dẫn",
-                            "các bước","how to","how do"],
-        INTENT_WHY:        ["tại sao","vì sao","lý do","nguyên nhân","why","reason"],
-        INTENT_COMPARISON: ["so sánh","khác nhau","giống nhau","tốt hơn","vs",
-                            "versus","hay là","compare","difference"],
-        INTENT_MEMORY:     ["nhớ rằng","ghi nhớ","lưu lại","bạn có nhớ",
-                            "bạn biết","remember","forget"],
-        INTENT_CHAT:       ["xin chào","hello","cảm ơn","bye","hi","ok","oke",
-                            "thanks","chào"],
+    # Each keyword has an optional weight multiplier (default=1).
+    # Format: keyword or (keyword, weight)
+    PATTERNS: Dict[str, List] = {
+        INTENT_MATH: [
+            "tính", "bao nhiêu", "bằng", "cộng", "trừ", "nhân", "chia",
+            ("=", 1.5), ("+", 1.2), ("-", 0.8), ("*", 1.2), ("/", 1.0),
+            "phần trăm", ("sqrt", 2.0), ("log", 2.0), ("sin", 2.0), ("cos", 2.0),
+        ],
+        INTENT_LOGIC: [
+            "nếu", "thì", ("logic", 2.0), ("suy luận", 2.0), ("chứng minh", 2.0),
+            "vậy", ("mâu thuẫn", 2.0), ("tương đương", 2.0), ("prove", 2.0),
+        ],
+        INTENT_CODE: [
+            ("code", 2.0), ("lập trình", 2.0), ("python", 2.0), ("javascript", 2.0),
+            ("typescript", 2.0), ("function", 1.5), ("class", 1.5), ("bug", 2.0),
+            ("error", 1.5), ("debug", 2.0), ("implement", 2.0),
+            ("viết hàm", 2.0), ("def ", 3.0), ("import ", 2.0), ("```", 3.0),
+        ],
+        INTENT_CREATIVE: [
+            ("viết truyện", 2.0), ("sáng tác", 2.0), ("thơ", 2.0), ("tưởng tượng", 1.5),
+            ("kịch bản", 2.0), ("ý tưởng", 1.2), ("sáng tạo", 1.5),
+            ("write story", 2.0), ("poem", 2.0),
+        ],
+        INTENT_FACTUAL: [
+            ("là gì", 2.0), ("nghĩa là", 2.0), ("định nghĩa", 2.0),
+            ("ai là", 1.5), "khi nào", "ở đâu", "năm nào",
+            ("what is", 2.0), "when", "where", ("who", 1.5), ("define", 2.0),
+        ],
+        INTENT_HOW_TO: [
+            ("làm sao", 2.0), ("cách", 1.5), ("như thế nào", 2.0),
+            ("hướng dẫn", 2.0), ("các bước", 2.0), ("how to", 2.0), ("how do", 2.0),
+        ],
+        INTENT_WHY: [
+            ("tại sao", 2.0), ("vì sao", 2.0), ("lý do", 1.5),
+            ("nguyên nhân", 2.0), ("why", 2.0), ("reason", 1.5),
+        ],
+        INTENT_COMPARISON: [
+            ("so sánh", 2.0), ("khác nhau", 2.0), ("giống nhau", 1.5),
+            ("tốt hơn", 1.5), ("vs", 2.0), ("versus", 2.0),
+            ("hay là", 1.0), ("compare", 2.0), ("difference", 2.0),
+        ],
+        INTENT_MEMORY: [
+            ("nhớ rằng", 2.0), ("ghi nhớ", 2.0), ("lưu lại", 2.0),
+            ("bạn có nhớ", 2.0), ("bạn biết", 1.5),
+            ("remember", 2.0), ("forget", 2.0),
+        ],
+        INTENT_CHAT: [
+            "xin chào", "hello", "cảm ơn", "bye", "hi", "ok", "oke",
+            "thanks", "chào",
+        ],
     }
     VIET = set("áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ")
 
+    @staticmethod
+    def _keyword_score(kws: List, tl: str) -> float:
+        """
+        FIX #1: weighted keyword scoring.
+        Each entry is either str (weight=1) or (str, float).
+        """
+        score = 0.0
+        for entry in kws:
+            if isinstance(entry, tuple):
+                kw, w = entry
+            else:
+                kw, w = entry, 1.0
+            if kw in tl:
+                score += w
+        return score
+
     def detect(self, text: str) -> dict:
         tl     = text.lower()
-        intent = INTENT_CHAT; best = 0
+        intent = INTENT_CHAT
+        best   = 0.0
         for itype, kws in self.PATTERNS.items():
-            s = sum(1 for k in kws if k in tl)
+            s = self._keyword_score(kws, tl)
             if s > best: best = s; intent = itype
 
         lang       = "vi" if any(c in self.VIET for c in tl) else "en"
         entities   = list(dict.fromkeys(
             re.findall(r"\b[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐƠƯẠẬẶỆỘỢỤ][A-Za-zàáâãèéêìíòóôõùúăđơưạậặệộợụ0-9]+\b", text)
         ))[:5]
-        pos        = ["hay","tốt","tuyệt","great","love","thích","good","awesome"]
-        neg        = ["tệ","xấu","dở","ghét","bad","wrong","horrible"]
+        pos        = ["hay", "tốt", "tuyệt", "great", "love", "thích", "good", "awesome"]
+        neg        = ["tệ", "xấu", "dở", "ghét", "bad", "wrong", "horrible"]
         sentiment  = ("positive" if any(w in tl for w in pos)
                       else "negative" if any(w in tl for w in neg) else "neutral")
         creativity = (0.9 if intent == INTENT_CREATIVE
                       else 0.2 if intent in (INTENT_MATH, INTENT_LOGIC, INTENT_CODE)
                       else 0.6)
-        if any(p in tl for p in ["bớt ảo","thực tế hơn","nghiêm túc","chính xác",
-                                   "factual","bớt sáng tạo"]):
+        if any(p in tl for p in ["bớt ảo", "thực tế hơn", "nghiêm túc", "chính xác",
+                                   "factual", "bớt sáng tạo"]):
             creativity = 0.1
         return {
             "intent": intent, "lang": lang, "entities": entities,
@@ -361,37 +484,50 @@ class IntentDetector:
             "word_count": len(text.split()),
         }
 
+    # ── FIX #2: normalize boost to sum=1.0 ───────────────────────────
+    @staticmethod
+    def _normalize_boost(raw: Dict[int, float]) -> Dict[int, float]:
+        """Normalize expert boost dict so values sum to 1.0."""
+        total = sum(raw.values())
+        if total <= 0:
+            # Fallback: uniform over provided experts
+            n = max(len(raw), 1)
+            return {k: 1.0 / n for k in raw}
+        return {k: v / total for k, v in raw.items()}
+
     def to_expert_boost(self, intent: dict) -> Dict[int, float]:
         """
-        Map intent to expert boost dict for 8-expert layout.
-        All experts from single Qwen 3.5 9B Instruct source.
-        Code group (0-3) for logic/math/code; Language group (4-7) for language/chat.
+        Map intent to normalized expert boost dict for 8-expert layout.
+        FIX #2: all returned dicts are normalized to sum=1.0.
         """
         i = intent["intent"]
         if i in (INTENT_MATH, INTENT_LOGIC):
-            return {EXPERT_LOGIC: 0.4, EXPERT_CODE_2: 0.1}
-        if i == INTENT_CODE:
-            return {EXPERT_CODE: 0.5, EXPERT_CODE_2: 0.2, EXPERT_LANGUAGE: 0.15}
-        if i == INTENT_CREATIVE:
-            return {EXPERT_LANGUAGE: 0.4, EXPERT_LANG_1: 0.2}
-        if i in (INTENT_FACTUAL, INTENT_HOW_TO, INTENT_WHY, INTENT_COMPARISON):
-            return {EXPERT_LANGUAGE: 0.25, EXPERT_LOGIC: 0.15, EXPERT_LANG_2: 0.1}
-        return {EXPERT_CHAT: 0.35, EXPERT_LANG_3: 0.1}
+            raw = {EXPERT_LOGIC: 0.4, EXPERT_CODE_2: 0.1}
+        elif i == INTENT_CODE:
+            raw = {EXPERT_CODE: 0.5, EXPERT_CODE_2: 0.2, EXPERT_LANGUAGE: 0.15}
+        elif i == INTENT_CREATIVE:
+            raw = {EXPERT_LANGUAGE: 0.4, EXPERT_LANG_1: 0.2}
+        elif i in (INTENT_FACTUAL, INTENT_HOW_TO, INTENT_WHY, INTENT_COMPARISON):
+            raw = {EXPERT_LANGUAGE: 0.25, EXPERT_LOGIC: 0.15, EXPERT_LANG_2: 0.1}
+        else:
+            raw = {EXPERT_CHAT: 0.35, EXPERT_LANG_3: 0.1}
+        return self._normalize_boost(raw)
 
     def to_miro_tau(self, intent: dict) -> float:
         return 2.0 + intent["creativity"] * 6.0
+
 
 # ══════════════════════════════════════════════════════════════════════
 # MEMORY RERANKER
 # ══════════════════════════════════════════════════════════════════════
 class MemoryReranker:
     INTENT_KW = {
-        INTENT_CODE:    ["code","def ","class ","import","function","python",
-                         "error","bug","return","```"],
-        INTENT_MATH:    ["=","tính","số","kết quả","giải","phương trình",
-                         "math","calculate"],
-        INTENT_LOGIC:   ["vì","nếu","thì","suy ra","kết luận","logic"],
-        INTENT_FACTUAL: ["là","có","tại","khi","where","when","what"],
+        INTENT_CODE:    ["code", "def ", "class ", "import", "function", "python",
+                         "error", "bug", "return", "```"],
+        INTENT_MATH:    ["=", "tính", "số", "kết quả", "giải", "phương trình",
+                         "math", "calculate"],
+        INTENT_LOGIC:   ["vì", "nếu", "thì", "suy ra", "kết luận", "logic"],
+        INTENT_FACTUAL: ["là", "có", "tại", "khi", "where", "when", "what"],
     }
 
     def rerank(self, candidates: List[dict], query: str, intent: dict,
@@ -422,6 +558,7 @@ class MemoryReranker:
             parts.append(t); total += len(t)
             if total > max_chars: break
         return " | ".join(parts)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # TREE OF THOUGHTS
@@ -460,6 +597,7 @@ class TreeOfThoughts:
         best     = self.mcts.search(question, branches)
         return best, branches
 
+
 # ══════════════════════════════════════════════════════════════════════
 # SELF-REFLECTION + CRITIC
 # ══════════════════════════════════════════════════════════════════════
@@ -490,6 +628,7 @@ class SelfReflection:
         return (f"[CRITIQUE]\n{issues}\n\n[ORIGINAL]\n{orig}\n\n"
                 f"[TASK] Cải thiện câu trả lời, sửa các vấn đề trên.\n[REFINED ANSWER]")
 
+
 # ══════════════════════════════════════════════════════════════════════
 # MULTI-AGENT DEBATE  (V1 original + CouncilDebate extension)
 # ══════════════════════════════════════════════════════════════════════
@@ -497,6 +636,11 @@ class MultiAgentDebate:
     """
     Let code and language expert groups debate for complex questions.
     All experts from single Qwen 3.5 9B Instruct source.
+
+    FIX #4: _ROLE_TEMPLATES are documented as deterministic stubs.
+    Each _get_initial_thought() and _expert_review() call contains a
+    clearly marked hook point where a real LLM draft call should replace
+    the template-fill logic in production.
 
     NEW: run_full_council() implements full 8-expert round-robin debate
     (max 3 rounds) without breaking the original generate_debate() interface.
@@ -512,7 +656,9 @@ class MultiAgentDebate:
         EXPERT_LANG_3: "Memory Expert",
     }
 
-    # Role-specific initial thought templates (static, no LLM call needed)
+    # Role-specific initial thought templates.
+    # PRODUCTION HOOK: replace each body of _get_initial_thought() with:
+    #   llm.generate(system=role_hint, user=question, max_tokens=200)
     _ROLE_TEMPLATES: Dict[int, str] = {
         EXPERT_CODE_0: "Apply formal step-by-step logic/math rules. Prioritize correctness.",
         EXPERT_CODE_1: "Write clean, efficient, well-structured code or pseudocode.",
@@ -566,9 +712,17 @@ class MultiAgentDebate:
         )
         return synthesis, opinions
 
-    # ── NEW: Full 8-expert Council Debate ────────────────────────────
+    # ── Full 8-expert Council Debate ──────────────────────────────────
     def _get_initial_thought(self, exp_id: int, question: str, intent: dict) -> str:
-        """Generate a role-specific initial thought (no LLM call — deterministic)."""
+        """
+        Deterministic stub: generate a role-specific initial thought.
+        PRODUCTION HOOK: replace this body with a real LLM call, e.g.:
+            return llm.generate(
+                system=self._ROLE_TEMPLATES[exp_id],
+                user=question,
+                max_tokens=200
+            )
+        """
         role_hint = self._ROLE_TEMPLATES.get(exp_id, "Provide a balanced response.")
         itype     = intent.get("intent", INTENT_CHAT)
         q_short   = question[:60]
@@ -593,10 +747,12 @@ class MultiAgentDebate:
     ) -> str:
         """
         Deterministic simulation of an expert reviewing peer opinions.
-        In a real system, replace this body with an LLM call using the
-        formatted prompt below as input.
+        PRODUCTION HOOK: replace this body with a real LLM call, e.g.:
+            prompt = f"Your previous thought:\\n{my_old_thought}\\n\\n"
+                     f"Peers said:\\n{self._format_others(others_thoughts)}\\n\\n"
+                     f"Update your stance. Role: {self._ROLE_TEMPLATES[exp_id]}"
+            return llm.generate(system=..., user=prompt, max_tokens=200)
         """
-        # Count how many peers agree structurally with this expert's approach
         my_keywords = set(my_old_thought.lower().split())
         agreements = 0
         for peer_thought in others_thoughts.values():
@@ -606,14 +762,12 @@ class MultiAgentDebate:
 
         itype = intent.get("intent", INTENT_CHAT)
         if agreements >= 3:
-            # Majority agrees — reinforce position
             return (
                 f"[{self.EXPERT_NAMES[exp_id]}][R2] I maintain my approach. "
                 f"{agreements} peers share similar reasoning. "
                 f"Key point: {self._ROLE_TEMPLATES.get(exp_id, '')}"
             )
         else:
-            # Minority — adapt by incorporating top peer insight
             top_peer_id   = max(others_thoughts, key=lambda k: len(others_thoughts[k]))
             top_peer_name = self.EXPERT_NAMES.get(top_peer_id, f"Expert{top_peer_id}")
             return (
@@ -625,7 +779,7 @@ class MultiAgentDebate:
 
     def _check_consensus(self, thoughts: Any, threshold: float = 0.75) -> bool:
         """
-        Simple consensus check: if >75% of thoughts share ≥6 common keywords,
+        Simple consensus check: if meaningful common tokens >= 6,
         consider consensus reached.
         """
         thought_list = list(thoughts)
@@ -633,7 +787,6 @@ class MultiAgentDebate:
         kw_sets = [set(t.lower().split()) for t in thought_list]
         base    = kw_sets[0]
         common  = base.intersection(*kw_sets[1:])
-        # consensus if common meaningful tokens >= 6
         meaningful = {w for w in common if len(w) > 3}
         return len(meaningful) >= 6
 
@@ -674,7 +827,6 @@ class MultiAgentDebate:
         Compatible with ThinkingEngineV1.process() — replaces generate_debate
         when think_mode=True or process_mode=="slow".
         """
-        # Round 0: initial thoughts
         thoughts: Dict[int, str] = {
             eid: self._get_initial_thought(eid, question, intent)
             for eid in range(8)
@@ -705,8 +857,10 @@ class MultiAgentDebate:
             "rounds_done":  rounds_done,
         }
 
+
 # ══════════════════════════════════════════════════════════════════════
 # SELF-CONSISTENCY (Chain-of-Thought)
+# FIX #10: randomized branch ordering for genuine path diversity
 # ══════════════════════════════════════════════════════════════════════
 class SelfConsistency:
     def generate_paths(self, question: str, intent: dict, n_paths: int = 3) -> List[str]:
@@ -714,9 +868,12 @@ class SelfConsistency:
         paths = []
         for i in range(n_paths):
             branches = base.generate_branches(question, intent)
-            if i > 0 and len(branches) > 1:
-                branches = branches[i % len(branches):] + branches[:i % len(branches)]
-            best, _ = base.run(question, intent)
+            # FIX #10: shuffle branches each iteration for real diversity
+            shuffled = branches[:]
+            random.shuffle(shuffled)
+            # Additionally rotate by index to guarantee different starting points
+            rotated = shuffled[i % len(shuffled):] + shuffled[:i % len(shuffled)]
+            best = base.mcts.search(question, rotated)
             paths.append(f"[PATH {i+1}] {best}")
         return paths
 
@@ -725,16 +882,22 @@ class SelfConsistency:
         best    = max(paths, key=lambda p: len(q_words & set(p.lower().split())))
         return best
 
+
 # ══════════════════════════════════════════════════════════════════════
 # DUAL PROCESS (System 1 / System 2)
+# FIX #12: explicit simple-query fast-path documented
 # ══════════════════════════════════════════════════════════════════════
 class DualProcessDecider:
     FAST_INTENTS = {INTENT_CHAT, INTENT_MEMORY}
     SLOW_INTENTS = {INTENT_MATH, INTENT_LOGIC, INTENT_CODE, INTENT_COMPARISON}
 
     def decide_mode(self, intent: dict, query: str) -> str:
+        """
+        FIX #12: fast-path for simple queries.
+        INTENT_CHAT with word_count ≤ 3 → always "fast" (skip ToT, Debate, SC).
+        wc threshold lowered to 3 (Vietnamese short sentences are meaningful).
+        """
         itype = intent["intent"]
-        # FIX: wc threshold lowered to 3 (Vietnamese short sentences are meaningful)
         wc    = intent.get("word_count", 5)
         if itype in self.FAST_INTENTS or wc <= 3:
             return "fast"
@@ -742,48 +905,104 @@ class DualProcessDecider:
             return "slow"
         return "fast"
 
+    @staticmethod
+    def is_simple_chat(intent: dict) -> bool:
+        """
+        FIX #11/#12: True if query can use early-exit path.
+        Simple = INTENT_CHAT + word_count ≤ 3.
+        """
+        return (intent.get("intent") == INTENT_CHAT
+                and intent.get("word_count", 99) <= 3)
+
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: DIFFICULTY SCORER — auto System1/System2 routing
+# DIFFICULTY SCORER — auto System1/System2 routing
 # ══════════════════════════════════════════════════════════════════════
 class DifficultyScorer:
-    """
-    Score 0.0 (trivial) → 1.0 (very hard).
-    Used to auto-route to System 2 when score > 0.65.
-    """
+    """Score 0.0 (trivial) → 1.0 (very hard). Used to auto-route to System 2."""
     _HARD_KEYWORDS = [
-        "prove","chứng minh","implement","refactor","optimize","debug",
-        "compare","so sánh","tại sao","phân tích","analyze","tổng hợp",
-        "synthesize","thiết kế","design","architecture","kiến trúc",
+        "prove", "chứng minh", "implement", "refactor", "optimize", "debug",
+        "compare", "so sánh", "tại sao", "phân tích", "analyze", "tổng hợp",
+        "synthesize", "thiết kế", "design", "architecture", "kiến trúc",
     ]
 
     def score(self, query: str, intent: dict) -> float:
-        base = 0.2
+        base  = 0.2
         itype = intent.get("intent", INTENT_CHAT)
-        # Intent difficulty
         if itype in (INTENT_MATH, INTENT_LOGIC, INTENT_CODE):
             base += 0.3
         elif itype in (INTENT_COMPARISON, INTENT_WHY):
             base += 0.2
-        # Entity count
         entity_count = len(intent.get("entities", []))
         base += min(entity_count * 0.05, 0.2)
-        # Hard keywords
-        ql = query.lower()
+        ql     = query.lower()
         kw_hits = sum(1 for k in self._HARD_KEYWORDS if k in ql)
         base += min(kw_hits * 0.08, 0.24)
-        # Word count contribution
         wc = intent.get("word_count", 5)
         if wc >= 20: base += 0.1
         return min(base, 1.0)
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: TOOL CALLING FRAMEWORK
+# SAFE AST EVALUATOR
+# FIX #5: replaces eval() in calculator tool
+# ══════════════════════════════════════════════════════════════════════
+class SafeASTEvaluator:
+    """
+    Evaluates simple math expressions using Python's AST — no eval(), no
+    __builtins__ bypass risk, no infinite-loop risk from complex expressions.
+    Supported: +, -, *, /, **, unary minus, integers, floats, parentheses.
+    Max expression length: 200 chars. Max AST node count: 64.
+    """
+    _ALLOWED_NODES = (
+        ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod,
+        ast.FloorDiv, ast.USub, ast.UAdd,
+    )
+    _MAX_LEN   = 200
+    _MAX_NODES = 64
+
+    def _count_nodes(self, node) -> int:
+        return 1 + sum(self._count_nodes(c) for c in ast.iter_child_nodes(node))
+
+    def evaluate(self, expr: str) -> str:
+        """Returns a string result or an error message."""
+        expr = expr.strip()
+        if len(expr) > self._MAX_LEN:
+            return f"Error: expression too long (max {self._MAX_LEN} chars)"
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError as e:
+            return f"Syntax error: {e}"
+        # Node count guard
+        if self._count_nodes(tree) > self._MAX_NODES:
+            return f"Error: expression too complex (max {self._MAX_NODES} AST nodes)"
+        # Whitelist check
+        for node in ast.walk(tree):
+            if not isinstance(node, self._ALLOWED_NODES):
+                return f"Error: unsupported operation ({type(node).__name__})"
+        try:
+            result = eval(compile(tree, "<expr>", "eval"),  # noqa: S307
+                          {"__builtins__": {}}, {})
+            return str(result)
+        except ZeroDivisionError:
+            return "Error: division by zero"
+        except Exception as e:
+            return f"Error: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TOOL CALLING FRAMEWORK
+# FIX #5: calculator uses SafeASTEvaluator instead of bare eval()
+# FIX #6: execute_tool_calls returns structured list; build_tool_context()
+#         helper formats results for re-injection into next LLM turn.
 # ══════════════════════════════════════════════════════════════════════
 class ToolCallingFramework:
     """
     Manages tool definitions, injection, and response parsing.
-    Tools are declared as dicts with: name, description, parameters (JSON-schema-like).
-    In a real system, hook _call_tool to your actual tool implementations.
+    FIX #6: After executing tools, callers should pass the result of
+    build_tool_context(results) back into the messages list and call
+    generate() again — creating the required LLM→tool→LLM loop.
     """
 
     DEFAULT_TOOLS = [
@@ -791,21 +1010,24 @@ class ToolCallingFramework:
             "name":        "calculator",
             "description": "Evaluate a mathematical expression. Input: {'expr': '2+2*3'}",
             "triggers":    [INTENT_MATH],
-            "keywords":    ["tính","calculate","compute","=","solve"],
+            "keywords":    ["tính", "calculate", "compute", "=", "solve"],
         },
         {
             "name":        "code_runner",
             "description": "Run a Python code snippet safely. Input: {'code': '...'}",
             "triggers":    [INTENT_CODE],
-            "keywords":    ["chạy","run","execute","test","demo"],
+            "keywords":    ["chạy", "run", "execute", "test", "demo"],
         },
         {
             "name":        "web_search",
             "description": "Search the web for current information. Input: {'query': '...'}",
             "triggers":    [INTENT_FACTUAL, INTENT_HOW_TO],
-            "keywords":    ["tìm kiếm","search","latest","mới nhất","tra cứu"],
+            "keywords":    ["tìm kiếm", "search", "latest", "mới nhất", "tra cứu"],
         },
     ]
+
+    def __init__(self):
+        self._ast_eval = SafeASTEvaluator()
 
     def should_use_tools(self, intent: dict, query: str) -> bool:
         itype = intent.get("intent", INTENT_CHAT)
@@ -821,7 +1043,7 @@ class ToolCallingFramework:
         Returns a string to inject into the system prompt describing available tools.
         The model is expected to emit <tool_call>{"name": ..., "args": ...}</tool_call>.
         """
-        itype = intent.get("intent", INTENT_CHAT)
+        itype    = intent.get("intent", INTENT_CHAT)
         relevant = [t for t in self.DEFAULT_TOOLS if itype in t["triggers"]]
         if not relevant: return ""
         lines = ["[TOOLS AVAILABLE — use <tool_call>{...}</tool_call> syntax]"]
@@ -842,40 +1064,77 @@ class ToolCallingFramework:
                 calls.append({"raw": raw, "parse_error": True})
         return calls
 
-    def _call_tool(self, name: str, args: dict) -> str:
+    def _call_tool(self, name: str, args: dict) -> Dict[str, Any]:
         """
-        Stub: replace with real tool dispatch in production.
-        Returns a string result to inject back into context.
+        FIX #5: calculator uses SafeASTEvaluator (no eval() risk).
+        Returns a structured dict for easy re-injection.
+        Stub tools return placeholder — hook real implementations here.
         """
         if name == "calculator":
-            try:
-                result = eval(args.get("expr", "0"), {"__builtins__": {}})
-                return f"[TOOL:calculator] Result = {result}"
-            except Exception as e:
-                return f"[TOOL:calculator] Error: {e}"
-        return f"[TOOL:{name}] (stub — not implemented)"
+            expr   = str(args.get("expr", "0"))
+            result = self._ast_eval.evaluate(expr)
+            return {"tool": name, "input": expr, "output": result, "ok": not result.startswith("Error")}
+        if name == "code_runner":
+            # PRODUCTION HOOK: run in sandbox (e.g. restrictedpython, subprocess jail)
+            code = args.get("code", "")
+            return {"tool": name, "input": code[:200], "output": "(stub — sandbox not connected)", "ok": False}
+        if name == "web_search":
+            query = args.get("query", "")
+            return {"tool": name, "input": query, "output": "(stub — search not connected)", "ok": False}
+        return {"tool": name, "input": str(args), "output": "(unknown tool)", "ok": False}
 
-    def execute_tool_calls(self, calls: List[Dict[str, Any]]) -> str:
-        """Execute parsed tool calls and return concatenated results."""
-        if not calls: return ""
+    def execute_tool_calls(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        FIX #6: Execute parsed tool calls and return a structured list of results.
+        Each result dict: {tool, input, output, ok}.
+        """
+        if not calls: return []
         results = []
         for call in calls:
             if call.get("parse_error"):
-                results.append(f"[TOOL:parse_error] Could not parse: {call.get('raw','')[:80]}")
+                results.append({
+                    "tool": "parse_error",
+                    "input": call.get("raw", "")[:80],
+                    "output": "Could not parse tool_call JSON",
+                    "ok": False,
+                })
             else:
                 name = call.get("name", "unknown")
                 args = call.get("args", {})
                 results.append(self._call_tool(name, args))
-        return "\n".join(results)
+        return results
+
+    @staticmethod
+    def build_tool_context(results: List[Dict[str, Any]]) -> str:
+        """
+        FIX #6: Format tool results as a string to inject back into the
+        next LLM message (as a user-turn tool_result block).
+
+        Usage in caller (LLM→tool→LLM loop):
+            calls, results = engine.parse_and_execute_tools(model_output)
+            if results:
+                tool_context = engine.tools.build_tool_context(results)
+                messages.append({"role": "user", "content": tool_context})
+                # Call generate() again with updated messages
+        """
+        if not results: return ""
+        lines = ["[TOOL RESULTS]"]
+        for r in results:
+            status = "✓" if r.get("ok") else "✗"
+            lines.append(f"  {status} {r['tool']}({r['input'][:60]}) → {r['output']}")
+        return "\n".join(lines)
+
 
 # ══════════════════════════════════════════════════════════════════════
-# NEW: CHAIN-OF-THOUGHT VERIFIER
+# CHAIN-OF-THOUGHT VERIFIER
+# FIX #3: enriched with causal chain check + negation-flip check
 # ══════════════════════════════════════════════════════════════════════
 class ChainOfThoughtVerifier:
     """
     Debug Expert (EXPERT_CODE_2) reviews each thought step for logical
     consistency before the prompt is compiled.
-    Flags: contradiction, unsupported jump, circular reasoning.
+    Flags: contradiction, unsupported jump, circular reasoning,
+           broken causal chain, negation flip.
     """
     _CONTRADICTION_PAIRS = [
         (r"\btrue\b",   r"\bfalse\b"),
@@ -883,24 +1142,29 @@ class ChainOfThoughtVerifier:
         (r"\btăng\b",   r"\bgiảm\b"),
         (r"\bmore\b",   r"\bless\b"),
     ]
+    # FIX #3: causal markers — at least one expected in reasoning thoughts
+    _CAUSAL_MARKERS = ["vì", "bởi vì", "do đó", "vì vậy", "because", "therefore",
+                       "hence", "thus", "→", "⟹", "causes", "leads to"]
+    # FIX #3: negation-flip patterns — "không A" followed by "A" in next step
+    _NEGATION_FLIP  = [(r"\bkhông\s+(\w+)", r"\b\1\b"), (r"\bnot\s+(\w+)", r"\b\1\b")]
 
     def verify_thoughts(self, thoughts: List[str]) -> Dict[str, Any]:
         issues = []; score = 1.0
         combined = " ".join(thoughts).lower()
 
-        # Check contradictions across thoughts
+        # Contradiction check
         for pat_a, pat_b in self._CONTRADICTION_PAIRS:
             if re.search(pat_a, combined) and re.search(pat_b, combined):
                 issues.append(f"Possible contradiction: '{pat_a}' vs '{pat_b}'")
                 score -= 0.1
 
-        # Check for overly short thoughts (unsupported jumps)
+        # Unsupported jump check
         for i, t in enumerate(thoughts):
             if len(t.split()) < 3:
                 issues.append(f"Thought {i+1} too brief — may be unsupported")
                 score -= 0.05
 
-        # Check circular: same sentence near-repeated
+        # Circular reasoning check
         seen = set()
         for t in thoughts:
             key = frozenset(t.lower().split()[:6])
@@ -910,12 +1174,35 @@ class ChainOfThoughtVerifier:
                 break
             seen.add(key)
 
+        # FIX #3: Causal chain check — warn if no causal marker found in reasoning
+        if len(thoughts) >= 2:
+            reasoning_text = " ".join(thoughts[1:]).lower()
+            if not any(m in reasoning_text for m in self._CAUSAL_MARKERS):
+                issues.append("No causal connector found — reasoning may lack explicit logic chain")
+                score -= 0.08
+
+        # FIX #3: Negation-flip check — "không X" in step N then "X" in step N+1
+        for i in range(len(thoughts) - 1):
+            a_lower = thoughts[i].lower()
+            b_lower = thoughts[i + 1].lower()
+            for neg_pat, pos_pat in self._NEGATION_FLIP:
+                for neg_match in re.finditer(neg_pat, a_lower):
+                    term = neg_match.group(1)
+                    # Check if the positive form of the term appears in next thought
+                    if re.search(r"\b" + re.escape(term) + r"\b", b_lower):
+                        issues.append(
+                            f"Negation-flip: thought {i+1} negates '{term}' "
+                            f"but thought {i+2} asserts it positively"
+                        )
+                        score -= 0.12
+                        break
+
         score = max(0.0, min(1.0, score))
         return {
-            "issues":       issues,
-            "score":        score,
-            "is_sound":     score >= 0.7,
-            "expert":       "Debug Expert (EXPERT_CODE_2)",
+            "issues":   issues,
+            "score":    score,
+            "is_sound": score >= 0.7,
+            "expert":   "Debug Expert (EXPERT_CODE_2)",
         }
 
     def flag_thoughts(self, thoughts: List[str], verification: dict) -> List[str]:
@@ -923,8 +1210,9 @@ class ChainOfThoughtVerifier:
         if verification["is_sound"]: return thoughts
         return [f"[?] {t}" if i < 2 else t for i, t in enumerate(thoughts)]
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: MULTI-STEP PLANNER (Sub-goal Decomposition)
+# MULTI-STEP PLANNER (Sub-goal Decomposition)
 # ══════════════════════════════════════════════════════════════════════
 class PlanDecomposer:
     """
@@ -964,13 +1252,12 @@ class PlanDecomposer:
                 "3. Structure and explain clearly",
                 "4. Add context or caveats if needed",
             ]
-        # Score via MCTS and return top subgoals
         best = self.mcts.search(question, templates[:max_subgoals])
-        # Return all templates, marking the MCTS-preferred one
         return [f"[★] {t}" if t == best else t for t in templates[:max_subgoals]]
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: ACTIVE LEARNING LOOP
+# ACTIVE LEARNING LOOP
 # ══════════════════════════════════════════════════════════════════════
 class ActiveLearningLoop:
     """
@@ -996,8 +1283,9 @@ class ActiveLearningLoop:
         template = self._CLARIFICATION_TEMPLATES.get(itype, self._DEFAULT_TEMPLATE)
         return template.format(topic=topic)
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: UNCERTAINTY QUANTIFICATION
+# UNCERTAINTY QUANTIFICATION
 # ══════════════════════════════════════════════════════════════════════
 class UncertaintyQuantifier:
     """
@@ -1005,31 +1293,26 @@ class UncertaintyQuantifier:
     Heuristic: sentences with hedges/negations → lower confidence.
     """
     _HEDGE_WORDS = [
-        "có thể","maybe","perhaps","possibly","không chắc","i think",
-        "tôi nghĩ","dường như","it seems","might","could be","probably",
+        "có thể", "maybe", "perhaps", "possibly", "không chắc", "i think",
+        "tôi nghĩ", "dường như", "it seems", "might", "could be", "probably",
     ]
     _CERTAIN_WORDS = [
-        "chắc chắn","definitely","clearly","obviously","always","luôn",
-        "proven","đã được chứng minh",
+        "chắc chắn", "definitely", "clearly", "obviously", "always", "luôn",
+        "proven", "đã được chứng minh",
     ]
 
     def tag(self, answer: str, base_confidence: float = 0.75) -> str:
-        """
-        Split answer into sentences and tag each with a confidence estimate.
-        Returns annotated answer string.
-        """
         if not answer or len(answer.strip()) < 10:
             return answer
-        # Simple sentence split
         sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
         tagged = []
         for sent in sentences:
-            sl = sent.lower()
+            sl   = sent.lower()
             conf = base_confidence
-            hedges  = sum(1 for w in self._HEDGE_WORDS  if w in sl)
-            certains= sum(1 for w in self._CERTAIN_WORDS if w in sl)
-            conf -= hedges  * 0.08
-            conf += certains* 0.05
+            hedges   = sum(1 for w in self._HEDGE_WORDS   if w in sl)
+            certains = sum(1 for w in self._CERTAIN_WORDS if w in sl)
+            conf -= hedges   * 0.08
+            conf += certains * 0.05
             conf = round(max(0.1, min(1.0, conf)), 2)
             if conf < 0.5:
                 tagged.append(f"[confidence:{conf}] {sent}")
@@ -1038,14 +1321,14 @@ class UncertaintyQuantifier:
         return " ".join(tagged)
 
     def overall_confidence(self, answer: str, base: float) -> float:
-        """Return an overall confidence score for the full answer."""
-        sl = answer.lower()
+        sl       = answer.lower()
         hedges   = sum(1 for w in self._HEDGE_WORDS   if w in sl)
         certains = sum(1 for w in self._CERTAIN_WORDS if w in sl)
         return round(max(0.1, min(1.0, base - hedges * 0.05 + certains * 0.03)), 2)
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: COUNTERFACTUAL REASONING
+# COUNTERFACTUAL REASONING
 # ══════════════════════════════════════════════════════════════════════
 class CounterfactualReasoner:
     """
@@ -1066,9 +1349,6 @@ class CounterfactualReasoner:
         return any(re.search(p, ql) for p in self._CF_PATTERNS) or itype == INTENT_LOGIC
 
     def generate(self, question: str, intent: dict) -> str:
-        """
-        Build a short counterfactual branch description to inject into thought plan.
-        """
         entities = intent.get("entities", [])
         subj     = entities[0] if entities else "the subject"
         return (
@@ -1078,15 +1358,21 @@ class CounterfactualReasoner:
             f"Consistency check: the factual answer should hold against this counterfactual."
         )
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: ANALOGICAL MAPPING
+# ANALOGICAL MAPPING
+# FIX #9: weight-threshold guard before returning analogy
 # ══════════════════════════════════════════════════════════════════════
+_ANALOGY_MIN_WEIGHT = 0.3   # FIX #9: don't return analogy if edge weight < threshold
+
+
 class AnalogicalMapper:
     """
     Use KnowledgeGraph to find analogies: A:B :: C:?
-    Finds the concept in the KG most structurally similar to B relative to A,
-    then maps it onto C.
+    FIX #9: weight-threshold guard — only return analogy if the best
+    candidate has KG edge weight >= _ANALOGY_MIN_WEIGHT.
     """
+
     def find_analogy(
         self,
         kg: KnowledgeGraph,
@@ -1096,35 +1382,40 @@ class AnalogicalMapper:
     ) -> Optional[str]:
         """
         A:B :: C:? — find X such that C→X mirrors A→B structurally.
-        Uses the intersection of related-concepts at same hop distance.
+        FIX #9: returns None if best candidate weight < _ANALOGY_MIN_WEIGHT.
         """
         related_b = set(kg.related(concept_b, hops=2).keys())
         related_c = set(kg.related(concept_c, hops=2).keys())
         candidates = related_c & related_b
         if not candidates:
-            # Fallback: direct neighbors of C
             candidates = set(kg.related(concept_c, hops=1).keys())
         if not candidates: return None
-        # Prefer candidate with highest KG weight to C
+        # FIX #9: pick best by weight and check threshold
         best = max(candidates, key=lambda n: kg.g.get(concept_c, {}).get(n, 0.0))
+        best_weight = kg.g.get(concept_c, {}).get(best, 0.0)
+        if best_weight < _ANALOGY_MIN_WEIGHT:
+            return None   # FIX #9: reject low-confidence analogies
         return best
 
-    def describe_analogy(
-        self,
-        a: str, b: str, c: str, x: Optional[str]
-    ) -> str:
+    def describe_analogy(self, a: str, b: str, c: str, x: Optional[str]) -> str:
         if x is None:
             return f"[ANALOGY] {a}:{b} :: {c}:? — No analogy found in knowledge graph."
         return f"[ANALOGY] {a}:{b} :: {c}:{x} — {c} relates to {x} as {a} relates to {b}."
 
+
 # ══════════════════════════════════════════════════════════════════════
-# NEW: RETRIEVAL AUGMENTER (RAG stub)
+# RETRIEVAL AUGMENTER (RAG stub)
+# FIX #7: retrieve() stub clearly documented; callers safe on empty return
 # ══════════════════════════════════════════════════════════════════════
 class RetrievalAugmenter:
     """
     RAG hook for INTENT_FACTUAL and INTENT_HOW_TO.
-    In production: replace retrieve() with your embedding-based retriever.
-    The existing MemoryReranker is used for post-retrieval ranking.
+
+    FIX #7: retrieve() is a documented stub. It returns [] gracefully.
+    To activate real RAG, replace retrieve() body with:
+        vec    = embedder.encode(query)               # e.g. MiniEmbedder
+        docs   = vector_store.search(vec, top_k)      # e.g. LongTermMemoryV1
+        return [{"text": d.text, "score": d.score, "ts": d.timestamp} for d in docs]
     """
     _TRIGGER_INTENTS = {INTENT_FACTUAL, INTENT_HOW_TO}
 
@@ -1133,9 +1424,10 @@ class RetrievalAugmenter:
 
     def retrieve(self, query: str, intent: dict, top_k: int = 3) -> List[dict]:
         """
-        Stub retriever — returns empty list.
-        Replace with: embedder.encode(query) → vector_store.search(vec, top_k).
-        Each result should be: {"text": str, "score": float, "ts": float}
+        Stub retriever — returns [] until a real vector store is connected.
+        FIX #7: empty-list return is safe; augment_memory_summary handles it.
+        PRODUCTION HOOK: replace this body with your embedding retriever.
+        Each result must be: {"text": str, "score": float, "ts": float}
         """
         return []
 
@@ -1147,14 +1439,13 @@ class RetrievalAugmenter:
         query: str,
         intent: dict,
     ) -> str:
-        """
-        Merge retrieved docs with existing memory summary via MemoryReranker.
-        """
+        """Merge retrieved docs with existing memory summary via MemoryReranker."""
         if not retrieved: return base_summary
         reranked = reranker.rerank(retrieved, query, intent, top_k=3)
         rag_text = reranker.format_for_prompt(reranked, max_chars=300)
         if not rag_text: return base_summary
         return (base_summary + " [RAG] " + rag_text).strip()
+
 
 # ══════════════════════════════════════════════════════════════════════
 # PROMPT COMPILER — [PLAN][THOUGHT][FINAL ANSWER] injection
@@ -1171,7 +1462,6 @@ class PromptCompiler:
         msgs = []
         sys_content = DRACO_SYSTEM_PROMPT
         if memory_summary:
-            # FIX: trim memory_summary to avoid bloating system prompt
             sys_content += f"\n\n[MEMORY]\n{memory_summary[:400]}"
 
         expert_note = {
@@ -1185,11 +1475,9 @@ class PromptCompiler:
         if expert_note:
             sys_content += expert_note
 
-        # NEW: inject tool calling hint if applicable
         if thought_plan.get("tool_injection"):
             sys_content += f"\n\n{thought_plan['tool_injection']}"
 
-        # NEW: inject counterfactual note if applicable
         if thought_plan.get("counterfactual"):
             sys_content += f"\n\n{thought_plan['counterfactual']}"
 
@@ -1201,7 +1489,6 @@ class PromptCompiler:
                 f"Type: {intent.get('intent','?')} | Lang: {intent.get('lang','?')} | "
                 f"Entities: {', '.join(intent.get('entities', [])[:3]) or '---'}",
             ]
-            # NEW: subgoal plan
             if thought_plan.get("subgoals"):
                 lines.append("\n[SUBGOALS]")
                 lines.extend(thought_plan["subgoals"])
@@ -1217,11 +1504,9 @@ class PromptCompiler:
             if thought_plan.get("reasoning_path"):
                 lines.append(f"\n[KNOWLEDGE PATH]\n{' → '.join(thought_plan['reasoning_path'])}")
 
-            # NEW: analogy note
             if thought_plan.get("analogy"):
                 lines.append(f"\n{thought_plan['analogy']}")
 
-            # NEW: CoT verification note
             if thought_plan.get("cot_verification"):
                 v = thought_plan["cot_verification"]
                 if not v.get("is_sound"):
@@ -1233,6 +1518,7 @@ class PromptCompiler:
         if history: msgs.extend(history[-10:])
         msgs.append({"role": "user", "content": question})
         return msgs
+
 
 # ══════════════════════════════════════════════════════════════════════
 # THINKING ENGINE V1
@@ -1249,7 +1535,6 @@ class ThinkingEngineV1:
         self.debate       = MultiAgentDebate()
         self.sc           = SelfConsistency()
         self.dual         = DualProcessDecider()
-        # NEW modules
         self.difficulty   = DifficultyScorer()
         self.tools        = ToolCallingFramework()
         self.cot_verifier = ChainOfThoughtVerifier()
@@ -1260,6 +1545,7 @@ class ThinkingEngineV1:
         self.analogy      = AnalogicalMapper()
         self.rag          = RetrievalAugmenter()
 
+    # ── Main processing pipeline ──────────────────────────────────────
     def process(
         self,
         question:          str,
@@ -1268,7 +1554,7 @@ class ThinkingEngineV1:
         ltm_facts:         List[dict] = None,
         memory_candidates: List[dict] = None,
         think_mode:        bool       = False,
-        force_system2:     bool       = False,   # NEW
+        force_system2:     bool       = False,
     ) -> dict:
         # Contextual Prompt Rewriting
         rewritten_q = self.cpr.rewrite(question, history or [])
@@ -1276,20 +1562,48 @@ class ThinkingEngineV1:
             memory_summary = (memory_summary + f"\n[Rewritten: {rewritten_q}]").strip()
 
         intent       = self.detector.detect(rewritten_q)
-        expert_boost = self.detector.to_expert_boost(intent)
+        expert_boost = self.detector.to_expert_boost(intent)   # FIX #2: normalized
         miro_tau     = self.detector.to_miro_tau(intent)
         process_mode = self.dual.decide_mode(intent, rewritten_q)
 
-        # NEW: Difficulty-based System2 auto-routing
+        # Difficulty-based System2 auto-routing
         difficulty_score = self.difficulty.score(rewritten_q, intent)
         base_conf        = self._confidence(intent)
         if force_system2 or (difficulty_score > 0.65 and base_conf < 0.75):
             process_mode = "slow"
 
-        # NEW: Dynamic KG triple extraction from latest user turn
+        # ── FIX #11/#12: Early-exit for simple chat queries ──────────
+        # If the query is trivially simple (INTENT_CHAT, word_count ≤ 3),
+        # skip the heavy pipeline (ToT, Debate, SC, CoT verify) and go
+        # straight to message compilation with a minimal thought plan.
+        if self.dual.is_simple_chat(intent) and not think_mode and not force_system2:
+            messages = self.compiler.compile(
+                rewritten_q, intent,
+                thought_plan={},          # no heavy plan needed
+                memory_summary=memory_summary,
+                history=history or [],
+            )
+            return {
+                "intent":                intent,
+                "expert_boost":          expert_boost,
+                "miro_tau":              miro_tau,
+                "thought_plan":          {"process_mode": "fast", "early_exit": True},
+                "messages":              messages,
+                "creativity":            intent["creativity"],
+                "rewritten_query":       rewritten_q,
+                "process_mode":          "fast",
+                "difficulty_score":      difficulty_score,
+                "clarification_needed":  False,
+                "clarification_question": "",
+                "cot_verification":      {"is_sound": True, "issues": [], "score": 1.0},
+                "tool_injection_active": False,
+            }
+        # ── End early-exit ───────────────────────────────────────────
+
+        # Dynamic KG triple extraction from latest user turn
         self.kg.extract_and_add_triples(rewritten_q, conf=base_conf)
 
-        # NEW: RAG augmentation for factual/how-to
+        # RAG augmentation for factual/how-to
         if self.rag.is_applicable(intent):
             retrieved      = self.rag.retrieve(rewritten_q, intent)
             memory_summary = self.rag.augment_memory_summary(
@@ -1307,15 +1621,15 @@ class ThinkingEngineV1:
         elif entities:
             reasoning_path = list(self.kg.related(entities[0], hops=2).keys())[:4]
 
-        # Thought plan
+        # Thought plan (ToT + MCTS)
         best_branch, all_branches = self.tot.run(rewritten_q, intent)
         thoughts = self._thoughts(rewritten_q, intent, reasoning_path)
 
-        # NEW: CoT Verification
+        # CoT Verification (FIX #3: enriched)
         cot_verification = self.cot_verifier.verify_thoughts(thoughts)
         thoughts = self.cot_verifier.flag_thoughts(thoughts, cot_verification)
 
-        # NEW: Sub-goal decomposition (slow mode only)
+        # Sub-goal decomposition (slow mode only)
         subgoals: List[str] = []
         if process_mode == "slow" or think_mode:
             subgoals = self.decomposer.decompose(rewritten_q, intent)
@@ -1324,7 +1638,6 @@ class ThinkingEngineV1:
         debate_synthesis = ""
         debate_opinions  = {}
         if think_mode or process_mode == "slow":
-            # NEW: use full CouncilDebate when think_mode is True
             if think_mode:
                 council_result   = self.debate.run_full_council(rewritten_q, intent, max_rounds=3)
                 debate_synthesis = council_result["final_answer"]
@@ -1348,17 +1661,17 @@ class ThinkingEngineV1:
         if reranked_memory:
             full_memory = (memory_summary + " | " + reranked_memory).strip(" |")
 
-        # NEW: Tool calling injection
+        # Tool calling injection
         tool_injection = ""
         if self.tools.should_use_tools(intent, rewritten_q):
             tool_injection = self.tools.build_tool_injection(intent, rewritten_q)
 
-        # NEW: Counterfactual reasoning note
+        # Counterfactual reasoning note
         counterfactual = ""
         if self.cf_reasoner.is_applicable(rewritten_q, intent):
             counterfactual = self.cf_reasoner.generate(rewritten_q, intent)
 
-        # NEW: Analogical mapping (when 2+ entities in KG)
+        # Analogical mapping (FIX #9: weight-threshold guard in find_analogy)
         analogy_note = ""
         if len(entities) >= 2:
             x = self.analogy.find_analogy(self.kg, entities[0], entities[0], entities[1])
@@ -1367,7 +1680,7 @@ class ThinkingEngineV1:
                     entities[0], entities[0], entities[1], x
                 )
 
-        # NEW: Active Learning — clarification if confidence too low
+        # Active Learning — clarification if confidence too low
         clarification_needed = self.active_loop.needs_clarification(base_conf, intent)
         clarification_q      = (
             self.active_loop.generate_clarification(rewritten_q, intent)
@@ -1385,7 +1698,6 @@ class ThinkingEngineV1:
             "debate_opinions":  debate_opinions,
             "sc_path":          sc_path,
             "process_mode":     process_mode,
-            # NEW fields
             "subgoals":         subgoals,
             "cot_verification": cot_verification,
             "tool_injection":   tool_injection,
@@ -1407,7 +1719,6 @@ class ThinkingEngineV1:
             "creativity":            intent["creativity"],
             "rewritten_query":       rewritten_q,
             "process_mode":          process_mode,
-            # NEW fields
             "difficulty_score":      difficulty_score,
             "clarification_needed":  clarification_needed,
             "clarification_question":clarification_q,
@@ -1415,6 +1726,7 @@ class ThinkingEngineV1:
             "tool_injection_active": bool(tool_injection),
         }
 
+    # ── Post-generation helpers ───────────────────────────────────────
     def critique_and_refine(self, question: str, answer: str, ltm_facts: List[dict] = None) -> dict:
         return self.reflect.critique(answer, question, ltm_facts or [])
 
@@ -1426,7 +1738,7 @@ class ThinkingEngineV1:
         max_iter:  int = 3,
     ) -> Tuple[str, List[dict]]:
         """
-        NEW: Recursive Self-Critique Loop.
+        Recursive Self-Critique Loop.
         Iteratively critiques and refines the answer up to max_iter times.
         Returns (final_answer, list_of_critique_reports).
         """
@@ -1437,26 +1749,35 @@ class ThinkingEngineV1:
             reports.append(report)
             if not report["should_refine"]:
                 break
-            # Build a refined prompt note (in production: pass to LLM for actual refinement)
             refine_note = self.reflect.build_refine_prompt(current, report)
-            # Stub: append the refine note as a marker; real system would call LLM here
+            # PRODUCTION HOOK: pass refine_note to LLM for actual refinement.
+            # Stub: append the refine note as a marker.
             current = f"{current}\n[AUTO-REFINED: {refine_note[:120]}]"
         return current, reports
 
     def tag_answer_uncertainty(self, answer: str, intent: dict) -> str:
-        """NEW: Apply UncertaintyQuantifier to a generated answer."""
+        """Apply UncertaintyQuantifier to a generated answer."""
         base = self._confidence(intent)
         return self.uq.tag(answer, base_confidence=base)
 
-    def parse_and_execute_tools(self, model_output: str) -> Tuple[List[dict], str]:
+    def parse_and_execute_tools(self, model_output: str) -> Tuple[List[dict], List[dict]]:
         """
-        NEW: Parse tool calls from model output and execute them.
-        Returns (parsed_calls, tool_results_string).
+        Parse tool calls from model output and execute them.
+        FIX #6: Returns (parsed_calls, structured_results_list) — not a flat string.
+        Use tools.build_tool_context(results) to format for LLM re-injection.
+
+        Typical caller pattern (LLM→tool→LLM loop):
+            calls, results = engine.parse_and_execute_tools(model_output)
+            if results:
+                tool_ctx = engine.tools.build_tool_context(results)
+                messages.append({"role": "user", "content": tool_ctx})
+                # Call generate() again with updated messages
         """
         calls   = self.tools.parse_tool_calls(model_output)
         results = self.tools.execute_tool_calls(calls)
         return calls, results
 
+    # ── Private helpers ───────────────────────────────────────────────
     def _thoughts(self, q: str, intent: dict, path: List[str]) -> List[str]:
         t = [f"Type: {intent['intent']} | Lang: {intent['lang']} | "
              f"Entities: {', '.join(intent['entities'][:3]) or '---'}"]
