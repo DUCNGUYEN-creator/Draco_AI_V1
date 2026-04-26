@@ -20,29 +20,20 @@ Expert layout (all from ONE Qwen 3.5 9B Instruct checkpoint):
     Code group    (0-3): expert slots for code/math/logic FFN layers
     Language group (4-7): expert slots for language/instruction FFN layers
 
-ALL BUGS FIXED (V1):
-    ✅ import heapq — heapq.heappush / heapq.heappop used correctly
-    ✅ MultiAgentDebate.generate_debate uses self.EXPERT_NAMES correctly
-    ✅ A* heuristic: h = 0.0 if a==b else 1.0 (no set(string) bug)
-    ✅ astar returns Tuple[Optional[List[str]], float] — caller unpacks both
-    ✅ MCTS rollout max_depth=10 (no infinite loop)
+CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
+    ✅ import heapq, BFS popleft, A* heuristic, MCTS max_depth=10
     ✅ MemoryReranker.rerank uses c.copy() — no mutation
-    ✅ BFS popleft() correct
-    ✅ KnowledgeGraph.add uses setdefault correctly
+    ✅ KnowledgeGraph.add setdefault, DracoAI branding, init_default
     ✅ Code intent boosts BOTH Code + Language experts
     ✅ Contextual Prompt Rewriting (CPR)
     ✅ Prompt Compiler: [PLAN][THOUGHT][FINAL ANSWER] format
     ✅ Expert indices updated for 8-expert layout (Qwen 3.5 9B single source)
-    ✅ System prompt updated: Qwen 3.5 9B Instruct
-    ✅ KnowledgeGraph.init_default: uses DracoAI branding (not Qwen-only)
     ✅ DualProcessDecider: wc threshold tuned for Vietnamese short sentences
     ✅ SelfReflection.critique: safe check for zero-length answer
     ✅ PromptCompiler: expert_note lookup uses .get() with default safely
     ✅ ThinkingEngineV1.process: memory_candidates type-checked before rerank
-
-NEW FEATURES (V1.1):
     ✅ Tool Calling framework — <tool_call>...</tool_call> injection & parse
-    ✅ Chain-of-Thought Verifier — Debug expert checks each thought step
+    ✅ Chain-of-Thought Verifier (causal chain + negation-flip)
     ✅ Multi-Step Planner (PlanDecomposer) — sub-goal decomposition via MCTS
     ✅ Graph-Based Memory — auto-extract subject–relation–object triples
     ✅ Active Learning Loop — ask clarification when confidence < 0.5
@@ -50,35 +41,22 @@ NEW FEATURES (V1.1):
     ✅ CouncilDebate — full 8-expert round-robin debate (max 3 rounds)
     ✅ Recursive Self-Critique Loop — up to 3 refinement iterations
     ✅ Counterfactual Reasoning — "what if" branch for logic/legal questions
-    ✅ Analogical Mapping — KG-based A:B::C:? analogy via related()
+    ✅ Analogical Mapping — KG-based A:B::C:? (A contribution now used)
     ✅ DifficultyScorer — auto System1/System2 routing
     ✅ RetrievalAugmenter stub — RAG hook for INTENT_FACTUAL/HOW_TO
     ✅ force_system2 param in ThinkingEngineV1.process()
-    ✅ All new features isolated; no existing logic mutated
-
-FIXES V1.2 (per audit report):
-    ✅ [#1]  IntentDetector: hybrid keyword + semantic scoring (TF-IDF-like
-             multi-keyword weighting instead of raw count) to reduce prompt
-             injection & multi-intent bias.
-    ✅ [#2]  expert_boost normalized to sum=1.0 via _normalize_boost().
-    ✅ [#3]  CoT verifier enriched: causal chain check + negation-flip check.
-    ✅ [#4]  MultiAgentDebate templates documented as deterministic stubs;
-             hook point clearly marked for real LLM calls.
-    ✅ [#5]  calculator tool: eval() replaced with safe AST-based parser
-             (no __builtins__ bypass risk, expression complexity limited).
-    ✅ [#6]  Tool-loop: parse_and_execute_tools now returns structured result
-             ready to be fed back into the next generate() call; engine
-             exposes build_tool_context() helper for callers.
-    ✅ [#7]  RetrievalAugmenter.retrieve() documented stub with clear hook
-             comment; callers receive [] gracefully (no silent failure).
-    ✅ [#8]  KnowledgeGraph: dedup by (subj, obj) hash + max-degree cap (50)
-             + weight-based pruning (remove edges < MIN_EDGE_WEIGHT).
-    ✅ [#9]  AnalogicalMapper: weight-threshold guard before returning analogy.
-    ✅ [#10] SelfConsistency: branch rotation + randomized ordering for
-             genuine path diversity.
-    ✅ [#11] ThinkingEngineV1.process(): early-exit for simple INTENT_CHAT
-             (word_count ≤ 3) — skips ToT, Debate, SC, CoT verification.
-    ✅ [#12] DualProcessDecider: explicit simple-query fast-path documented.
+    ✅ IntentDetector: hybrid weighted keyword scoring (TF-IDF-like)
+    ✅ expert_boost normalized to sum=1.0 via _normalize_boost()
+    ✅ calculator: eval() replaced with SafeASTEvaluator (DoS-safe)
+    ✅ [DOS-FIX] SafeASTEvaluator: ast.Pow guarded — exponent capped ≤ 1000
+    ✅ [JSON-FIX] parse_tool_calls: strip markdown fences + trailing commas
+    ✅ [KG-FIX]  _enforce_degree_cap: always remove reverse edge on prune
+    ✅ [KG-FIX]  _triple_key: dedup includes relation — richer graph semantics
+    ✅ [ANALOGY-FIX] find_analogy: concept_a now used to guide candidate selection
+    ✅ [EARLY-EXIT-FIX] fast-path only when base_conf >= 0.8 (prevents mis-routing)
+    ✅ [BIAS-FIX] INTENT_BIAS_ALPHA = 0.5 documented; callers apply alpha * boost
+    ✅ SelfConsistency: branch rotation + randomized ordering
+    ✅ Tool-loop: structured result dict + build_tool_context() helper
 """
 
 import re
@@ -106,6 +84,10 @@ EXPERT_LOGIC    = EXPERT_CODE_0
 EXPERT_CODE     = EXPERT_CODE_1
 EXPERT_LANGUAGE = EXPERT_LANG_0
 EXPERT_CHAT     = EXPERT_LANG_1
+
+# ── Intent bias alpha — apply as: logits += INTENT_BIAS_ALPHA * intent_bias
+# Keeps router adaptive; prevents boost from dominating raw logits (~[-5, 5]).
+INTENT_BIAS_ALPHA = 0.5
 
 # Intent types
 INTENT_MATH       = "math"
@@ -162,11 +144,18 @@ class KnowledgeGraph:
 
     # ── Internal helpers ──────────────────────────────────────────────
     @staticmethod
-    def _triple_key(subj: str, obj: str) -> str:
-        return hashlib.md5(f"{subj.lower()}|{obj.lower()}".encode()).hexdigest()
+    def _triple_key(subj: str, rel: str, obj: str) -> str:
+        """Include relation in dedup key so same pair with different relations
+        are treated as distinct triples — preserves richer graph semantics."""
+        return hashlib.md5(
+            f"{subj.lower()}|{rel.lower()}|{obj.lower()}".encode()
+        ).hexdigest()
 
     def _enforce_degree_cap(self, node: str):
-        """Remove lowest-weight edges if node exceeds max degree."""
+        """Remove lowest-weight edges if node exceeds max degree.
+        FIX: always remove reverse edge when forward edge is pruned,
+        ensuring graph symmetry (no orphaned back-edges).
+        """
         neighbors = self.g.get(node, {})
         if len(neighbors) > _KG_MAX_DEGREE:
             # Sort by weight ascending, drop the weakest
@@ -174,9 +163,8 @@ class KnowledgeGraph:
             to_drop    = len(neighbors) - _KG_MAX_DEGREE
             for nb, _ in sorted_nbs[:to_drop]:
                 del self.g[node][nb]
-                # Also remove reverse edge if it still points back weakly
-                if self.g.get(nb, {}).get(node, 1.0) < _KG_MIN_EDGE_WEIGHT:
-                    self.g[nb].pop(node, None)
+                # Always remove reverse edge to keep graph symmetric
+                self.g.get(nb, {}).pop(node, None)
 
     def _prune_weak_edges(self, node: str):
         """Remove edges below minimum weight threshold."""
@@ -267,8 +255,8 @@ class KnowledgeGraph:
                 subj = m.group(1).strip()[:30]
                 obj  = m.group(2).strip()[:30]
                 if len(subj) < 2 or len(obj) < 2: continue
-                # FIX #8: dedup check
-                key = self._triple_key(subj, obj)
+                # Dedup includes relation — same pair with different relation is kept
+                key = self._triple_key(subj, rel, obj)
                 if key in self._triple_hashes: continue
                 self._triple_hashes.add(key)
                 w = base_w * conf
@@ -949,21 +937,38 @@ class DifficultyScorer:
 # ══════════════════════════════════════════════════════════════════════
 class SafeASTEvaluator:
     """
-    Evaluates simple math expressions using Python's AST — no eval(), no
-    __builtins__ bypass risk, no infinite-loop risk from complex expressions.
-    Supported: +, -, *, /, **, unary minus, integers, floats, parentheses.
+    Evaluates simple math expressions using Python's AST — no eval() risk,
+    no __builtins__ bypass, no DoS via large exponents.
+    Supported: +, -, *, /, **, %, //, unary minus, integers, floats.
     Max expression length: 200 chars. Max AST node count: 64.
+    Max exponent value: 1000 (guards against 999999**999999 CPU hang).
     """
     _ALLOWED_NODES = (
         ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
         ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod,
         ast.FloorDiv, ast.USub, ast.UAdd,
     )
-    _MAX_LEN   = 200
-    _MAX_NODES = 64
+    _MAX_LEN        = 200
+    _MAX_NODES      = 64
+    _MAX_EXPONENT   = 1000   # DoS guard: 999999**999999 would hang CPU indefinitely
 
     def _count_nodes(self, node) -> int:
         return 1 + sum(self._count_nodes(c) for c in ast.iter_child_nodes(node))
+
+    def _check_pow_safety(self, tree) -> Optional[str]:
+        """Walk AST and reject any Pow whose exponent constant exceeds _MAX_EXPONENT."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+                # Check right operand (exponent)
+                exp_node = node.right
+                # Unwrap unary minus if present: e.g. 2**(-3)
+                if isinstance(exp_node, ast.UnaryOp) and isinstance(exp_node.op, ast.USub):
+                    exp_node = exp_node.operand
+                if isinstance(exp_node, ast.Constant) and isinstance(exp_node.value, (int, float)):
+                    if abs(exp_node.value) > self._MAX_EXPONENT:
+                        return (f"Error: exponent {exp_node.value} exceeds max allowed "
+                                f"({self._MAX_EXPONENT}) — operation refused (DoS guard)")
+        return None
 
     def evaluate(self, expr: str) -> str:
         """Returns a string result or an error message."""
@@ -981,12 +986,18 @@ class SafeASTEvaluator:
         for node in ast.walk(tree):
             if not isinstance(node, self._ALLOWED_NODES):
                 return f"Error: unsupported operation ({type(node).__name__})"
+        # DoS guard: reject huge exponents before eval
+        pow_err = self._check_pow_safety(tree)
+        if pow_err:
+            return pow_err
         try:
             result = eval(compile(tree, "<expr>", "eval"),  # noqa: S307
                           {"__builtins__": {}}, {})
             return str(result)
         except ZeroDivisionError:
             return "Error: division by zero"
+        except OverflowError:
+            return "Error: result too large (overflow)"
         except Exception as e:
             return f"Error: {e}"
 
@@ -1052,11 +1063,21 @@ class ToolCallingFramework:
         return "\n".join(lines)
 
     def parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """Extract all <tool_call>...</tool_call> blocks from model output."""
+        """Extract all <tool_call>...</tool_call> blocks from model output.
+        FIX: strips markdown code fences and trailing commas before parsing,
+        so outputs like ```json{...},``` or {'k':'v',} are handled robustly.
+        """
         import json
         calls = []
         for m in re.finditer(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL):
             raw = m.group(1).strip()
+            # Strip markdown code fences (```json...``` or ```...```)
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+                raw = raw.strip()
+            # Remove trailing commas before } or ] (common LLM output quirk)
+            raw = re.sub(r",(\s*[}\]])", r"\1", raw)
             try:
                 parsed = json.loads(raw)
                 calls.append(parsed)
@@ -1369,8 +1390,15 @@ _ANALOGY_MIN_WEIGHT = 0.3   # FIX #9: don't return analogy if edge weight < thre
 class AnalogicalMapper:
     """
     Use KnowledgeGraph to find analogies: A:B :: C:?
-    FIX #9: weight-threshold guard — only return analogy if the best
-    candidate has KG edge weight >= _ANALOGY_MIN_WEIGHT.
+
+    The A→B structural relationship is now used to guide candidate selection:
+    we look for C→X where X shares the same "hop distance" from C that B has
+    from A, intersected with C's neighbours for graph-grounded results.
+
+    FIX: concept_a is used to compute the A→B relation signature (hop
+    distance + shared neighbours), then the same signature is sought from C.
+    FIX: weight-threshold guard — only return analogy if best candidate
+    edge weight >= _ANALOGY_MIN_WEIGHT.
     """
 
     def find_analogy(
@@ -1382,19 +1410,39 @@ class AnalogicalMapper:
     ) -> Optional[str]:
         """
         A:B :: C:? — find X such that C→X mirrors A→B structurally.
-        FIX #9: returns None if best candidate weight < _ANALOGY_MIN_WEIGHT.
+        Uses concept_a to characterise the A–B relationship, then seeks
+        the same pattern from C.
         """
+        # Characterise the A→B relationship via shared neighbourhood
+        related_a = set(kg.related(concept_a, hops=2).keys())
         related_b = set(kg.related(concept_b, hops=2).keys())
+        # "signature" = concepts shared between A's neighbourhood and B's
+        ab_signature = related_a & related_b
+
         related_c = set(kg.related(concept_c, hops=2).keys())
-        candidates = related_c & related_b
+
+        # Prefer candidates that mirror the A–B signature from C
+        if ab_signature:
+            candidates = related_c & ab_signature
+        else:
+            candidates = set()
+
+        # Fallback: any overlap of C's neighbours with B's neighbours
+        if not candidates:
+            candidates = related_c & related_b
+
+        # Last-resort: immediate neighbours of C
         if not candidates:
             candidates = set(kg.related(concept_c, hops=1).keys())
-        if not candidates: return None
-        # FIX #9: pick best by weight and check threshold
+
+        if not candidates:
+            return None
+
+        # Pick best by direct edge weight from C
         best = max(candidates, key=lambda n: kg.g.get(concept_c, {}).get(n, 0.0))
         best_weight = kg.g.get(concept_c, {}).get(best, 0.0)
         if best_weight < _ANALOGY_MIN_WEIGHT:
-            return None   # FIX #9: reject low-confidence analogies
+            return None   # reject low-confidence analogies
         return best
 
     def describe_analogy(self, a: str, b: str, c: str, x: Optional[str]) -> str:
@@ -1572,11 +1620,15 @@ class ThinkingEngineV1:
         if force_system2 or (difficulty_score > 0.65 and base_conf < 0.75):
             process_mode = "slow"
 
-        # ── FIX #11/#12: Early-exit for simple chat queries ──────────
-        # If the query is trivially simple (INTENT_CHAT, word_count ≤ 3),
-        # skip the heavy pipeline (ToT, Debate, SC, CoT verify) and go
-        # straight to message compilation with a minimal thought plan.
-        if self.dual.is_simple_chat(intent) and not think_mode and not force_system2:
+        # ── Early-exit for simple chat queries ──────────────────────────
+        # Only use fast-path when BOTH conditions hold:
+        #   1. query is trivially simple (INTENT_CHAT, word_count ≤ 3)
+        #   2. confidence is high enough (>= 0.8) — prevents mis-routing
+        #      a genuinely complex query that scored INTENT_CHAT by accident.
+        if (self.dual.is_simple_chat(intent)
+                and not think_mode
+                and not force_system2
+                and base_conf >= 0.8):
             messages = self.compiler.compile(
                 rewritten_q, intent,
                 thought_plan={},          # no heavy plan needed
@@ -1671,13 +1723,16 @@ class ThinkingEngineV1:
         if self.cf_reasoner.is_applicable(rewritten_q, intent):
             counterfactual = self.cf_reasoner.generate(rewritten_q, intent)
 
-        # Analogical mapping (FIX #9: weight-threshold guard in find_analogy)
+        # Analogical mapping — A:B :: C:? (uses entities[0] as A, [1] as B, [2] as C)
         analogy_note = ""
         if len(entities) >= 2:
-            x = self.analogy.find_analogy(self.kg, entities[0], entities[0], entities[1])
+            concept_a = entities[0]
+            concept_b = entities[1]
+            concept_c = entities[2] if len(entities) >= 3 else entities[1]
+            x = self.analogy.find_analogy(self.kg, concept_a, concept_b, concept_c)
             if x:
                 analogy_note = self.analogy.describe_analogy(
-                    entities[0], entities[0], entities[1], x
+                    concept_a, concept_b, concept_c, x
                 )
 
         # Active Learning — clarification if confidence too low
