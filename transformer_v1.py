@@ -76,9 +76,21 @@ FIXES (V1 — final consolidated):
          exactly what the normal sampling path does: forward(nid) → spec from l2_new.
          When no spec follows, cur=[nid] and the next iteration forwards nid normally —
          but with forward done eagerly, cache is always complete before any spec chain.
-"""
+    ✅ FIX KVCACHE-ALLOC: KVCache.__init__ uses np.empty instead of np.zeros.
+         np.zeros zero-fills the entire buffer at startup (up to 4 GB for 9B model),
+         causing lag and potential OOM on low-RAM machines.
+         np.empty skips zero-fill; safe because update() always writes before get() reads.
+         Optional use_memmap=True parameter backs buffers with disk-mapped temp files,
+         supporting window sizes that exceed available RAM at the cost of ~2-5x slower I/O.
+         cleanup() method deletes temp files when the cache is no longer needed.
+    ✅ FIX MIROSTAT-MU-PERSIST: generate() now uses self._miro_mu instead of a local
+         mu = 5.0 that was reset on every call regardless of new_prompt.
+         self._miro_mu is reset to 5.0 only when new_prompt=True (or cache is None).
+         For multi-turn continuation (new_prompt=False), mu carries over, preserving
+         Mirostat's adaptive entropy state across successive generate() calls.
+         mu is saved back to self._miro_mu at the end of every generate() call."""
 from __future__ import annotations
-import math, os, json, time, copy
+import math, os, json, time, copy, tempfile
 from typing import List, Optional, Tuple, Dict, Callable
 import numpy as np
 # ── Constants ──────────────────────────────────────────────────────────
@@ -124,27 +136,71 @@ class KVCache:
     If the spec is rejected, call restore(snap) to revert K/V state cleanly.
     """
     def __init__(self, n_layers: int, n_kv_heads: int, head_dim: int,
-                 window: int = 1024, sink: int = SINK_TOKENS):
+                 window: int = 1024, sink: int = SINK_TOKENS,
+                 use_memmap: bool = False, memmap_dir: Optional[str] = None):
+        """
+        use_memmap=True: buffers backed by disk-mapped temp files.
+            Avoids upfront RAM allocation — only pages in physical RAM that are
+            actually read/written.  ~2-5x slower I/O than pure RAM.
+            Recommended on machines with < 8 GB free RAM and large windows.
+        use_memmap=False (default): np.empty — fast allocation, no zero-fill,
+            safe because update() always writes before get() reads.
+        """
         self.n_layers   = n_layers
         self.n_kv_heads = n_kv_heads
         self.head_dim   = head_dim
         self.window     = window
         self.sink       = sink
-        shape = (n_layers, 1, n_kv_heads, window, head_dim)
-        self.k_buf = np.zeros(shape, dtype=np.float16)
-        self.v_buf = np.zeros(shape, dtype=np.float16)
         self.cache_pos: int = 0
         self.filled:    int = 0
+        self._use_memmap = use_memmap
+        self._k_file     = None
+        self._v_file     = None
+        shape = (n_layers, 1, n_kv_heads, window, head_dim)
+        dtype = np.float16
+        if use_memmap:
+            _dir = memmap_dir or tempfile.gettempdir()
+            # delete=False so memmap can keep the fd open cross-platform
+            self._k_file = tempfile.NamedTemporaryFile(
+                dir=_dir, delete=False, suffix=".k_cache")
+            self._v_file = tempfile.NamedTemporaryFile(
+                dir=_dir, delete=False, suffix=".v_cache")
+            self.k_buf = np.memmap(self._k_file.name, dtype=dtype,
+                                   mode="w+", shape=shape)
+            self.v_buf = np.memmap(self._v_file.name, dtype=dtype,
+                                   mode="w+", shape=shape)
+        else:
+            # np.empty: virtual memory allocated, no zero-fill — fast startup.
+            # All positions are written by update() before get() reads them.
+            self.k_buf = np.empty(shape, dtype=dtype)
+            self.v_buf = np.empty(shape, dtype=dtype)
     def reset(self):
         self.k_buf[:] = 0
         self.v_buf[:] = 0
+        if self._use_memmap:
+            self.k_buf.flush()
+            self.v_buf.flush()
         self.cache_pos = 0
         self.filled    = 0
+
+    def cleanup(self):
+        """Delete memmap temp files. Call when KVCache is no longer needed."""
+        for f in (self._k_file, self._v_file):
+            if f is not None:
+                try:
+                    os.unlink(f.name)
+                except OSError:
+                    pass
+        self._k_file = self._v_file = None
     def snapshot(self) -> dict:
         """
         FIX CACHE-ROLLBACK: Capture current cache state for transactional rollback.
         Returns a dict with copies of all mutable state.
+        With memmap buffers, flush is called before copy to ensure consistency.
         """
+        if self._use_memmap:
+            self.k_buf.flush()
+            self.v_buf.flush()
         return {
             "cache_pos": self.cache_pos,
             "filled":    self.filled,
@@ -469,10 +525,15 @@ class DracoTransformerV1:
         self.mtp = MTPHead(self.d_model, self.vocab_size)
         self.mtp.lm_head = self.lm_head
         self._cache: Optional[KVCache] = None
+        self._miro_mu: float = 5.0          # FIX: persistent Mirostat mu across turns
+        self._memmap_cache: bool = False     # set True to use memmap KVCache
+        self._memmap_dir: Optional[str] = None
     def _make_cache(self) -> KVCache:
         return KVCache(
             self.n_layers, self.n_kv_heads, self.head_dim,
-            window=self.window, sink=SINK_TOKENS
+            window=self.window, sink=SINK_TOKENS,
+            use_memmap=self._memmap_cache,
+            memmap_dir=self._memmap_dir,
         )
     # ── Forward pass ─────────────────────────────────────────────────
     def forward(self, token_ids: List[int], cache: KVCache,
@@ -636,9 +697,10 @@ class DracoTransformerV1:
         """
         if new_prompt or self._cache is None:
             self._cache = self._make_cache()
+            self._miro_mu = 5.0   # FIX: reset mu only when starting a new prompt
         cache = self._cache
         ids   = list(prompt_ids)
-        mu  = 5.0
+        mu  = self._miro_mu    # FIX: load persistent mu (already reset above if new_prompt)
         tau = 5.0
         eta = 0.1
         freq: Dict[int, int] = {}
@@ -853,6 +915,7 @@ class DracoTransformerV1:
             if ids and ids[-1] == spec_pending:
                 ids.pop()
             pre_spec_logits = None
+        self._miro_mu = mu   # FIX: persist mu for next generate() call (multi-turn)
         return ids[len(prompt_ids):]
     # ── Weight loading ────────────────────────────────────────────────
     def load_external_weights(self, state_dict: dict, from_checkpoint: bool = True):

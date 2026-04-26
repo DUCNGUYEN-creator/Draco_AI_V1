@@ -48,6 +48,10 @@ FIXES (V1 — final consolidated):
          which raises AttributeError because no_grad() is a context manager
          instance, not a class. Now uses a proper contextlib.nullcontext()
          fallback for the non-AMP path, which is the correct Python idiom.
+    ✅ FIX KVCACHE-ALLOC: KVCacheTorch uses torch.empty instead of torch.zeros.
+         torch.zeros zero-fills the entire buffer at init time (~2 GB/buffer for 9B model).
+         torch.empty skips zero-fill; safe because update() always writes before get() reads.
+         This eliminates startup lag and prevents OOM on low-VRAM / low-RAM machines.
 """
 
 from __future__ import annotations
@@ -162,8 +166,10 @@ if HAS_TORCH:
             self.cache_pos = 0
             self.filled    = 0
             shape = (n_layers, 1, n_kv_heads, window, head_dim)
-            self.k_buf = torch.zeros(shape, dtype=torch.float16, device=device)
-            self.v_buf = torch.zeros(shape, dtype=torch.float16, device=device)
+            # FIX KVCACHE-ALLOC: torch.empty skips zero-fill — fast startup.
+            # Safe because update() always writes a slot before get() reads it.
+            self.k_buf = torch.empty(shape, dtype=torch.float16, device=device)
+            self.v_buf = torch.empty(shape, dtype=torch.float16, device=device)
 
         def reset(self):
             self.k_buf.zero_()
