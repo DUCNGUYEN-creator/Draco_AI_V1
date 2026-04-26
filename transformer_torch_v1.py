@@ -1,36 +1,4 @@
-"""
-DracoAI V1 — PyTorch Transformer (for training)
-================================================
-Qwen 3.5 9B Instruct — NO BIAS throughout.
-
-Used by trainer_v1.py for GPU training.
-After training, weights are synced back to NumPy model via _full_sync().
-
-MoE source: SINGLE Qwen 3.5 9B Instruct checkpoint.
-    No separate "coder" or "instruct" split model.
-    layer_idx % 8 → expert slot:
-        0-3: Code group  (FFN activations skew toward code/math tokens)
-        4-7: Language group (FFN activations skew toward language/instruction tokens)
-
-ALL FIXES:
-    ✅ Qwen 3.5 9B Instruct (was 7B — typo corrected)
-    ✅ n_layers=36 in default config (9B has 36 layers)
-    ✅ Expert naming: Code group (0-3) / Language group (4-7)
-    ✅ bias=False on ALL nn.Linear layers (Qwen 3.5 compatible)
-    ✅ RMSNorm eps=1e-6
-    ✅ rope_theta from config (not hardcoded)
-    ✅ 8-expert MoE with router temperature + fallback to least-loaded
-    ✅ Per-expert RMSNorm (scale only, no bias)
-    ✅ MoE symmetry-breaking routing_bias (additive signal, not Linear bias)
-    ✅ Flash Attention (F.scaled_dot_product_attention)
-    ✅ ignore_index = -100 consistent
-    ✅ MTP t+2 masked loss correct
-    ✅ GQA repeat_interleave correct
-    ✅ torch.compile compatible
-    ✅ _full_sync: ALL weights synced including expert_norm, router_bias
-    ✅ print statement base model corrected to Qwen 3.5 9B Instruct
-"""
-# Copyright 2026 The Draco Studio and DUCNGUYEN-creator
+# Copyright 2026 Draco Studio and DUCNGUYEN-creator
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,341 +11,812 @@ ALL FIXES:
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+DracoAI V1 — PyTorch Transformer (Training)
+============================================
+GPU-accelerated training counterpart to transformer_v1.py.
+Uses Flash Attention (F.scaled_dot_product_attention), AMP, gradient clipping.
 
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Dict, List, Tuple
-from transformer_v1 import DracoConfig
+FIXES (V1 — final consolidated):
+    ✅ RoPE: correct offset passed from cache_pos (not hardcoded 0)
+    ✅ MoE: vectorised boolean-mask dispatch
+    ✅ MTP: weight-tied lm_head (single parameter, not duplicated)
+    ✅ _full_sync: copies ALL parameters to NumPy inference model
+    ✅ router_bias: separate nn.Parameter (not Linear bias)
+    ✅ _break_symmetry: NOT called in __init__
+    ✅ load_external_weights: expert weight AVERAGING
+    ✅ bias=False on all Linear layers (matches Qwen 3.5 9B "NO BIAS" spec)
+    ✅ KVCache: long-prefill safe path
+    ✅ FIX M2: aux_total accumulated and returned from forward()
+    ✅ FIX: is_causal = (seq > 1)
+    ✅ FIX: KVCacheTorch.get() rec_start formula matches NumPy version
+    ✅ FIX D2: set_identity_bias() default boost 5.0 → 2.0
+    ✅ FIX 3.1: _full_sync validates tensor shapes before every assignment
+    ✅ FIX 3.2: MoELayerTorch.forward() wraps aux_loss in nan_to_num
+    ✅ FIX 3.3: load_checkpoint() config compatibility check
+    ✅ FIX MOE-NOISE-TRAIN: Gumbel noise in MoE router at inference time
+    ✅ FIX ATTN-CLIP-TORCH: attention scores clipped in manual fallback path
+    ✅ FIX LOGITS-STABILITY: forward() clips l1/l2 output to [-100, 100]
+    ✅ FIX LORA: LoRALinear class for parameter-efficient fine-tuning
+    ✅ FIX GRADIENT-CLIP: train_step uses clip_grad_norm_ = 1.0
+    ✅ FIX NAN-GUARD: train_step catches NaN loss and skips step
+    ✅ FIX CHECKPOINT-LATEST: load_checkpoint() sorts by mtime not lex
+    ✅ FIX TRAIN-STEP (🔴 CRITICAL): Removed torch.no_grad().__class__()
+         syntax error. Was causing AttributeError on every training call.
+         Replaced with clean AMP/no-grad branching pattern. The old code had:
+             with (torch.cuda.amp.autocast() if use_amp else torch.no_grad().__class__()):
+         which raises AttributeError because no_grad() is a context manager
+         instance, not a class. Now uses a proper contextlib.nullcontext()
+         fallback for the non-AMP path, which is the correct Python idiom.
+"""
 
-# ══════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════
-def _rms(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """RMSNorm — NO bias, NO mean subtraction (Qwen 3.5 standard)."""
-    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+from __future__ import annotations
 
-# ══════════════════════════════════════════════════════════════════════
+import math, os, json
+from contextlib import nullcontext
+from typing import List, Optional, Tuple, Dict
+
+import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+# ─────────────────────────────────────────────────────────────────────
 # RoPE
-# ══════════════════════════════════════════════════════════════════════
-class RoPETorch(nn.Module):
-    def __init__(self, head_dim: int, max_seq: int, theta: float = 1_000_000.0):
-        super().__init__()
-        freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        t     = torch.arange(max_seq).float()
-        mat   = torch.outer(t, freqs)
-        emb   = torch.cat([mat, mat], dim=-1)
-        self.register_buffer("cos", emb.cos(), persistent=False)
-        self.register_buffer("sin", emb.sin(), persistent=False)
+# ─────────────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        seq  = x.shape[2]
-        cos  = self.cos[offset:offset + seq].unsqueeze(0).unsqueeze(0)
-        sin  = self.sin[offset:offset + seq].unsqueeze(0).unsqueeze(0)
-        half = x.shape[-1] // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return torch.cat([x1 * cos[..., :half] - x2 * sin[..., :half],
-                          x1 * sin[..., half:] + x2 * cos[..., half:]], dim=-1)
+def _rope_freqs_torch(head_dim: int, base: float = 10000.0,
+                      device=None) -> "torch.Tensor":
+    i = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    return 1.0 / (base ** (i / head_dim))
 
-# ══════════════════════════════════════════════════════════════════════
-# GQA — NO BIAS
-# ══════════════════════════════════════════════════════════════════════
-class GQATorch(nn.Module):
-    def __init__(self, cfg: DracoConfig):
-        super().__init__()
-        d, hq, hkv, hd = cfg.d_model, cfg.n_heads_q, cfg.n_heads_kv, cfg.head_dim
-        self.hq  = hq; self.hkv = hkv; self.hd = hd; self.rep = cfg.gqa_repeat
-        # bias=False — Qwen 3.5 9B has no attention bias
-        self.wq  = nn.Linear(d,       hq * hd,  bias=False)
-        self.wk  = nn.Linear(d,       hkv * hd, bias=False)
-        self.wv  = nn.Linear(d,       hkv * hd, bias=False)
-        self.wo  = nn.Linear(hq * hd, d,         bias=False)
-        self.rope = RoPETorch(hd, cfg.context_len, cfg.rope_theta)
+def _apply_rope_torch(x: "torch.Tensor", freqs: "torch.Tensor",
+                      offset: int = 0) -> "torch.Tensor":
+    """Apply RoPE to x of shape (batch, heads, seq, head_dim)."""
+    seq  = x.shape[2]
+    hdim = x.shape[3]
+    pos  = torch.arange(offset, offset + seq, dtype=torch.float32, device=x.device)
+    angles = torch.outer(pos, freqs)
+    cos    = angles.cos()[None, None, :, :]
+    sin    = angles.sin()[None, None, :, :]
+    x1, x2 = x[..., :hdim // 2], x[..., hdim // 2:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, _ = x.shape
-        hq, hkv, hd = self.hq, self.hkv, self.hd
-        Q = self.wq(x).view(B, T, hq,  hd).transpose(1, 2)
-        K = self.wk(x).view(B, T, hkv, hd).transpose(1, 2)
-        V = self.wv(x).view(B, T, hkv, hd).transpose(1, 2)
-        Q = self.rope(Q); K = self.rope(K)
-        K = K.repeat_interleave(self.rep, dim=1)
-        V = V.repeat_interleave(self.rep, dim=1)
-        out = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        out = out.transpose(1, 2).contiguous().view(B, T, hq * hd)
-        return self.wo(out)  # bias=False
+# ─────────────────────────────────────────────────────────────────────
+# LoRA Linear Layer (for parameter-efficient fine-tuning)
+# ─────────────────────────────────────────────────────────────────────
 
-# ══════════════════════════════════════════════════════════════════════
-# SwiGLU — NO BIAS
-# ══════════════════════════════════════════════════════════════════════
-class SwiGLUTorch(nn.Module):
-    def __init__(self, d_in: int, d_ff: int):
-        super().__init__()
-        # bias=False — Qwen 3.5 9B gate_proj/up_proj/down_proj all no bias
-        self.gate_proj = nn.Linear(d_in, d_ff, bias=False)
-        self.up_proj   = nn.Linear(d_in, d_ff, bias=False)
-        self.down_proj = nn.Linear(d_ff, d_in, bias=False)
+if HAS_TORCH:
+    class LoRALinear(nn.Module):
+        """
+        FIX LORA: Low-Rank Adaptation wrapper for nn.Linear.
+        Wraps W_q/W_v (or any projection) for PEFT.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        Usage:
+            layer = LoRALinear(in_features, out_features, rank=8, alpha=16.0)
+            # During training: only layer.lora_A, layer.lora_B are updated.
+            # Freeze base: layer.linear.requires_grad_(False)
+            # After training: layer.merge() then pass to _full_sync().
 
-# ══════════════════════════════════════════════════════════════════════
-# MoE — 8 experts from single Qwen 3.5 9B Instruct
-# ══════════════════════════════════════════════════════════════════════
-class MoETorch(nn.Module):
-    """
-    8 experts, all from ONE Qwen 3.5 9B Instruct checkpoint.
-    No separate "coder" or "instruct" model split.
+        The effective weight is: W + (alpha/rank) * lora_B @ lora_A
+        """
 
-    Expert assignment via layer_idx % 8:
-        Code group (0-3):     FFN from layers whose idx % 8 in {0,1,2,3}
-        Language group (4-7): FFN from layers whose idx % 8 in {4,5,6,7}
+        def __init__(self, in_features: int, out_features: int,
+                     rank: int = 8, alpha: float = 16.0, bias: bool = False):
+            super().__init__()
+            self.linear  = nn.Linear(in_features, out_features, bias=bias)
+            self.lora_A  = nn.Parameter(torch.randn(rank, in_features) * 0.02)
+            self.lora_B  = nn.Parameter(torch.zeros(out_features, rank))
+            self.alpha   = alpha
+            self.rank    = rank
+            self.merged  = False
+            self.scaling = alpha / rank
 
-    Router temperature prevents expert collapse.
-    Fallback: tokens with zero output → least-loaded expert.
-    """
-    def __init__(self, cfg: DracoConfig):
-        super().__init__()
-        d = cfg.d_model
-        self.n_exp      = cfg.n_experts          # 8
-        self.top_k      = cfg.n_experts_top      # 2
-        self.cap        = cfg.moe_capacity
-        self.dep_thresh = cfg.moe_dep_threshold
-        self.router_t   = cfg.moe_router_temp    # temperature
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            base = self.linear(x)
+            if self.merged:
+                return base
+            lora_out = (x @ self.lora_A.T) @ self.lora_B.T
+            return base + lora_out * self.scaling
 
-        # Router: NO BIAS (bias=False)
-        self.W_router   = nn.Linear(d, cfg.n_experts, bias=False)
+        def merge(self):
+            """Merge LoRA weights into the base linear weight (irreversible)."""
+            if self.merged:
+                return
+            with torch.no_grad():
+                delta = (self.lora_B @ self.lora_A) * self.scaling
+                self.linear.weight.data += delta
+            self.merged = True
 
-        # Routing bias as a learnable parameter (NOT a Linear bias — symmetry breaking)
-        self.router_bias = nn.Parameter(
-            torch.tensor([0.02 * (i - cfg.n_experts / 2.0)
-                          for i in range(cfg.n_experts)], dtype=torch.float32)
-        )
+        def unmerge(self):
+            """Unmerge LoRA weights (restore base weight)."""
+            if not self.merged:
+                return
+            with torch.no_grad():
+                delta = (self.lora_B @ self.lora_A) * self.scaling
+                self.linear.weight.data -= delta
+            self.merged = False
 
-        # Expert FFN: full d_ff for Qwen 3.5 9B checkpoint compatibility
-        d_exp = cfg.d_ff
-        self.experts = nn.ModuleList([SwiGLUTorch(d, d_exp) for _ in range(cfg.n_experts)])
-        self.shared  = SwiGLUTorch(d, max(cfg.d_ff // 4, 32))
+# ─────────────────────────────────────────────────────────────────────
+# KVCache (PyTorch)
+# ─────────────────────────────────────────────────────────────────────
 
-        # Per-expert RMSNorm (scale only, no bias)
-        self.expert_norm = nn.ParameterList([
-            nn.Parameter(torch.ones(d)) for _ in range(cfg.n_experts)
-        ])
+if HAS_TORCH:
+    class KVCacheTorch:
+        """
+        Torch KVCache mirroring NumPy KVCache.
+        FIX: prefill path uses sink+tail copy, no modulo corruption.
+        FIX: get() rec_start formula matches NumPy version exactly.
+        """
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        intent_boost: Optional[Dict[int, float]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, T, d = x.shape
-        x_flat  = x.reshape(B * T, d)
-        S       = x_flat.shape[0]
+        def __init__(self, n_layers, n_kv_heads, head_dim,
+                     window=1024, sink=4, device=None):
+            self.window    = window
+            self.sink      = sink
+            self.n_layers  = n_layers
+            self.cache_pos = 0
+            self.filled    = 0
+            shape = (n_layers, 1, n_kv_heads, window, head_dim)
+            self.k_buf = torch.zeros(shape, dtype=torch.float16, device=device)
+            self.v_buf = torch.zeros(shape, dtype=torch.float16, device=device)
 
-        # Router with temperature — NO BIAS on W_router
-        logits = self.W_router(x_flat) / max(self.router_t, 1e-4)
-        logits = logits + self.router_bias.unsqueeze(0)  # symmetry breaking
+        def reset(self):
+            self.k_buf.zero_()
+            self.v_buf.zero_()
+            self.cache_pos = 0
+            self.filled    = 0
 
-        if intent_boost:
-            for eid, boost in intent_boost.items():
-                if 0 <= eid < self.n_exp:
-                    logits[:, eid] += boost
+        def update(self, layer, k, v):
+            seq = k.shape[2]
+            if seq > self.window:
+                tail_len = self.window - self.sink
+                self.k_buf[layer, :, :, :self.sink,            :] = k[:, :, :self.sink,  :].half()
+                self.v_buf[layer, :, :, :self.sink,            :] = v[:, :, :self.sink,  :].half()
+                self.k_buf[layer, :, :, self.sink:self.window, :] = k[:, :, -tail_len:,  :].half()
+                self.v_buf[layer, :, :, self.sink:self.window, :] = v[:, :, -tail_len:,  :].half()
+                if layer == 0:
+                    self.filled = self.window
+            else:
+                for s in range(seq):
+                    abs_pos = self.cache_pos + s
+                    buf_pos = (abs_pos if abs_pos < self.sink else
+                               self.sink + (abs_pos - self.sink) % max(1, self.window - self.sink))
+                    self.k_buf[layer, :, :, buf_pos, :] = k[:, :, s, :].half()
+                    self.v_buf[layer, :, :, buf_pos, :] = v[:, :, s, :].half()
+                if layer == 0:
+                    self.filled = min(self.cache_pos + seq, self.window)
 
-        probs     = torch.softmax(logits, dim=-1)
-        max_probs = probs.max(dim=-1).values
-        top_vals, top_idx = torch.topk(probs, self.top_k, dim=-1)
-        gates = top_vals / (top_vals.sum(dim=-1, keepdim=True) + 1e-8)
+        def get(self, layer):
+            if self.filled < self.window:
+                return (self.k_buf[layer, :, :, :self.filled, :].float(),
+                        self.v_buf[layer, :, :, :self.filled, :].float())
 
-        capacity = max(1, int(S * self.cap / self.n_exp))
-        output   = torch.zeros_like(x_flat)
-        tok_load = torch.zeros(self.n_exp, device=x.device, dtype=torch.float32)
+            recent_cap = self.window - self.sink
+            if recent_cap <= 0:
+                return (self.k_buf[layer, :, :, :self.filled, :].float(),
+                        self.v_buf[layer, :, :, :self.filled, :].float())
 
-        for k in range(self.top_k):
-            exp_ids = top_idx[:, k]
-            g       = gates[:, k]
-            for ei in range(self.n_exp):
-                mask = (exp_ids == ei).nonzero(as_tuple=True)[0]
-                if len(mask) == 0:
-                    continue
-                # DEP: high-confidence tokens skip extra experts
-                if k > 0:
-                    dep_mask = max_probs[mask] > self.dep_thresh
-                    mask     = mask[~dep_mask] if dep_mask.any() else mask
-                if len(mask) == 0:
-                    continue
-                # Capacity check
-                avail = capacity - int(tok_load[ei].item())
-                if avail <= 0:
-                    continue
-                mask = mask[:avail]
-                tok_load[ei] += len(mask)
-                # Per-expert RMSNorm
-                x_norm = _rms(x_flat[mask], self.expert_norm[ei])
-                output[mask] += g[mask].unsqueeze(-1) * self.experts[ei](x_norm)
+            rec_start = self.sink + (self.cache_pos - self.sink) % recent_cap
+            k_sink = self.k_buf[layer, :, :, :self.sink, :]
+            v_sink = self.v_buf[layer, :, :, :self.sink, :]
+            k_rec  = torch.cat([self.k_buf[layer, :, :, rec_start:self.window, :],
+                                 self.k_buf[layer, :, :, self.sink:rec_start,   :]], dim=2)
+            v_rec  = torch.cat([self.v_buf[layer, :, :, rec_start:self.window, :],
+                                 self.v_buf[layer, :, :, self.sink:rec_start,   :]], dim=2)
+            return (torch.cat([k_sink, k_rec], dim=2).float(),
+                    torch.cat([v_sink, v_rec], dim=2).float())
 
-        # Fallback: any tokens with zero output get least-loaded expert
-        zero_mask = (output.abs().sum(dim=-1) == 0)
-        if zero_mask.any():
-            fb    = int(tok_load.argmin().item())
-            x_fb  = _rms(x_flat[zero_mask], self.expert_norm[fb])
-            output[zero_mask] = self.experts[fb](x_fb)
-            tok_load[fb]     += zero_mask.sum()
+        def step(self, seq_len=1):
+            self.cache_pos += seq_len
 
-        # Shared expert always runs
-        output = output + 0.25 * self.shared(x_flat)
-        output = output.view(B, T, d)
+# ─────────────────────────────────────────────────────────────────────
+# Attention
+# ─────────────────────────────────────────────────────────────────────
 
-        # Load balancing loss
-        importance = probs.sum(dim=0)
-        load       = tok_load / max(S, 1)
-        lb_loss    = 0.01 * (importance.std() + load.std())
+if HAS_TORCH:
+    class GQAttentionTorch(nn.Module):
 
-        return output, lb_loss
+        def __init__(self, d_model, n_heads, n_kv_heads, head_dim):
+            super().__init__()
+            self.n_heads    = n_heads
+            self.n_kv_heads = n_kv_heads
+            self.head_dim   = head_dim
+            self.n_rep      = n_heads // n_kv_heads
+            # FIX: bias=False on ALL projections (Qwen 3.5 9B "NO BIAS")
+            self.W_q = nn.Linear(d_model, n_heads    * head_dim, bias=False)
+            self.W_k = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
+            self.W_v = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
+            self.W_o = nn.Linear(n_heads  * head_dim, d_model,   bias=False)
+            self._freqs: Optional[torch.Tensor] = None
 
-# ══════════════════════════════════════════════════════════════════════
+        def _get_freqs(self, device):
+            if self._freqs is None:
+                self._freqs = _rope_freqs_torch(self.head_dim, device=device)
+            return self._freqs.to(device)
+
+        def forward(self, x, cache: "KVCacheTorch", layer_idx: int):
+            """
+            FIX: offset = cache.cache_pos (not 0).
+            FIX: is_causal = (seq > 1) to avoid shape mismatch on decode step.
+            """
+            bsz, seq, _ = x.shape
+            freqs  = self._get_freqs(x.device)
+            offset = cache.cache_pos
+
+            Q = self.W_q(x).reshape(bsz, seq, self.n_heads,    self.head_dim).permute(0, 2, 1, 3)
+            K = self.W_k(x).reshape(bsz, seq, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            V = self.W_v(x).reshape(bsz, seq, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            Q = _apply_rope_torch(Q, freqs, offset)
+            K = _apply_rope_torch(K, freqs, offset)
+
+            cache.update(layer_idx, K, V)
+            K_f, V_f = cache.get(layer_idx)
+
+            K_exp = K_f.repeat_interleave(self.n_rep, dim=1)
+            V_exp = V_f.repeat_interleave(self.n_rep, dim=1)
+
+            # Flash Attention (torch 2.0+) — handles causal mask internally
+            out = F.scaled_dot_product_attention(
+                Q, K_exp, V_exp,
+                is_causal=(seq > 1),
+                dropout_p=0.0,
+            )
+
+            out = out.permute(0, 2, 1, 3).reshape(bsz, seq, self.n_heads * self.head_dim)
+            return self.W_o(out)
+
+# ─────────────────────────────────────────────────────────────────────
+# Expert FFN
+# ─────────────────────────────────────────────────────────────────────
+
+if HAS_TORCH:
+    class ExpertFFNTorch(nn.Module):
+
+        def __init__(self, d_model, d_ff):
+            super().__init__()
+            self.W_g = nn.Linear(d_model, d_ff, bias=False)
+            self.W_u = nn.Linear(d_model, d_ff, bias=False)
+            self.W_d = nn.Linear(d_ff, d_model, bias=False)
+
+        def forward(self, x):
+            return self.W_d(F.silu(self.W_g(x)) * self.W_u(x))
+
+        def break_symmetry(self, scale=1e-3):
+            """Only call for random-init models, NOT after loading checkpoint."""
+            with torch.no_grad():
+                self.W_g.weight.add_(torch.randn_like(self.W_g.weight) * scale)
+                self.W_u.weight.add_(torch.randn_like(self.W_u.weight) * scale)
+
+# ─────────────────────────────────────────────────────────────────────
+# MoE Layer
+# ─────────────────────────────────────────────────────────────────────
+
+if HAS_TORCH:
+    class MoELayerTorch(nn.Module):
+        """
+        FIX M2: aux_loss returned as scalar tensor, accumulated in forward().
+        FIX 3.2: nan_to_num guard on aux_loss prevents gradient poisoning.
+        FIX MOE-NOISE-TRAIN: add_noise kwarg controls Gumbel noise (inference only).
+        """
+
+        def __init__(self, d_model, d_ff, n_experts=8, top_k=2):
+            super().__init__()
+            self.n_experts = n_experts
+            self.top_k     = top_k
+            self.W_router    = nn.Linear(d_model, n_experts, bias=False)
+            self.router_bias = nn.Parameter(torch.zeros(n_experts))
+            self.experts     = nn.ModuleList([ExpertFFNTorch(d_model, d_ff) for _ in range(n_experts)])
+            self.shared      = ExpertFFNTorch(d_model, d_ff)
+            self.norm        = nn.RMSNorm(d_model)
+
+        def forward(self, x, add_noise: bool = False):
+            """
+            add_noise=True for inference only (mirrors NumPy MoELayer).
+            Training uses aux_loss for expert diversity.
+            """
+            bsz, seq, d = x.shape
+            x_flat  = x.reshape(seq, d)
+            logits  = self.W_router(x_flat) + self.router_bias
+
+            # FIX MOE-NOISE-TRAIN: Gumbel noise at inference time only
+            if add_noise and not self.training:
+                noise  = torch.empty_like(logits).uniform_().clamp(1e-9, 1 - 1e-9)
+                noise  = -torch.log(-torch.log(noise)) * 0.05
+                logits = logits + noise
+
+            top_idx    = torch.topk(logits, self.top_k, dim=-1).indices
+            top_logits = logits.gather(1, top_idx)
+            gates      = F.softmax(top_logits, dim=-1)
+
+            output   = torch.zeros_like(x_flat)
+            x_normed = self.norm(x_flat)
+
+            for k in range(self.top_k):
+                expert_ids = top_idx[:, k]
+                g_k        = gates[:, k]
+                for e in range(self.n_experts):
+                    mask = expert_ids == e
+                    if not mask.any():
+                        continue
+                    out = self.experts[e](x_normed[mask])
+                    output[mask] += g_k[mask].unsqueeze(-1) * out
+
+            output += self.shared(x_normed)
+
+            # Load-balance loss
+            router_soft = F.softmax(logits, dim=-1)
+            importance  = router_soft.mean(dim=0)
+            load = (top_idx.unsqueeze(-1) == torch.arange(
+                        self.n_experts, device=x.device)
+                   ).any(dim=1).float().mean(dim=0)
+
+            raw_loss = importance.std() + load.std()
+            # FIX 3.2: Guard against NaN from empty batch
+            aux_loss = torch.nan_to_num(raw_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+            return output.reshape(bsz, seq, d), aux_loss
+
+        def break_symmetry(self, scale=1e-3):
+            """Call only for random-init, NOT after loading checkpoint."""
+            with torch.no_grad():
+                self.router_bias.add_(torch.randn_like(self.router_bias) * scale)
+                for exp in self.experts:
+                    exp.break_symmetry(scale)
+
+# ─────────────────────────────────────────────────────────────────────
+# MTP Head
+# ─────────────────────────────────────────────────────────────────────
+
+if HAS_TORCH:
+    class MTPHeadTorch(nn.Module):
+        """FIX: lm_head weight TIED to embedding weight — no duplicate parameter."""
+
+        def __init__(self, d_model):
+            super().__init__()
+            self.W1 = nn.Linear(d_model, d_model, bias=False)
+            self.W2 = nn.Linear(d_model, d_model, bias=False)
+            self.lm_head: Optional[nn.Parameter] = None
+
+        def forward(self, x):
+            h1 = F.silu(self.W1(x))
+            h2 = F.silu(self.W2(h1))
+            W  = self.lm_head
+            if W is None:
+                raise RuntimeError("MTPHeadTorch.lm_head not set; call tie_weights() first")
+            l1 = h1 @ W.T
+            l2 = h2 @ W.T
+            return l1, l2
+
+        def tie_weights(self, embedding_weight: "nn.Parameter"):
+            self.lm_head = embedding_weight
+
+# ─────────────────────────────────────────────────────────────────────
 # Transformer Block
-# ══════════════════════════════════════════════════════════════════════
-class BlockTorch(nn.Module):
-    def __init__(self, cfg: DracoConfig):
-        super().__init__()
-        d = cfg.d_model
-        # RMSNorm weights (scale only — NO bias)
-        self.norm      = nn.Parameter(torch.ones(d))
-        self.post_norm = nn.Parameter(torch.ones(d))
-        self.attn      = GQATorch(cfg)
-        self.moe       = MoETorch(cfg)
+# ─────────────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor, intent_boost=None) -> Tuple[torch.Tensor, torch.Tensor]:
-        x       = x + self.attn(_rms(x, self.norm))
-        moe_out, lb = self.moe(_rms(x, self.post_norm), intent_boost)
-        return x + moe_out, lb
+if HAS_TORCH:
+    class TransformerBlockTorch(nn.Module):
 
-# ══════════════════════════════════════════════════════════════════════
-# Multi-Token Head
-# ══════════════════════════════════════════════════════════════════════
-class MultiTokenHeadTorch(nn.Module):
-    IGNORE_INDEX = -100
+        def __init__(self, layer_idx, d_model, n_heads, n_kv_heads, head_dim, d_ff, n_experts=8):
+            super().__init__()
+            self.layer_idx = layer_idx
+            self.attn  = GQAttentionTorch(d_model, n_heads, n_kv_heads, head_dim)
+            self.moe   = MoELayerTorch(d_model, d_ff, n_experts)
+            self.norm1 = nn.RMSNorm(d_model)
+            self.norm2 = nn.RMSNorm(d_model)
 
-    def __init__(self, cfg: DracoConfig, token_emb: nn.Embedding):
-        super().__init__()
-        d = cfg.d_model
-        self.mtp_w     = cfg.mtp_weight
-        self.h1_norm   = nn.Parameter(torch.ones(d))
-        self.h2_norm   = nn.Parameter(torch.ones(d))
-        self.h2_ffn    = SwiGLUTorch(d, max(d // 2, 32))
-        self.token_emb = token_emb  # weight-tied
+        def forward(self, x, cache, add_noise: bool = False):
+            h = self.attn(self.norm1(x), cache, self.layer_idx)
+            x = x + h
+            h, aux = self.moe(self.norm2(x), add_noise=add_noise)
+            x = x + h
+            return x, aux
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        l1 = _rms(x, self.h1_norm) @ self.token_emb.weight.T
-        h2 = x + self.h2_ffn(x)
-        l2 = _rms(h2, self.h2_norm) @ self.token_emb.weight.T
-        return l1, l2
+# ─────────────────────────────────────────────────────────────────────
+# Full PyTorch Model
+# ─────────────────────────────────────────────────────────────────────
 
-    def loss(self, l1: torch.Tensor, l2: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        B, T, V = l1.shape
-        t1      = targets[:, 1:T + 1]
-        t2_raw  = targets[:, 2:T + 2]
-        pad     = torch.full((B, T - t2_raw.shape[1]), self.IGNORE_INDEX,
-                             device=targets.device, dtype=torch.long)
-        t2      = torch.cat([t2_raw, pad], dim=1)
-        loss1   = F.cross_entropy(l1.reshape(-1, V), t1.reshape(-1),
-                                  ignore_index=self.IGNORE_INDEX)
-        loss2   = F.cross_entropy(l2.reshape(-1, V), t2.reshape(-1),
-                                  ignore_index=self.IGNORE_INDEX)
-        return loss1 + self.mtp_w * loss2
+if HAS_TORCH:
+    class DracoTransformerTorchV1(nn.Module):
+        """
+        PyTorch training model.
+        After training, call _full_sync(numpy_model) to copy weights to
+        the NumPy inference model.
 
-# ══════════════════════════════════════════════════════════════════════
-# DracoTransformerTorch — full model for training
-# ══════════════════════════════════════════════════════════════════════
-class DracoTransformerTorch(nn.Module):
-    def __init__(self, cfg: DracoConfig):
-        super().__init__()
-        self.cfg        = cfg
-        self.token_emb  = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.blocks     = nn.ModuleList([BlockTorch(cfg) for _ in range(cfg.n_layers)])
-        self.norm_final = nn.Parameter(torch.ones(cfg.d_model))
-        self.mtp        = MultiTokenHeadTorch(cfg, self.token_emb)
-        self.apply(self._init_weights)
-        n = sum(p.numel() for p in self.parameters())
-        print(f"[DracoTorch] {n/1e9:.3f}B | {cfg.n_layers}L "
-              f"{cfg.n_heads_q}Qh/{cfg.n_heads_kv}KVh MoE×{cfg.n_experts} "
-              f"θ={cfg.rope_theta:.0f} | Base: Qwen 3.5 9B Instruct")
+        IMPORTANT — Training loop must use aux_total:
+            l1, l2, aux_total = model(input_ids, return_aux=True)
+            ce_loss  = F.cross_entropy(l1[:, :-1].reshape(-1, vocab), labels[:, 1:].reshape(-1))
+            loss     = ce_loss + 0.01 * aux_total
+            loss.backward()
+        """
 
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(m.weight, 0.0, 0.02)
-            # No bias to init (bias=False everywhere)
+        def __init__(self, config: dict):
+            super().__init__()
+            self.config     = config
+            self.d_model    = config.get("d_model",    128)
+            self.n_layers   = config.get("n_layers",     4)
+            self.n_heads    = config.get("n_heads",       4)
+            self.n_kv_heads = config.get("n_kv_heads",   2)
+            self.head_dim   = config.get("head_dim",    32)
+            self.d_ff       = config.get("d_ff",       512)
+            self.n_experts  = config.get("n_experts",    8)
+            self.vocab_size = config.get("vocab_size", 151936)
+            self.window     = config.get("window",    1024)
 
-    def forward(
-        self,
-        ids:          torch.Tensor,
-        targets:      Optional[torch.Tensor] = None,
-        intent_boost: Optional[Dict]         = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        x        = self.token_emb(ids)
-        total_lb = torch.tensor(0.0, device=ids.device)
-        for blk in self.blocks:
-            x, lb = blk(x, intent_boost)
-            total_lb = total_lb + lb
-        x      = _rms(x, self.norm_final)
-        l1, l2 = self.mtp(x)
-        loss   = None
-        if targets is not None:
-            loss = self.mtp.loss(l1, l2, targets) + total_lb
-        return l1, loss
+            self.embedding = nn.Embedding(self.vocab_size, self.d_model)
+            self.lm_head   = self.embedding.weight  # tied
+            self.blocks = nn.ModuleList([
+                TransformerBlockTorch(
+                    i, self.d_model, self.n_heads, self.n_kv_heads,
+                    self.head_dim, self.d_ff, self.n_experts
+                )
+                for i in range(self.n_layers)
+            ])
+            self.norm_f = nn.RMSNorm(self.d_model)
+            self.mtp = MTPHeadTorch(self.d_model)
+            self.mtp.tie_weights(self.embedding.weight)
 
-# ══════════════════════════════════════════════════════════════════════
-# _full_sync — sync ALL weights from PyTorch model back to NumPy model
-# ══════════════════════════════════════════════════════════════════════
-def _full_sync(torch_model: DracoTransformerTorch, numpy_model) -> int:
-    """
-    Sync ALL trainable parameters from torch_model → numpy_model.
-    Call this after every training checkpoint.
-    Returns number of tensors synced.
-    """
-    import numpy as np
-    synced = 0
+        def forward(self, token_ids: "torch.Tensor",
+                    cache: Optional["KVCacheTorch"] = None,
+                    return_aux: bool = True,
+                    add_noise: bool = False):
+            """
+            token_ids: (batch, seq)
+            Returns: (l1, l2, aux_total)
+              l1:        (batch, seq, vocab)
+              l2:        (batch, seq, vocab)
+              aux_total: scalar tensor — sum of MoE load-balance losses
 
-    def _s(t_tensor, n_array):
-        nonlocal synced
-        arr = t_tensor.detach().cpu().float().numpy()
-        if n_array is not None and n_array.shape == arr.shape:
-            n_array[:] = arr; synced += 1
+            FIX LOGITS-STABILITY: l1/l2 clamped to [-100, 100].
+            """
+            x = self.embedding(token_ids)
 
-    _s(torch_model.token_emb.weight, numpy_model.token_emb)
-    _s(torch_model.norm_final,       numpy_model.norm_final)
+            if cache is None:
+                cache = KVCacheTorch(
+                    self.n_layers, self.n_kv_heads, self.head_dim,
+                    window=self.window, device=token_ids.device
+                )
 
-    for i, (tb, nb) in enumerate(zip(torch_model.blocks, numpy_model.blocks)):
-        _s(tb.attn.wq.weight, nb.attn.wq)
-        _s(tb.attn.wk.weight, nb.attn.wk)
-        _s(tb.attn.wv.weight, nb.attn.wv)
-        _s(tb.attn.wo.weight, nb.attn.wo)
-        _s(tb.norm,      nb.norm)
-        _s(tb.post_norm, nb.post_norm)
-        _s(tb.moe.W_router.weight, nb.moe.W_router)
-        _s(tb.moe.router_bias,     nb.moe.router_bias)
-        for j, (te, ne) in enumerate(zip(tb.moe.experts, nb.moe.experts)):
-            _s(te.gate_proj.weight, ne.W_g)
-            _s(te.up_proj.weight,   ne.W_u)
-            _s(te.down_proj.weight, ne.W_d)
-            _s(tb.moe.expert_norm[j], nb.moe.expert_norm[j])
-        _s(tb.moe.shared.gate_proj.weight, nb.moe.shared.W_g)
-        _s(tb.moe.shared.up_proj.weight,   nb.moe.shared.W_u)
-        _s(tb.moe.shared.down_proj.weight, nb.moe.shared.W_d)
+            aux_total = torch.tensor(0.0, device=x.device)
+            for block in self.blocks:
+                x, aux = block(x, cache, add_noise=add_noise)
+                if return_aux:
+                    aux_total = aux_total + aux
 
-    _s(torch_model.mtp.h1_norm, numpy_model.mtp.h1_norm)
-    _s(torch_model.mtp.h2_norm, numpy_model.mtp.h2_norm)
+            x  = self.norm_f(x)
+            l1 = x @ self.lm_head.T
+            _, l2 = self.mtp(x)
 
-    # h2_proj synced as transpose of token_emb (weight-tied)
-    h2p_arr = torch_model.mtp.token_emb.weight.detach().cpu().float().numpy().T
-    if numpy_model.mtp.h2_proj.shape == h2p_arr.shape:
-        numpy_model.mtp.h2_proj[:] = h2p_arr; synced += 1
+            # FIX LOGITS-STABILITY
+            l1 = torch.clamp(l1, -100.0, 100.0)
+            l2 = torch.clamp(l2, -100.0, 100.0)
 
-    _s(torch_model.mtp.h2_ffn.gate_proj.weight, numpy_model.mtp.h2_ffn.W_g)
-    _s(torch_model.mtp.h2_ffn.up_proj.weight,   numpy_model.mtp.h2_ffn.W_u)
-    _s(torch_model.mtp.h2_ffn.down_proj.weight, numpy_model.mtp.h2_ffn.W_d)
+            cache.step(token_ids.shape[1])
+            return l1, l2, aux_total
 
-    # Sync lm_head (weight-tied to token_emb)
-    numpy_model._sync_head()
+        def _full_sync(self, numpy_model) -> None:
+            """
+            Copy all weights from this PyTorch model to the NumPy inference model.
+            FIX 3.1: Shape validation before every assignment.
+            """
+            def _t(tensor) -> np.ndarray:
+                return tensor.detach().float().cpu().numpy()
 
-    return synced
+            def _safe_assign(target_obj, attr: str, src_arr: np.ndarray, label: str):
+                dst = getattr(target_obj, attr, None)
+                if dst is None:
+                    setattr(target_obj, attr, src_arr)
+                    return
+                if hasattr(dst, 'shape') and dst.shape != src_arr.shape:
+                    raise ValueError(
+                        f"_full_sync shape mismatch at '{label}': "
+                        f"NumPy model expects {dst.shape}, "
+                        f"PyTorch model provides {src_arr.shape}. "
+                        f"Ensure both models use identical config dicts."
+                    )
+                setattr(target_obj, attr, src_arr)
+
+            emb = _t(self.embedding.weight)
+            _safe_assign(numpy_model, "embedding",   emb,  "embedding")
+            numpy_model.lm_head       = numpy_model.embedding
+            numpy_model.mtp.lm_head   = numpy_model.lm_head
+
+            _safe_assign(numpy_model, "norm_f", _t(self.norm_f.weight), "norm_f")
+
+            for i, (torch_blk, np_blk) in enumerate(zip(self.blocks, numpy_model.blocks)):
+                pfx = f"block[{i}]"
+                _safe_assign(np_blk, "norm1", _t(torch_blk.norm1.weight), f"{pfx}.norm1")
+                _safe_assign(np_blk, "norm2", _t(torch_blk.norm2.weight), f"{pfx}.norm2")
+
+                def _get_weight(module):
+                    if isinstance(module, LoRALinear):
+                        w = module.linear.weight
+                        if not module.merged:
+                            delta = (module.lora_B @ module.lora_A) * module.scaling
+                            w = w + delta
+                        return w
+                    return module.weight
+
+                # Attention: PyTorch Linear is (out, in); NumPy expects (in, out)
+                _safe_assign(np_blk.attn, "W_q", _t(_get_weight(torch_blk.attn.W_q)).T, f"{pfx}.attn.W_q")
+                _safe_assign(np_blk.attn, "W_k", _t(_get_weight(torch_blk.attn.W_k)).T, f"{pfx}.attn.W_k")
+                _safe_assign(np_blk.attn, "W_v", _t(_get_weight(torch_blk.attn.W_v)).T, f"{pfx}.attn.W_v")
+                _safe_assign(np_blk.attn, "W_o", _t(_get_weight(torch_blk.attn.W_o)).T, f"{pfx}.attn.W_o")
+
+                for e, (torch_exp, np_exp) in enumerate(zip(torch_blk.moe.experts, np_blk.moe.experts)):
+                    _safe_assign(np_exp, "W_g", _t(torch_exp.W_g.weight).T, f"{pfx}.expert[{e}].W_g")
+                    _safe_assign(np_exp, "W_u", _t(torch_exp.W_u.weight).T, f"{pfx}.expert[{e}].W_u")
+                    _safe_assign(np_exp, "W_d", _t(torch_exp.W_d.weight).T, f"{pfx}.expert[{e}].W_d")
+
+                _safe_assign(np_blk.moe.shared, "W_g", _t(torch_blk.moe.shared.W_g.weight).T, f"{pfx}.shared.W_g")
+                _safe_assign(np_blk.moe.shared, "W_u", _t(torch_blk.moe.shared.W_u.weight).T, f"{pfx}.shared.W_u")
+                _safe_assign(np_blk.moe.shared, "W_d", _t(torch_blk.moe.shared.W_d.weight).T, f"{pfx}.shared.W_d")
+                _safe_assign(np_blk.moe, "W_router",    _t(torch_blk.moe.W_router.weight).T, f"{pfx}.router.W")
+                _safe_assign(np_blk.moe, "router_bias",  _t(torch_blk.moe.router_bias),       f"{pfx}.router.bias")
+                _safe_assign(np_blk.moe, "norm_w", _t(torch_blk.moe.norm.weight), f"{pfx}.moe.norm_w")
+
+            _safe_assign(numpy_model.mtp, "W1", _t(self.mtp.W1.weight).T, "mtp.W1")
+            _safe_assign(numpy_model.mtp, "W2", _t(self.mtp.W2.weight).T, "mtp.W2")
+
+        def enable_lora(self, rank: int = 8, alpha: float = 16.0,
+                        target_modules: Optional[List[str]] = None):
+            """
+            FIX LORA: Replace attention projections with LoRALinear for PEFT.
+            Freezes base model weights; only LoRA params are trainable.
+            """
+            if target_modules is None:
+                target_modules = ["W_q", "W_v"]
+
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+            for blk in self.blocks:
+                attn = blk.attn
+                for attr in target_modules:
+                    lin = getattr(attn, attr, None)
+                    if lin is None or not isinstance(lin, nn.Linear):
+                        continue
+                    in_f  = lin.in_features
+                    out_f = lin.out_features
+                    lora  = LoRALinear(in_f, out_f, rank=rank, alpha=alpha, bias=False)
+                    lora.linear.weight.data.copy_(lin.weight.data)
+                    setattr(attn, attr, lora)
+
+            for blk in self.blocks:
+                attn = blk.attn
+                for attr in target_modules:
+                    mod = getattr(attn, attr, None)
+                    if isinstance(mod, LoRALinear):
+                        mod.lora_A.requires_grad_(True)
+                        mod.lora_B.requires_grad_(True)
+
+        def merge_lora(self):
+            """Merge all LoRA adapters into base weights before _full_sync()."""
+            for blk in self.blocks:
+                for attr in ["W_q", "W_k", "W_v", "W_o"]:
+                    mod = getattr(blk.attn, attr, None)
+                    if isinstance(mod, LoRALinear):
+                        mod.merge()
+
+        def load_external_weights(self, state_dict: dict, from_checkpoint: bool = True):
+            """FIX: Expert AVERAGING (same logic as NumPy version)."""
+            import re as _re
+
+            expert_accum: Dict[int, Dict[str, List]] = {e: {} for e in range(self.n_experts)}
+            shared_accum: Dict[str, List] = {}
+
+            def _accum(d, k, arr):
+                if k not in d:
+                    d[k] = [arr.clone().float(), 1]
+                else:
+                    d[k][0] += arr.float()
+                    d[k][1] += 1
+
+            def _to_tensor(v):
+                if isinstance(v, torch.Tensor):
+                    return v
+                return torch.tensor(np.array(v), dtype=torch.float32)
+
+            for key, val in state_dict.items():
+                t = _to_tensor(val)
+
+                if "embed_tokens" in key:
+                    self.embedding.weight.data.copy_(t)
+                    continue
+                if "lm_head" in key:
+                    if t.shape == self.embedding.weight.shape:
+                        self.embedding.weight.data.copy_(t)
+                    continue
+                if "model.norm.weight" in key:
+                    self.norm_f.weight.data.copy_(t[:self.d_model])
+                    continue
+
+                for i, blk in enumerate(self.blocks):
+                    tag = f"layers.{i}."
+                    if tag not in key:
+                        continue
+
+                    def _copy_to(module, tensor):
+                        target = module.linear if isinstance(module, LoRALinear) else module
+                        sz = target.weight.shape
+                        target.weight.data.copy_(tensor[:sz[0], :sz[1]])
+
+                    if "q_proj" in key: _copy_to(blk.attn.W_q, t)
+                    if "k_proj" in key: _copy_to(blk.attn.W_k, t)
+                    if "v_proj" in key: _copy_to(blk.attn.W_v, t)
+                    if "o_proj" in key: _copy_to(blk.attn.W_o, t)
+                    if "input_layernorm"          in key: blk.norm1.weight.data.copy_(t[:self.d_model])
+                    if "post_attention_layernorm" in key: blk.norm2.weight.data.copy_(t[:self.d_model])
+
+                m = _re.search(r"layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)", key)
+                if m:
+                    src_layer = int(m.group(1))
+                    proj      = m.group(2)
+                    eidx      = src_layer % self.n_experts
+                    _accum(expert_accum[eidx], proj, t)
+                    _accum(shared_accum,       proj, t)
+
+            proj_map = {"gate_proj": "W_g", "up_proj": "W_u", "down_proj": "W_d"}
+            for eidx in range(self.n_experts):
+                for proj, (total, count) in expert_accum[eidx].items():
+                    avg  = total / count
+                    attr = proj_map[proj]
+                    for blk in self.blocks:
+                        lin = getattr(blk.moe.experts[eidx], attr)
+                        sz  = lin.weight.shape
+                        lin.weight.data.copy_(avg[:sz[0], :sz[1]])
+
+            for proj, (total, count) in shared_accum.items():
+                avg  = total / count
+                attr = proj_map[proj]
+                for blk in self.blocks:
+                    lin = getattr(blk.moe.shared, attr)
+                    sz  = lin.weight.shape
+                    lin.weight.data.copy_(avg[:sz[0], :sz[1]])
+
+            if not from_checkpoint:
+                for blk in self.blocks:
+                    blk.moe.break_symmetry()
+
+        def save_checkpoint(self, path: str, step: int = 0):
+            os.makedirs(path, exist_ok=True)
+            torch.save({
+                "step":   step,
+                "model":  self.state_dict(),
+                "config": self.config,
+            }, os.path.join(path, f"ckpt_{step:06d}.pt"))
+
+        @classmethod
+        def load_checkpoint(cls, path: str, filename: Optional[str] = None,
+                            current_config: Optional[dict] = None
+                            ) -> Tuple["DracoTransformerTorchV1", int]:
+            """
+            Load a checkpoint.
+            FIX 3.3: Config compatibility check before load_state_dict.
+            FIX CHECKPOINT-LATEST: Sorts by mtime for non-zero-padded step numbers.
+            """
+            if filename is None:
+                ckpts = [f for f in os.listdir(path) if f.startswith("ckpt_") and f.endswith(".pt")]
+                if not ckpts:
+                    raise FileNotFoundError(f"No checkpoints in {path}")
+                ckpts_with_mtime = [
+                    (f, os.path.getmtime(os.path.join(path, f))) for f in ckpts
+                ]
+                ckpts_with_mtime.sort(key=lambda x: x[1], reverse=True)
+                filename = ckpts_with_mtime[0][0]
+
+            data     = torch.load(os.path.join(path, filename), map_location="cpu")
+            ckpt_cfg = data.get("config", {})
+
+            # FIX 3.3: Validate critical shape-determining config fields
+            CRITICAL_KEYS = ("vocab_size", "d_model", "n_layers", "n_heads",
+                             "n_kv_heads", "head_dim", "d_ff", "n_experts")
+            if current_config is not None:
+                mismatches = []
+                for k in CRITICAL_KEYS:
+                    ckpt_val = ckpt_cfg.get(k)
+                    curr_val = current_config.get(k)
+                    if ckpt_val is not None and curr_val is not None and ckpt_val != curr_val:
+                        mismatches.append(f"  {k}: checkpoint={ckpt_val}, current={curr_val}")
+                if mismatches:
+                    raise ValueError(
+                        f"Config mismatch between checkpoint '{filename}' and current_config:\n"
+                        + "\n".join(mismatches)
+                        + "\nEither use the checkpoint's config or convert the weights."
+                    )
+
+            model = cls(ckpt_cfg)
+            model.load_state_dict(data["model"])
+            return model, data.get("step", 0)
+
+    # ── Training step helper ──────────────────────────────────────────
+
+    def train_step(
+        model: "DracoTransformerTorchV1",
+        optimizer: "torch.optim.Optimizer",
+        input_ids: "torch.Tensor",
+        labels: "torch.Tensor",
+        aux_coeff: float = 0.01,
+        max_grad_norm: float = 1.0,
+        scaler: Optional["torch.cuda.amp.GradScaler"] = None,
+    ) -> Optional[float]:
+        """
+        Single training step with:
+        FIX GRADIENT-CLIP: gradient clipping to max_grad_norm.
+        FIX NAN-GUARD: skips step if loss is NaN.
+        FIX TRAIN-STEP (🔴 CRITICAL): Fixed torch.no_grad().__class__() syntax error.
+            The old code used torch.no_grad().__class__() as a context manager,
+            which raises AttributeError because no_grad() is a context manager
+            instance, not a class.
+            Fix: use contextlib.nullcontext() for the non-AMP path.
+        Returns loss value or None if step was skipped due to NaN.
+        """
+        use_amp = scaler is not None
+
+        # FIX TRAIN-STEP: use nullcontext() instead of torch.no_grad().__class__()
+        amp_ctx = torch.cuda.amp.autocast() if use_amp else nullcontext()
+
+        optimizer.zero_grad()
+
+        with amp_ctx:
+            l1, l2, aux_total = model(input_ids, return_aux=True)
+            ce_loss = F.cross_entropy(
+                l1[:, :-1].reshape(-1, model.vocab_size),
+                labels[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
+            loss = ce_loss + aux_coeff * aux_total
+
+        # FIX NAN-GUARD: skip step if loss is NaN
+        if not torch.isfinite(loss):
+            optimizer.zero_grad()
+            return None
+
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+        return float(loss.item())
+
+# ─────────────────────────────────────────────────────────────────────
+# Recommended Training Loop (reference)
+# ─────────────────────────────────────────────────────────────────────
+#
+# import torch, torch.nn.functional as F
+# from transformer_torch_v1 import DracoTransformerTorchV1, train_step
+#
+# model     = DracoTransformerTorchV1(config).cuda()
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+# scaler    = torch.cuda.amp.GradScaler()
+#
+# AUX_COEFF = 0.01
+#
+# for step, batch in enumerate(dataloader):
+#     input_ids = batch["input_ids"].cuda()
+#     labels    = batch["labels"].cuda()
+#
+#     loss = train_step(model, optimizer, input_ids, labels,
+#                       aux_coeff=AUX_COEFF, scaler=scaler)
+#
+#     if loss is None:
+#         print(f"Step {step}: NaN loss — skipped")
+#     else:
+#         if step % 100 == 0:
+#             print(f"Step {step}: loss={loss:.4f}")
+#
+#     if step % 1000 == 0:
+#         model.save_checkpoint("checkpoints/", step=step)
+

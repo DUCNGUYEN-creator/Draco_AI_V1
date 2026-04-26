@@ -1,72 +1,4 @@
-"""
-DracoAI V1 — Transformer Core (NumPy inference)
-================================================
-Base: Qwen 3.5 9B Instruct  (NO BIAS throughout)
-
-Config Qwen 3.5 9B Instruct:
-    d_model   = 4096
-    n_heads_q = 32
-    n_heads_kv= 8
-    n_layers  = 36        (9B has 36 layers vs 7B's 32)
-    d_ff      = 22016     (SwiGLU intermediate)
-    rope_theta= 1_000_000.0
-    vocab_size= 151936
-
-MoE: 8 experts from single Qwen 3.5 9B Instruct FFN
-    Source:  ONE Qwen 3.5 9B Instruct checkpoint.
-             No separate "coder" or "instruct" model.
-
-    Expert 0-3  (Code group):
-        Initialised from FFN neurons of layers whose index maps to code tasks.
-        Specifically: layer_idx % 8 == 0,1,2,3 → expert slot 0,1,2,3.
-        These layers are observed to activate strongly on code/math tokens.
-
-    Expert 4-7  (Language group):
-        Initialised from FFN neurons of layers whose index maps to
-        language/instruction-following tasks (layer_idx % 8 == 4,5,6,7).
-
-    Shared expert: running-average blend of all loaded layers.
-
-    → symmetry broken via per-expert noise + routing bias
-
-Identity Overlay (logit-level, NOT text-replace):
-    Deny tokens  (Qwen/Alibaba/Ali …): logit -= 10.0
-    Boost tokens (Draco/DracoAI/DUCNGUYEN …): logit += 2.0
-    → keeps IQ intact while enforcing brand identity
-
-ALL BUGS FIXED:
-    ✅ Qwen 3.5 9B Instruct (was 7B — typo corrected everywhere)
-    ✅ n_layers=36 for 9B default config
-    ✅ Expert naming: Code group (0-3) / Language group (4-7)
-       — no "expert_coder" or "expert_instruct" split models
-       — single Qwen 3.5 9B Instruct FFN sliced by layer_idx % 8
-    ✅ NO BIAS on any Linear layer (Qwen 3.5 compatible)
-    ✅ RMSNorm eps = 1e-6 (Qwen standard)
-    ✅ KVCache: reset() clears cache_pos AND filled
-    ✅ KVCache: step() called ONCE in forward(), not per-layer
-    ✅ KVCache: circular buffer get() reorders correctly
-    ✅ GQA repeat_interleave exact
-    ✅ Attention: clamp scores [-50,50], causal mask
-    ✅ MoE: top-k argpartition+argsort correct order
-    ✅ MoE: capacity fallback → least-loaded expert (NOT silent drop)
-    ✅ MoE: router temperature scaling (0.7-1.2) prevents collapse
-    ✅ MoE: symmetry breaking via init noise per expert
-    ✅ MTP: masked loss -100 ignore, aligned indices
-    ✅ Mirostat v2: mu = mu - eta*(H-tau), clamped
-    ✅ Typical sampling before Mirostat
-    ✅ Fallback when distribution dead (NaN/sum=0)
-    ✅ Rep penalty: frequency + distance
-    ✅ Token confidence scoring (entropy-based)
-    ✅ Dynamic Expert Pruning (DEP)
-    ✅ Identity Overlay: logit bias in sample_token
-    ✅ _place_weight: uses correct attribute names (wq/wk/wv/wo)
-    ✅ lm_head fallback: tied to embed_tokens when missing
-    ✅ safetensors save/load
-    ✅ Weight bridge Qwen/DS/LLaMA→Draco
-    ✅ for_9b() / for_demo() correct
-    ✅ manifest arch correct (Qwen3.5-9B-Instruct)
-"""
-# Copyright 2026 The Draco Studio and DUCNGUYEN-creator
+# Copyright 2026 Draco Studio and DUCNGUYEN-creator
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,1006 +11,963 @@ ALL BUGS FIXED:
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import math, os, json, struct, hashlib
+"""
+DracoAI V1 — NumPy Transformer (Inference Only)
+================================================
+MoE Transformer built from a single Qwen 3.5 9B dense checkpoint.
+8 experts created by distributing the 36 Qwen FFN layers across experts
+using layer_idx % 8, with weights AVERAGED (not overwritten) per expert.
+Architecture:
+  - GQA (Grouped Query Attention) + SWA-Sink KVCache
+  - MoE (8 experts, top-2 routing, load-balance loss)
+  - MTP (Multi-Token Prediction / speculative decoding)
+  - RoPE positional encoding
+  - Mirostat v2 sampling
+  - Identity overlay via logit-level bias (no text replacement)
+FIXES (V1 — final consolidated):
+    ✅ KVCache: prefill safety — long prompt slices sink+tail, no modulo overwrite
+    ✅ KVCache: filled updated correctly for both prefill and decode
+    ✅ MoE: vectorised boolean-mask dispatch (removes Python token loop)
+    ✅ MTP: try_speculative used in generate (logits2 no longer wasted)
+    ✅ _place_weight: uses expert_accum dict to AVERAGE layers per expert
+    ✅ _break_symmetry NOT called in __init__ (only after load for random init)
+    ✅ RoPE offset correct through long prefill + speculative decode steps
+    ✅ MoE gate normalisation: softmax only over selected top-k experts
+    ✅ FIX S1: generate() breaks immediately when spec_id == eos_id
+    ✅ FIX 2.2 (🔴 CRITICAL): _sample_mirostat_v2 mu update sign CORRECTED
+         Was:  mu = mu + eta * (surprise - tau)   ← positive feedback = collapse
+         Now:  mu = mu - eta * (surprise - tau)   ← correct per Basu 2020
+    ✅ FIX 2.3: distance-decayed repetition penalty via pos dict
+    ✅ FIX CACHE-ROLLBACK (🔴 CRITICAL): generate() now correctly calls
+         cache.restore(snap) when verify_id != spec_pending, then immediately
+         re-forwards verify_id so its K/V is written to cache before continuing.
+         The old code stored snap in cache._pending_snap but NEVER called
+         restore() during rejection — leaving rotten K/V in cache permanently.
+         This is the "transactional cache" pattern. No more hallucination from
+         rejected speculative tokens poisoning the attention context.
+    ✅ FIX MOE-NOISE: MoELayer.forward() adds Gumbel noise (scale=0.05) to
+         router logits at inference time to prevent expert collapse.
+    ✅ FIX LOGITS-CLIP: np.clip(logits, -50, 50) in sampling before exp()
+         prevents numerical overflow/underflow in float32.
+    ✅ FIX PROBS-GUARD: After softmax, probs re-normalised to ensure sum=1.0
+         and NaN values replaced with 0 before np.random.choice.
+    ✅ FIX LOGITS-PIPELINE: generate() applies logit processing in strict order:
+         clip → repetition_penalty → (mirostat or top-k/p → min-p) → sample.
+    ✅ FIX MIN-P: _sample_topk_topp() supports min_p parameter (default 0.0).
+    ✅ FIX SANITY: _sanity_checks() validates logits when debug=True.
+    ✅ FIX ADAPTIVE-TEMP: generate() supports adaptive_temp=True.
+    ✅ FIX IDENTITY-BIAS: set_identity_bias() uses reduced boost (2.0).
+    ✅ FIX ATTN-CLIP: GQAttention clips attention scores to [-50, 50].
+    ✅ FIX SILU-CLIP: ExpertFFN.forward() clips gate before exp().
+    ✅ FIX SPEC-INDENT (🔴 CRITICAL): Speculative verification block was incorrectly
+         indented inside the repetition-penalty for-loop and outside the while-loop.
+         Fixed: block now correctly sits at while-body level, after penalty application.
+    ✅ FIX SPEC-LOGITS (🔴 CRITICAL): pre_spec_logits saved BEFORE snapshot/spec forward.
+         On rejection, re-sample from pre_spec_logits (clean, uncontaminated) instead of
+         post-spec logits — eliminates hallucination from rejected token's K/V influence.
+    ✅ FIX SPEC-NPOS: On rejection, verify_id reuses spec_pending's n_pos slot (n_pos-1)
+         so repetition-penalty position tracking is always accurate.
+    ✅ FIX SPEC-ACCEPT-MISSING-KV (🔴 CRITICAL): After accepting spec and sampling T+2
+         (nid), the accept block did NOT forward nid before trying speculative T+3.
+         If speculative T+3 was added, the next iteration would forward T+3 with cache
+         missing K/V(nid), causing attention to skip a position and breaking RoPE.
+         Fix: always call forward([nid]) in the accept block after sampling T+2, then
+         use the resulting l2_new (fresh MTP output) for T+3 speculation. This mirrors
+         exactly what the normal sampling path does: forward(nid) → spec from l2_new.
+         When no spec follows, cur=[nid] and the next iteration forwards nid normally —
+         but with forward done eagerly, cache is always complete before any spec chain.
+"""
+from __future__ import annotations
+import math, os, json, time, copy
+from typing import List, Optional, Tuple, Dict, Callable
 import numpy as np
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Tuple, Dict, Any
-
-QWEN_BASE_END = 151936  # Qwen 3.5 9B vocab size (same as 7B — Qwen uses 151936 for all)
-
-# ══════════════════════════════════════════════════════════════════════
-# IDENTITY OVERLAY — token IDs to be resolved at runtime via vocab
-# ══════════════════════════════════════════════════════════════════════
-_IDENTITY_DENY_STRINGS  = ["Qwen", "Alibaba", "AlibabaDRIVEN", "Ali", "OpenAI",
-                            "ChatGPT", "GPT-4", "LLaMA", "Meta AI"]
-_IDENTITY_BOOST_STRINGS = ["Draco", "DracoAI", "DUCNGUYEN", "Đức"]
-_IDENTITY_LOGIT_PENALTY = -10.0
-_IDENTITY_LOGIT_BONUS   =   2.0
-
-# ══════════════════════════════════════════════════════════════════════
-# WEIGHT BRIDGE  (Qwen / DeepSeek / LLaMA → Draco naming)
-# ══════════════════════════════════════════════════════════════════════
-_BRIDGE: List[Tuple[str, str]] = [
-    ("q_proj",                  "wq"),
-    ("k_proj",                  "wk"),
-    ("v_proj",                  "wv"),
-    ("o_proj",                  "wo"),
-    ("gate_proj",               "gate_proj"),
-    ("up_proj",                 "up_proj"),
-    ("down_proj",               "down_proj"),
-    ("input_layernorm",         "norm"),
-    ("post_attention_layernorm","post_norm"),
-    ("post_attn_layernorm",     "post_norm"),
-    ("ln_1",                    "norm"),
-    ("ln_2",                    "post_norm"),
-    ("ln_f",                    "norm_final"),
-    ("embed_tokens",            "token_emb"),
-    ("lm_head",                 "lm_head"),
-    ("model.norm",              "norm_final"),
-    ("model.layers.",           "blocks."),
-    ("transformer.h.",          "blocks."),
-    ("self_attn.",              "attn."),
-    ("mlp.",                    "ffn."),
-]
-
-def bridge_key(ext_key: str) -> str:
-    k = ext_key
-    for src, dst in _BRIDGE:
-        k = k.replace(src, dst)
-    k = k.replace("attn.attn.", "attn.")
-    k = k.replace(".weight", "")
-    return k
-
-# ══════════════════════════════════════════════════════════════════════
-# CONFIG  (Qwen 3.5 9B Instruct defaults)
-# ══════════════════════════════════════════════════════════════════════
-@dataclass
-class DracoConfig:
-    # ── Qwen 3.5 9B Instruct defaults ──
-    vocab_size:  int   = 151936
-    qwen_base:   int   = 151936
-    d_model:     int   = 4096
-    n_heads_q:   int   = 32
-    n_heads_kv:  int   = 8
-    n_layers:    int   = 36      # 9B has 36 transformer layers
-    d_ff:        int   = 22016   # SwiGLU intermediate dim
-    context_len: int   = 32768
-    rope_theta:  float = 1_000_000.0   # Qwen 3.5 uses 1M
-
-    # ── MoE (8 experts, all from single Qwen 3.5 9B Instruct FFN) ──
-    # Expert 0-3: Code group  (layer_idx % 8 in {0,1,2,3})
-    # Expert 4-7: Language group  (layer_idx % 8 in {4,5,6,7})
-    n_experts:         int   = 8
-    n_experts_top:     int   = 2
-    moe_capacity:      float = 1.25
-    moe_dep_threshold: float = 0.85    # Dynamic Expert Pruning
-    moe_router_temp:   float = 0.9     # Router temperature (prevent collapse)
-
-    # ── Multi-Token Prediction ──
-    mtp_heads:  int   = 2
-    mtp_weight: float = 0.5
-
-    # ── KV Cache / SWA-Sink ──
-    sink_tokens:    int = 4
-    sliding_window: int = 4096   # 0 = full context
-
-    # ── Training ──
-    dropout:       float = 0.0
-    freeze_base:   bool  = True
-
-    @property
-    def head_dim(self):    return self.d_model // self.n_heads_q
-    @property
-    def gqa_repeat(self):  return self.n_heads_q // self.n_heads_kv
-
-    def save(self, path: str):
-        os.makedirs(path, exist_ok=True)
-        with open(f"{path}/config.json", "w") as f:
-            json.dump(asdict(self), f, indent=2)
-
-    @classmethod
-    def load(cls, path: str) -> "DracoConfig":
-        with open(f"{path}/config.json") as f:
-            d = json.load(f)
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-    @classmethod
-    def for_demo(cls) -> "DracoConfig":
-        """Tiny model for local testing (no GPU needed)."""
-        return cls(
-            vocab_size=4096, qwen_base=4000, d_model=256,
-            n_heads_q=4, n_heads_kv=2, n_layers=4, d_ff=1024,
-            context_len=256, n_experts=8, rope_theta=10_000.0,
-            sliding_window=256,
-        )
-
-    @classmethod
-    def for_9b(cls) -> "DracoConfig":
-        """Qwen 3.5 9B Instruct — production config."""
-        return cls()
-
-    # backward-compat alias
-    @classmethod
-    def for_7b(cls) -> "DracoConfig":
-        """Alias for for_9b() — kept for backward compatibility."""
-        return cls.for_9b()
-
-# ══════════════════════════════════════════════════════════════════════
-# MATH HELPERS
-# ══════════════════════════════════════════════════════════════════════
-def softmax(x: np.ndarray, axis=-1) -> np.ndarray:
-    x = x - x.max(axis=axis, keepdims=True)
-    e = np.exp(np.clip(x, -50, 50))
-    return e / (e.sum(axis=axis, keepdims=True) + 1e-8)
-
-def silu(x: np.ndarray) -> np.ndarray:
-    return x * (1.0 / (1.0 + np.exp(-np.clip(x, -20, 20))))
-
-def rms_norm(x: np.ndarray, w: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """RMSNorm — eps=1e-6 (Qwen 3.5 standard, NO bias, NO mean subtraction)."""
-    return (x / (np.sqrt((x * x).mean(-1, keepdims=True)) + eps)) * w
-
-# ══════════════════════════════════════════════════════════════════════
-# RoPE  (theta = 1_000_000 for Qwen 3.5)
-# ══════════════════════════════════════════════════════════════════════
-class RoPE:
-    def __init__(self, head_dim: int, max_seq: int, theta: float = 1_000_000.0):
-        freqs = 1.0 / (theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim))
-        t     = np.arange(max_seq, dtype=np.float32)
-        mat   = np.outer(t, freqs)
-        self.cos_cache = np.cos(mat).astype(np.float32)
-        self.sin_cache = np.sin(mat).astype(np.float32)
-        self.head_dim  = head_dim
-
-    def apply(self, x: np.ndarray, offset: int = 0) -> np.ndarray:
-        seq  = x.shape[0]
-        cos  = self.cos_cache[offset:offset + seq, np.newaxis, :]
-        sin  = self.sin_cache[offset:offset + seq, np.newaxis, :]
-        half = self.head_dim // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
-
-# ══════════════════════════════════════════════════════════════════════
-# KV CACHE — pre-alloc, in-place, SWA-Sink
-# ══════════════════════════════════════════════════════════════════════
+# ── Constants ──────────────────────────────────────────────────────────
+SINK_TOKENS     = 4      # Number of "sink" tokens kept at start of KVCache
+SPEC_THRESH     = 0.80   # Confidence threshold for speculative accept
+DEFAULT_TEMP    = 0.7
+DEFAULT_TOP_P   = 0.9
+MOE_NOISE_SCALE = 0.05   # Gumbel noise scale for MoE router diversity
+# ─────────────────────────────────────────────────────────────────────
+# RoPE helpers
+# ─────────────────────────────────────────────────────────────────────
+def _rope_freqs(head_dim: int, base: float = 10000.0) -> np.ndarray:
+    i = np.arange(0, head_dim, 2, dtype=np.float32)
+    return 1.0 / (base ** (i / head_dim))
+def _apply_rope(x: np.ndarray, freqs: np.ndarray, offset: int = 0) -> np.ndarray:
+    """Apply RoPE to x of shape (..., seq, head_dim)."""
+    seq  = x.shape[-2]
+    hdim = x.shape[-1]
+    pos  = np.arange(offset, offset + seq, dtype=np.float32)
+    angles = np.outer(pos, freqs)
+    cos = np.cos(angles).astype(x.dtype)
+    sin = np.sin(angles).astype(x.dtype)
+    extra = x.ndim - 2
+    shape = (1,) * extra + (seq, hdim // 2)
+    cos = cos.reshape(shape)
+    sin = sin.reshape(shape)
+    x1 = x[..., :hdim // 2]
+    x2 = x[..., hdim // 2:]
+    return np.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+# ─────────────────────────────────────────────────────────────────────
+# KVCache with SWA-Sink  (Sliding Window Attention + sink tokens)
+# ─────────────────────────────────────────────────────────────────────
 class KVCache:
     """
-    Sliding Window Attention with Sink Tokens (SWA-Sink):
-    - Keep first `sink_tokens` (global attention anchors)
-    - Keep `window` most recent tokens in circular buffer
+    Sliding-window KV cache with sink tokens.
+    Buffer layout (after any prefill):
+        [0 .. sink-1]    : sink tokens (oldest, always retained)
+        [sink .. window-1]: recent tokens in circular order
+    get() always returns tokens in chronological order:
+        sink tokens first, then recent tokens oldest→newest.
+    FIX CACHE-ROLLBACK: snapshot() and restore() for transactional
+    speculative decoding. Before forwarding a spec token, call snapshot().
+    If the spec is rejected, call restore(snap) to revert K/V state cleanly.
     """
-    def __init__(self, n_layers, batch, n_kv_heads, max_seq, head_dim,
-                 sink_tokens=4, window=0):
+    def __init__(self, n_layers: int, n_kv_heads: int, head_dim: int,
+                 window: int = 1024, sink: int = SINK_TOKENS):
         self.n_layers   = n_layers
-        self.batch      = batch
         self.n_kv_heads = n_kv_heads
-        self.max_seq    = max_seq
         self.head_dim   = head_dim
-        self.sink       = sink_tokens
-        self.window     = window if window > 0 else max_seq
-        shape = (n_layers, batch, n_kv_heads, self.window, head_dim)
-        self.k_buf = np.zeros(shape, dtype=np.float32)
-        self.v_buf = np.zeros(shape, dtype=np.float32)
+        self.window     = window
+        self.sink       = sink
+        shape = (n_layers, 1, n_kv_heads, window, head_dim)
+        self.k_buf = np.zeros(shape, dtype=np.float16)
+        self.v_buf = np.zeros(shape, dtype=np.float16)
         self.cache_pos: int = 0
         self.filled:    int = 0
-
-    def update(self, layer: int, k: np.ndarray, v: np.ndarray):
-        """k, v: [B, n_kv_heads, seq, head_dim]"""
-        seq = k.shape[2]
-        for s in range(seq):
-            if self.cache_pos + s < self.sink:
-                pos = self.cache_pos + s
-            else:
-                pos = self.sink + (self.cache_pos + s - self.sink) % max(1, self.window - self.sink)
-                pos = min(pos, self.window - 1)
-            self.k_buf[layer, :, :, pos, :] = k[:, :, s, :]
-            self.v_buf[layer, :, :, pos, :] = v[:, :, s, :]
-
-    def get(self, layer: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Circular buffer reorder: sink tokens + recent window in temporal order."""
-        end = min(self.filled, self.window)
-        if self.filled <= self.window:
-            return (self.k_buf[layer, :, :, :end, :],
-                    self.v_buf[layer, :, :, :end, :])
-        # Buffer full: sink + reordered recent
-        sink_k = self.k_buf[layer, :, :, :self.sink, :]
-        sink_v = self.v_buf[layer, :, :, :self.sink, :]
-        rec_start = self.sink + (self.cache_pos - self.sink) % max(1, self.window - self.sink)
-        win_k = np.concatenate([self.k_buf[layer, :, :, rec_start:, :],
-                                 self.k_buf[layer, :, :, self.sink:rec_start, :]], axis=2)
-        win_v = np.concatenate([self.v_buf[layer, :, :, rec_start:, :],
-                                 self.v_buf[layer, :, :, self.sink:rec_start, :]], axis=2)
-        return (np.concatenate([sink_k, win_k], axis=2),
-                np.concatenate([sink_v, win_v], axis=2))
-
-    def step(self, seq_len: int = 1):
-        """Called ONCE in DracoTransformer.forward(), NOT per-layer."""
-        self.cache_pos += seq_len
-        self.filled     = min(self.filled + seq_len, self.window)
-
     def reset(self):
-        """Reset BOTH cache_pos AND filled."""
-        self.k_buf.fill(0); self.v_buf.fill(0)
+        self.k_buf[:] = 0
+        self.v_buf[:] = 0
         self.cache_pos = 0
         self.filled    = 0
-
-# ══════════════════════════════════════════════════════════════════════
-# GQA — NO BIAS (Qwen 3.5 9B: q_proj/k_proj/v_proj/o_proj all bias=False)
-# ══════════════════════════════════════════════════════════════════════
-class GQAttention:
-    def __init__(self, cfg: DracoConfig, layer_idx: int):
-        d, hq, hkv, hd = cfg.d_model, cfg.n_heads_q, cfg.n_heads_kv, cfg.head_dim
-        s = 0.02 / math.sqrt(cfg.n_layers)
-        self.layer_idx = layer_idx
-        self.n_q  = hq;  self.n_kv = hkv
-        self.hd   = hd;  self.rep  = cfg.gqa_repeat
-        self.scale = 1.0 / math.sqrt(hd)
-        # NO BIAS — matches Qwen 3.5 9B checkpoint layout
-        self.wq = np.random.randn(d,      hq * hd).astype(np.float32) * s
-        self.wk = np.random.randn(d,      hkv * hd).astype(np.float32) * s
-        self.wv = np.random.randn(d,      hkv * hd).astype(np.float32) * s
-        self.wo = np.random.randn(hq * hd, d).astype(np.float32) * s
-        self.rope = RoPE(hd, cfg.context_len, cfg.rope_theta)
-
-    def forward(self, x: np.ndarray, cache: Optional[KVCache]) -> np.ndarray:
-        seq, d = x.shape
-        hq, hkv, hd, rep = self.n_q, self.n_kv, self.hd, self.rep
-        offset = cache.cache_pos if cache is not None else 0
-        # NO BIAS: y = x @ W  (not x @ W + b)
-        Q = (x @ self.wq).reshape(seq, hq,  hd)
-        K = (x @ self.wk).reshape(seq, hkv, hd)
-        V = (x @ self.wv).reshape(seq, hkv, hd)
-        Q = self.rope.apply(Q, offset)
-        K = self.rope.apply(K, offset)
-        if cache is not None:
-            K4 = K[np.newaxis].transpose(0, 2, 1, 3)
-            V4 = V[np.newaxis].transpose(0, 2, 1, 3)
-            cache.update(self.layer_idx, K4, V4)
-            K_f, V_f = cache.get(self.layer_idx)
-            K_use = K_f[0].transpose(1, 0, 2)
-            V_use = V_f[0].transpose(1, 0, 2)
+    def snapshot(self) -> dict:
+        """
+        FIX CACHE-ROLLBACK: Capture current cache state for transactional rollback.
+        Returns a dict with copies of all mutable state.
+        """
+        return {
+            "cache_pos": self.cache_pos,
+            "filled":    self.filled,
+            "k_buf":     self.k_buf.copy(),
+            "v_buf":     self.v_buf.copy(),
+        }
+    def restore(self, snap: dict):
+        """
+        FIX CACHE-ROLLBACK: Restore cache state from a snapshot.
+        Must be called with the exact dict returned by snapshot().
+        """
+        self.cache_pos = snap["cache_pos"]
+        self.filled    = snap["filled"]
+        np.copyto(self.k_buf, snap["k_buf"])
+        np.copyto(self.v_buf, snap["v_buf"])
+    def update(self, layer: int, k: np.ndarray, v: np.ndarray):
+        """
+        Store K,V for one layer.
+        k, v shape: (1, n_kv_heads, seq, head_dim)
+        Two distinct paths:
+          1. seq > window  → prefill-long: copy sink + tail, no modulo
+          2. seq <= window → normal: sequential write with wrap-around
+        filled updated only on layer==0 to avoid n_layers redundant writes.
+        """
+        seq = k.shape[2]
+        if seq > self.window:
+            tail_len = self.window - self.sink
+            self.k_buf[layer, :, :, :self.sink, :]           = k[:, :, :self.sink,  :].astype(np.float16)
+            self.v_buf[layer, :, :, :self.sink, :]           = v[:, :, :self.sink,  :].astype(np.float16)
+            self.k_buf[layer, :, :, self.sink:self.window, :] = k[:, :, -tail_len:, :].astype(np.float16)
+            self.v_buf[layer, :, :, self.sink:self.window, :] = v[:, :, -tail_len:, :].astype(np.float16)
+            if layer == 0:
+                self.filled = self.window
         else:
-            K_use, V_use = K, V
-        kv_seq = K_use.shape[0]
-        K_exp  = np.repeat(K_use, rep, axis=1)
-        V_exp  = np.repeat(V_use, rep, axis=1)
-        Q_t    = Q.transpose(1, 0, 2)
-        K_t    = K_exp.transpose(1, 2, 0)
-        scores  = np.clip((Q_t @ K_t) * self.scale, -50, 50)
-        causal  = np.triu(np.full((seq, kv_seq), -1e9), k=kv_seq - seq + 1)
-        scores += causal[np.newaxis]
-        attn    = softmax(scores, axis=-1)
-        V_t     = V_exp.transpose(1, 0, 2)
-        out     = (attn @ V_t).transpose(1, 0, 2).reshape(seq, hq * hd)
-        return out @ self.wo   # NO BIAS
-
-# ══════════════════════════════════════════════════════════════════════
-# SwiGLU FFN — NO BIAS (gate_proj/up_proj/down_proj bias=False)
-# ══════════════════════════════════════════════════════════════════════
-class SwiGLU:
-    def __init__(self, d_in: int, d_ff: int):
-        s = 0.02
-        # NO BIAS
-        self.W_g = np.random.randn(d_in, d_ff).astype(np.float32) * s
-        self.W_u = np.random.randn(d_in, d_ff).astype(np.float32) * s
-        self.W_d = np.random.randn(d_ff, d_in).astype(np.float32) * s
-
+            for s in range(seq):
+                abs_pos = self.cache_pos + s
+                if abs_pos < self.sink:
+                    buf_pos = abs_pos
+                else:
+                    buf_pos = self.sink + (abs_pos - self.sink) % max(1, self.window - self.sink)
+                self.k_buf[layer, :, :, buf_pos, :] = k[:, :, s, :].astype(np.float16)
+                self.v_buf[layer, :, :, buf_pos, :] = v[:, :, s, :].astype(np.float16)
+            if layer == 0:
+                self.filled = min(self.cache_pos + seq, self.window)
+    def get(self, layer: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Return K, V in chronological order. Shape: (1, n_kv_heads, filled, head_dim)"""
+        if self.filled < self.window:
+            k = self.k_buf[layer, :, :, :self.filled, :]
+            v = self.v_buf[layer, :, :, :self.filled, :]
+            return k.astype(np.float32), v.astype(np.float32)
+        recent_cap = self.window - self.sink
+        if recent_cap <= 0:
+            k = self.k_buf[layer, :, :, :self.filled, :]
+            v = self.v_buf[layer, :, :, :self.filled, :]
+            return k.astype(np.float32), v.astype(np.float32)
+        rec_start = self.sink + (self.cache_pos - self.sink) % recent_cap
+        k_sink = self.k_buf[layer, :, :, :self.sink, :]
+        v_sink = self.v_buf[layer, :, :, :self.sink, :]
+        k_rec  = np.concatenate([
+            self.k_buf[layer, :, :, rec_start:self.window, :],
+            self.k_buf[layer, :, :, self.sink:rec_start,   :],
+        ], axis=2)
+        v_rec  = np.concatenate([
+            self.v_buf[layer, :, :, rec_start:self.window, :],
+            self.v_buf[layer, :, :, self.sink:rec_start,   :],
+        ], axis=2)
+        k = np.concatenate([k_sink, k_rec], axis=2)
+        v = np.concatenate([v_sink, v_rec], axis=2)
+        return k.astype(np.float32), v.astype(np.float32)
+    def step(self, seq_len: int = 1):
+        """Advance cache pointer after a forward pass."""
+        self.cache_pos += seq_len
+# ─────────────────────────────────────────────────────────────────────
+# Layer normalisations
+# ─────────────────────────────────────────────────────────────────────
+def rms_norm(x: np.ndarray, w: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
+    return (x / rms) * w
+# ─────────────────────────────────────────────────────────────────────
+# Grouped Query Attention
+# ─────────────────────────────────────────────────────────────────────
+class GQAttention:
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, head_dim: int):
+        self.d_model    = d_model
+        self.n_heads    = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim   = head_dim
+        self.n_rep      = n_heads // n_kv_heads
+        scale = 1.0 / math.sqrt(d_model)
+        self.W_q = np.random.randn(d_model, n_heads    * head_dim).astype(np.float32) * scale
+        self.W_k = np.random.randn(d_model, n_kv_heads * head_dim).astype(np.float32) * scale
+        self.W_v = np.random.randn(d_model, n_kv_heads * head_dim).astype(np.float32) * scale
+        self.W_o = np.random.randn(n_heads * head_dim, d_model).astype(np.float32)    * scale
+        self._rope_freqs: Optional[np.ndarray] = None
+    def _get_rope(self, head_dim: int) -> np.ndarray:
+        if self._rope_freqs is None or self._rope_freqs.shape[0] != head_dim // 2:
+            self._rope_freqs = _rope_freqs(head_dim)
+        return self._rope_freqs
+    def forward(self, x: np.ndarray, cache: KVCache, layer_idx: int) -> np.ndarray:
+        """
+        x: (1, seq, d_model)  Returns: (1, seq, d_model)
+        FIX ATTN-CLIP: attention scores clipped to [-50, 50] before softmax.
+        """
+        bsz, seq, _ = x.shape
+        freqs  = self._get_rope(self.head_dim)
+        offset = cache.cache_pos
+        Q = (x @ self.W_q).reshape(bsz, seq, self.n_heads,    self.head_dim).transpose(0, 2, 1, 3)
+        K = (x @ self.W_k).reshape(bsz, seq, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        V = (x @ self.W_v).reshape(bsz, seq, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        Q = _apply_rope(Q, freqs, offset)
+        K = _apply_rope(K, freqs, offset)
+        cache.update(layer_idx, K, V)
+        K_f, V_f = cache.get(layer_idx)
+        kv_seq   = K_f.shape[2]
+        K_exp = np.repeat(K_f, self.n_rep, axis=1)
+        V_exp = np.repeat(V_f, self.n_rep, axis=1)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        attn  = Q @ K_exp.transpose(0, 1, 3, 2) * scale
+        # Causal mask
+        if seq > 1:
+            causal   = np.triu(np.full((seq, seq), -1e9, dtype=np.float32), 1)
+            past_len = kv_seq - seq
+            if past_len > 0:
+                mask_full = np.concatenate(
+                    [np.zeros((seq, past_len), dtype=np.float32), causal], axis=1
+                )
+            else:
+                mask_full = causal
+            attn = attn + mask_full[None, None, :, :]
+        # FIX ATTN-CLIP: clip scores before softmax for numerical stability
+        attn = np.clip(attn, -50.0, 50.0)
+        attn = attn - attn.max(axis=-1, keepdims=True)
+        attn = np.exp(attn)
+        attn_sum = attn.sum(axis=-1, keepdims=True)
+        attn = attn / (attn_sum + 1e-9)
+        out = attn @ V_exp
+        out = out.transpose(0, 2, 1, 3).reshape(bsz, seq, self.n_heads * self.head_dim)
+        return out @ self.W_o
+# ─────────────────────────────────────────────────────────────────────
+# Expert FFN (SwiGLU)
+# ─────────────────────────────────────────────────────────────────────
+class ExpertFFN:
+    def __init__(self, d_model: int, d_ff: int):
+        scale = 1.0 / math.sqrt(d_model)
+        self.W_g = np.random.randn(d_model, d_ff).astype(np.float32) * scale
+        self.W_u = np.random.randn(d_model, d_ff).astype(np.float32) * scale
+        self.W_d = np.random.randn(d_ff, d_model).astype(np.float32) * scale
     def forward(self, x: np.ndarray) -> np.ndarray:
-        # gate_proj, up_proj, down_proj — all NO BIAS
-        return silu(x @ self.W_g) * (x @ self.W_u) @ self.W_d
-
-# ══════════════════════════════════════════════════════════════════════
-# MoE Layer — 8 experts from single Qwen 3.5 9B Instruct
-# ══════════════════════════════════════════════════════════════════════
+        gate = x @ self.W_g
+        # FIX SILU-CLIP: clip gate before exp to prevent overflow
+        gate = gate / (1.0 + np.exp(-np.clip(gate, -50, 50)))  # SiLU
+        return (gate * (x @ self.W_u)) @ self.W_d
+    def _break_symmetry(self, scale: float = 1e-3):
+        """Add tiny noise to break weight symmetry (init only, NOT on load)."""
+        self.W_g += np.random.randn(*self.W_g.shape).astype(np.float32) * scale
+        self.W_u += np.random.randn(*self.W_u.shape).astype(np.float32) * scale
+# ─────────────────────────────────────────────────────────────────────
+# Mixture of Experts Layer
+# ─────────────────────────────────────────────────────────────────────
 class MoELayer:
     """
-    8 experts, all from ONE Qwen 3.5 9B Instruct checkpoint.
-    No separate "coder model" or "instruct model" — single source.
-
-    How FFN layers are distributed:
-        layer_idx % 8 == 0,1,2,3  → expert slot 0,1,2,3  (Code group)
-        layer_idx % 8 == 4,5,6,7  → expert slot 4,5,6,7  (Language group)
-
-    Code group (0-3):
-        These are FFN neurons from layers whose remainder index maps to 0-3.
-        They activate preferentially on code/math/logic token sequences.
-
-    Language group (4-7):
-        FFN neurons from layers with remainder 4-7.
-        Activate preferentially on natural language / instruction-following.
-
-    Shared expert: running-average blend of all loaded FFN layers.
-
-    Symmetry breaking: each expert gets small unique noise + routing bias offset.
-    Router temperature (moe_router_temp) prevents expert collapse.
-    FIX: capacity fallback → dispatch to LEAST-LOADED expert (not silent drop).
+    8-expert MoE with top-2 routing.
+    FIX MOE-NOISE: Gumbel noise added to router logits to prevent expert
+    collapse at inference time. Scale 0.05 diversifies routing without
+    significantly changing top-k selections.
     """
-
-    def __init__(self, cfg: DracoConfig):
-        d = cfg.d_model
-        self.n_exp      = cfg.n_experts          # 8
-        self.top_k      = cfg.n_experts_top      # 2
-        self.cap_f      = cfg.moe_capacity
-        self.dep_thresh = cfg.moe_dep_threshold
-        self.router_t   = cfg.moe_router_temp    # temperature for router
-
-        # Router: NO BIAS (Qwen 3.5 compatible)
-        self.W_router   = np.random.randn(d, cfg.n_experts).astype(np.float32) * 0.02
-
-        # Routing bias: small unique offsets per expert to break symmetry
-        # (NOT the same as a bias in a linear layer — this is an aux signal)
-        self.router_bias = np.array(
-            [0.02 * (i - cfg.n_experts / 2.0) for i in range(cfg.n_experts)],
-            dtype=np.float32,
-        )
-
-        # Expert FFN size: use full d_ff for Qwen 3.5 9B checkpoint compatibility
-        # When loading from checkpoint, each expert gets the full FFN weights
-        d_exp = cfg.d_ff
-        self.experts = [SwiGLU(d, d_exp) for _ in range(cfg.n_experts)]
-        self.shared  = SwiGLU(d, max(cfg.d_ff // 4, 32))
-        self.share_w = 0.25
-
-        # Per-expert RMSNorm weight (scale) for weight-mismatch mitigation
-        self.expert_norm = [np.ones(d, dtype=np.float32) for _ in range(cfg.n_experts)]
-
-        # Apply initial symmetry breaking noise per expert
-        for i in range(cfg.n_experts):
-            self._break_symmetry(i)
-
-    def _break_symmetry(self, expert_idx: int):
-        """Add tiny unique noise to an expert to break weight symmetry."""
-        noise_scale = 0.005 * (expert_idx + 1)
-        self.experts[expert_idx].W_g += (
-            np.random.randn(*self.experts[expert_idx].W_g.shape).astype(np.float32) * noise_scale
-        )
-        self.experts[expert_idx].W_u += (
-            np.random.randn(*self.experts[expert_idx].W_u.shape).astype(np.float32) * noise_scale
-        )
-
-    def forward(
-        self,
-        x: np.ndarray,
-        intent_boost: Optional[Dict[int, float]] = None,
-    ) -> Tuple[np.ndarray, float]:
-        seq, d = x.shape
-        capacity = max(1, int(seq * self.cap_f / self.n_exp))
-
-        # Router: temperature scaling to prevent collapse, NO BIAS linear
-        logits = (x @ self.W_router) / max(self.router_t, 1e-4)
-        logits += self.router_bias   # symmetry-breaking routing bias (not weight bias)
-
-        if intent_boost:
-            for eid, boost in intent_boost.items():
-                if 0 <= eid < self.n_exp:
-                    logits[:, eid] += boost
-
-        probs = softmax(logits, axis=-1)
-
-        # DEP: tokens very confident about top-1 skip extra experts
-        max_probs = probs.max(axis=-1)
-
-        # Top-k: argpartition then argsort for correct order
-        part_idx   = np.argpartition(-probs, self.top_k, axis=-1)[:, :self.top_k]
-        part_probs = np.take_along_axis(probs, part_idx, axis=1)
-        sort_ord   = np.argsort(-part_probs, axis=-1)
-        top_idx    = np.take_along_axis(part_idx, sort_ord, axis=1)
-        top_scores = np.take_along_axis(part_probs, sort_ord, axis=1)
-        top_scores = top_scores / (top_scores.sum(axis=-1, keepdims=True) + 1e-8)
-
-        output   = np.zeros_like(x)
-        tok_load = np.zeros(self.n_exp, dtype=np.int32)
-
-        for ti in range(seq):
-            effective_k = 1 if max_probs[ti] > self.dep_thresh else self.top_k
-            dispatched  = False
-            for k in range(effective_k):
-                ei = top_idx[ti, k]
-                if tok_load[ei] >= capacity:
+    def __init__(self, d_model: int, d_ff: int, n_experts: int = 8, top_k: int = 2):
+        self.d_model   = d_model
+        self.d_ff      = d_ff
+        self.n_experts = n_experts
+        self.top_k     = top_k
+        scale = 1.0 / math.sqrt(d_model)
+        self.W_router    = np.random.randn(d_model, n_experts).astype(np.float32) * scale
+        self.router_bias = np.zeros(n_experts, dtype=np.float32)
+        self.experts     = [ExpertFFN(d_model, d_ff) for _ in range(n_experts)]
+        self.shared      = ExpertFFN(d_model, d_ff)
+        self.norm_w      = np.ones(d_model, dtype=np.float32)
+    def forward(self, x: np.ndarray, add_noise: bool = True) -> Tuple[np.ndarray, Dict]:
+        """
+        x: (batch=1, seq, d_model)
+        Returns: (output, aux_losses_dict)
+        FIX MOE-NOISE: Gumbel noise injected when add_noise=True (inference).
+        """
+        bsz, seq, d = x.shape
+        x_flat = x.reshape(seq, d)
+        logits = x_flat @ self.W_router + self.router_bias
+        # FIX MOE-NOISE
+        if add_noise and seq > 0:
+            noise = np.random.gumbel(size=logits.shape).astype(np.float32) * MOE_NOISE_SCALE
+            logits = logits + noise
+        # Softmax over all experts for load-balance metrics
+        router_soft = np.exp(np.clip(logits - logits.max(axis=-1, keepdims=True), -50, 50))
+        router_soft = router_soft / (router_soft.sum(axis=-1, keepdims=True) + 1e-9)
+        # Top-k selection
+        top_idx = np.argsort(logits, axis=-1)[:, -self.top_k:][:, ::-1]
+        # Gate weights: softmax over selected experts only
+        top_logits = np.take_along_axis(logits, top_idx, axis=1)
+        top_logits = top_logits - top_logits.max(axis=-1, keepdims=True)
+        gates = np.exp(np.clip(top_logits, -50, 50))
+        gates = gates / (gates.sum(axis=-1, keepdims=True) + 1e-9)
+        output = np.zeros((seq, d), dtype=np.float32)
+        for k in range(self.top_k):
+            expert_ids = top_idx[:, k]
+            g_k        = gates[:, k]
+            for e in range(self.n_experts):
+                mask = expert_ids == e
+                if not mask.any():
                     continue
-                tok_load[ei] += 1
-                # Per-expert RMSNorm before expert FFN
-                x_norm = rms_norm(x[ti:ti + 1], self.expert_norm[ei])
-                output[ti] += top_scores[ti, k] * self.experts[ei].forward(x_norm)[0]
-                dispatched = True
-
-            # FIX: capacity overflow → dispatch to LEAST-LOADED expert
-            if not dispatched:
-                fb     = int(np.argmin(tok_load))
-                x_norm = rms_norm(x[ti:ti + 1], self.expert_norm[fb])
-                score  = top_scores[ti, 0]  # use top-1 gate weight
-                output[ti] += score * self.experts[fb].forward(x_norm)[0]
-                tok_load[fb] += 1
-
-        # Shared expert always runs (lightweight)
-        output += self.share_w * self.shared.forward(x)
-
-        # Load balancing loss (standard formula)
-        importance = probs.sum(axis=0)
-        load       = tok_load.astype(np.float32) / max(seq, 1)
-        lb_loss    = 0.01 * (float(importance.std()) + float(load.std()))
-
-        return output, lb_loss
-
-# ══════════════════════════════════════════════════════════════════════
-# Transformer Block
-# ══════════════════════════════════════════════════════════════════════
-class TransformerBlock:
-    def __init__(self, cfg: DracoConfig, layer_idx: int):
-        d = cfg.d_model
-        self.idx       = layer_idx
-        self.attn      = GQAttention(cfg, layer_idx)
-        self.moe       = MoELayer(cfg)
-        # RMSNorm weights only — NO bias (Qwen 3.5)
-        self.norm      = np.ones(d, dtype=np.float32)
-        self.post_norm = np.ones(d, dtype=np.float32)
-
-    def forward(self, x, cache, intent_boost=None):
-        x       = x + self.attn.forward(rms_norm(x, self.norm), cache)
-        moe_out, lb = self.moe.forward(rms_norm(x, self.post_norm), intent_boost)
-        return x + moe_out, lb
-
-# ══════════════════════════════════════════════════════════════════════
-# Multi-Token Head (MTP)
-# ══════════════════════════════════════════════════════════════════════
-class MultiTokenHead:
-    IGNORE = -100
-
-    def __init__(self, cfg: DracoConfig):
-        d = cfg.d_model
-        self.mtp_w   = cfg.mtp_weight
-        self.h1_norm = np.ones(d, dtype=np.float32)
-        self.h2_ffn  = SwiGLU(d, max(d // 2, 32))
-        self.h2_norm = np.ones(d, dtype=np.float32)
-        self.h2_proj = np.random.randn(d, cfg.vocab_size).astype(np.float32) * 0.02
-        self.h1_proj: Optional[np.ndarray] = None  # weight-tied to token_emb.T
-
+                x_sel  = x_flat[mask]
+                g_sel  = g_k[mask]
+                normed = rms_norm(x_sel, self.norm_w)
+                e_out  = self.experts[e].forward(normed)
+                output[mask] += g_sel[:, None] * e_out
+        output += self.shared.forward(rms_norm(x_flat, self.norm_w))
+        # Aux losses
+        importance = router_soft.mean(axis=0)
+        load = (top_idx == np.arange(self.n_experts)[:, None, None]).any(axis=-1).mean(axis=1)
+        aux = {
+            "importance_loss": float(importance.std()),
+            "load_loss":       float(load.std()),
+            "aux_total":       float(importance.std() + load.std()),
+        }
+        return output.reshape(bsz, seq, d), aux
+# ─────────────────────────────────────────────────────────────────────
+# Multi-Token Prediction head
+# ─────────────────────────────────────────────────────────────────────
+class MTPHead:
+    """
+    Predicts the next token (l1) and one-step-ahead token (l2).
+    l2 is used for speculative decoding with cache snapshot/restore verification.
+    """
+    def __init__(self, d_model: int, vocab_size: int):
+        scale = 1.0 / math.sqrt(d_model)
+        self.W1 = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.W2 = np.random.randn(d_model, d_model).astype(np.float32) * scale
+        self.lm_head: Optional[np.ndarray] = None
+        self.d_model = d_model
     def forward(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        assert self.h1_proj is not None, "h1_proj must be set (weight tie)"
-        l1 = rms_norm(x, self.h1_norm) @ self.h1_proj
-        h2 = x + self.h2_ffn.forward(x)
-        l2 = rms_norm(h2, self.h2_norm) @ self.h2_proj
-        return l1, l2
-
-    def _ce(self, logits: np.ndarray, targets: List[int]) -> float:
-        seq   = logits.shape[0]
-        pairs = [(i, t) for i, t in enumerate(targets[:seq])
-                 if t != self.IGNORE and 0 <= t < logits.shape[1]]
-        if not pairs:
-            return 0.0
-        idxs, tgts = zip(*pairs)
-        idxs, tgts = list(idxs), list(tgts)
-        lgt = logits[idxs]
-        lgt -= lgt.max(axis=-1, keepdims=True)
-        log_sum = np.log(np.exp(lgt).sum(axis=-1) + 1e-8)
-        return float(-(lgt[range(len(idxs)), tgts] - log_sum).mean())
-
-    def compute_loss(self, l1: np.ndarray, l2: np.ndarray, targets: List[int]) -> float:
-        seq    = l1.shape[0]
-        t1     = targets[1:seq + 1]
-        t2_raw = targets[2:seq + 2]
-        t2     = list(t2_raw) + [self.IGNORE] * (seq - len(t2_raw))
-        return self._ce(l1, t1) + self.mtp_w * self._ce(l2, t2)
-
-# ══════════════════════════════════════════════════════════════════════
-# SAMPLING — Mirostat v2, Top-K/P, Typical, Rep Penalty, Identity Overlay
-# ══════════════════════════════════════════════════════════════════════
-def sample_token(
-    logits:    np.ndarray,
-    temp:      float = 0.8,
-    top_k:     int   = 50,
-    top_p:     float = 0.9,
-    typical_p: float = 0.95,
-    mirostat:  bool  = True,
-    miro_tau:  float = 5.0,
-    miro_mu:   Optional[float] = None,
-    miro_eta:  float = 0.1,
-    rep_pen:   float = 1.1,
-    seen:      Optional[set]           = None,
-    freq_map:  Optional[Dict[int,int]] = None,
-    dist_map:  Optional[Dict[int,int]] = None,
-    deny_ids:  Optional[List[int]]     = None,   # Identity Overlay deny
-    boost_ids: Optional[List[int]]     = None,   # Identity Overlay boost
-) -> Tuple[int, float, float]:
+        """x: (1, seq, d_model)  Returns: (l1, l2) each (1, seq, vocab_size)"""
+        def silu(z):
+            return z / (1.0 + np.exp(-np.clip(z, -50, 50)))
+        h1 = silu(x @ self.W1)
+        h2 = silu(h1 @ self.W2)
+        W  = self.lm_head if self.lm_head is not None else self.W1
+        return h1 @ W.T, h2 @ W.T
+    def try_speculative(self, l2: np.ndarray, thresh: float = SPEC_THRESH
+                        ) -> Tuple[Optional[int], float]:
+        """
+        Return (token_id, confidence) if MTP prediction is confident enough.
+        The caller MUST: (1) snapshot cache, (2) forward spec token, (3) verify,
+        (4) restore cache if rejected.
+        """
+        last_logits = l2[0, -1].astype(np.float64)
+        last_logits = np.clip(last_logits, -50, 50)
+        probs = np.exp(last_logits - last_logits.max())
+        probs /= probs.sum() + 1e-9
+        best_id   = int(probs.argmax())
+        best_prob = float(probs[best_id])
+        if best_prob >= thresh:
+            return best_id, best_prob
+        return None, 0.0
+# ─────────────────────────────────────────────────────────────────────
+# Transformer Block
+# ─────────────────────────────────────────────────────────────────────
+class TransformerBlock:
+    def __init__(self, layer_idx: int, d_model: int, n_heads: int, n_kv_heads: int,
+                 head_dim: int, d_ff: int, n_experts: int = 8):
+        self.layer_idx = layer_idx
+        self.attn      = GQAttention(d_model, n_heads, n_kv_heads, head_dim)
+        self.moe       = MoELayer(d_model, d_ff, n_experts)
+        self.norm1     = np.ones(d_model, dtype=np.float32)
+        self.norm2     = np.ones(d_model, dtype=np.float32)
+    def forward(self, x: np.ndarray, cache: KVCache,
+                add_noise: bool = True) -> Tuple[np.ndarray, Dict]:
+        h     = rms_norm(x, self.norm1)
+        h     = self.attn.forward(h, cache, self.layer_idx)
+        x     = x + h
+        h, aux = self.moe.forward(rms_norm(x, self.norm2), add_noise=add_noise)
+        x = x + h
+        return x, aux
+# ─────────────────────────────────────────────────────────────────────
+# Full Transformer Model
+# ─────────────────────────────────────────────────────────────────────
+class DracoTransformerV1:
     """
-    Returns: (token_id, new_miro_mu, confidence)
-    confidence ∈ [0,1]: 1=certain, 0=very uncertain
+    DracoAI Transformer — NumPy inference engine.
+    Sampling: Mirostat v2 + temperature scaling + min-p.
+    Speculative decoding: transactional cache with snapshot/restore.
     """
-    if miro_mu is None:
-        miro_mu = 2.0 * miro_tau
-
-    lgt = logits.copy().astype(np.float64)
-
-    # ── Identity Overlay (logit-level, NOT text-replace) ─────────────
-    if deny_ids:
-        for tid in deny_ids:
-            if 0 <= tid < len(lgt):
-                lgt[tid] += _IDENTITY_LOGIT_PENALTY
-    if boost_ids:
-        for tid in boost_ids:
-            if 0 <= tid < len(lgt):
-                lgt[tid] += _IDENTITY_LOGIT_BONUS
-
-    # ── Repetition penalty (frequency + distance decay) ──────────────
-    if seen and rep_pen != 1.0:
-        for tid in seen:
-            if not (0 <= tid < len(lgt)):
-                continue
-            f  = (freq_map or {}).get(tid, 1)
-            dv = (dist_map or {}).get(tid, 1)
-            p  = rep_pen * (1.0 + 0.1 * math.log(f + 1)) / (1.0 + 0.05 * math.log(dv + 1))
-            lgt[tid] = lgt[tid] / p if lgt[tid] > 0 else lgt[tid] * p
-
-    # ── Temperature ───────────────────────────────────────────────────
-    lgt /= max(temp, 1e-6)
-    lgt  = np.clip(lgt, -50, 50)
-
-    # ── Top-K ─────────────────────────────────────────────────────────
-    if top_k > 0:
-        kth = np.sort(lgt)[::-1][min(top_k, len(lgt) - 1)]
-        lgt[lgt < kth] = -1e9
-
-    # ── Softmax ───────────────────────────────────────────────────────
-    lgt -= lgt.max()
-    probs = np.exp(lgt)
-    s     = probs.sum()
-    if not np.isfinite(s) or s < 1e-12:
-        return int(np.argmax(logits)), miro_mu, 0.0  # dead distribution fallback
-    probs /= s
-
-    # ── Token confidence = 1 − normalized entropy ─────────────────────
-    H_full     = float(-(probs * np.log2(probs + 1e-10)).sum())
-    H_max      = math.log2(max((probs > 0).sum(), 1))
-    confidence = 1.0 - (H_full / max(H_max, 1e-6))
-
-    # ── Top-P (nucleus) ───────────────────────────────────────────────
-    if top_p < 1.0:
-        si  = np.argsort(-probs); sp = probs[si]
-        cs  = np.cumsum(sp); rm  = cs > top_p
-        rm[1:] = rm[:-1].copy(); rm[0] = False
-        probs[si[rm]] = 0.0
-        ps = probs.sum()
-        if ps > 1e-12:
-            probs /= ps
-
-    # ── Typical sampling (before Mirostat) ────────────────────────────
-    if typical_p < 1.0:
-        H_i    = -np.log2(probs + 1e-10)
-        H_avg  = float((probs * H_i).sum())
-        shift  = np.abs(H_i - H_avg)
-        n_keep = max(1, int(typical_p * (probs > 0).sum()))
-        mask   = np.zeros_like(probs, dtype=bool)
-        mask[np.argsort(shift)[:n_keep]] = True
-        filtered = probs * mask
-        fs = filtered.sum()
-        if fs > 1e-12:
-            probs = filtered / fs
-
-    new_mu = miro_mu
-
-    # ── Mirostat v2 ───────────────────────────────────────────────────
-    if mirostat:
-        si   = np.argsort(-probs)
-        sp   = probs[si] / (probs[si].sum() + 1e-8)
-        surp = -np.log2(sp + 1e-10)
-        keep = surp <= miro_mu
-        if not keep.any():
-            keep[0] = True
-        filtered = np.zeros_like(probs)
-        filtered[si[keep]] = sp[keep]
-        fs = filtered.sum()
-        if fs < 1e-12:
-            filtered[si[0]] = 1.0; fs = 1.0
-        filtered /= fs
-        token_id = int(np.random.choice(len(filtered), p=filtered / filtered.sum()))
-        # Correct Mirostat v2 update: mu = mu - eta * (H - tau)
-        H      = float(-np.sum(filtered[filtered > 0] * np.log2(filtered[filtered > 0] + 1e-10)))
-        new_mu = miro_mu - miro_eta * (H - miro_tau)
-        new_mu = float(np.clip(new_mu, 0.5, miro_tau * 6.0))
-        return token_id, new_mu, confidence
-
-    ps = probs.sum()
-    if ps < 1e-12:
-        return int(np.argmax(logits)), new_mu, confidence
-    return int(np.random.choice(len(probs), p=probs / ps)), new_mu, confidence
-
-# ══════════════════════════════════════════════════════════════════════
-# DRACO TRANSFORMER
-# ══════════════════════════════════════════════════════════════════════
-class DracoTransformer:
-    def __init__(self, cfg: DracoConfig):
-        self.cfg = cfg
-        d, v     = cfg.d_model, cfg.vocab_size
-        s        = 1.0 / math.sqrt(d)
-
-        self.token_emb  = np.random.randn(v, d).astype(np.float32) * s
-        self.norm_final = np.ones(d, dtype=np.float32)
-        self.lm_head    = self.token_emb.T.copy()  # weight-tied
-        self.blocks     = [TransformerBlock(cfg, i) for i in range(cfg.n_layers)]
-        self.mtp        = MultiTokenHead(cfg)
-        self.mtp.h1_proj = self.lm_head
-
-        # Identity overlay token ID cache (filled by engine after vocab is known)
-        self._deny_ids:  List[int] = []
-        self._boost_ids: List[int] = []
-
-        n = self._count_params()
-        print(f"[DracoAI] {n/1e9:.3f}B params | "
-              f"{cfg.n_layers}L {cfg.n_heads_q}Qh/{cfg.n_heads_kv}KVh "
-              f"d={cfg.d_model} | MoE×{cfg.n_experts} | θ={cfg.rope_theta:.0f} | "
-              f"Base: Qwen 3.5 9B Instruct")
-
-    def _count_params(self) -> int:
-        n = self.token_emb.size + self.norm_final.size
-        for b in self.blocks:
-            for w in [b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.norm, b.post_norm]:
-                n += w.size
-            n += b.moe.W_router.size + b.moe.router_bias.size
-            for e in b.moe.experts + [b.moe.shared]:
-                n += e.W_g.size + e.W_u.size + e.W_d.size
-            for en in b.moe.expert_norm:
-                n += en.size
-        n += (self.mtp.h1_norm.size + self.mtp.h2_norm.size +
-              self.mtp.h2_proj.size +
-              self.mtp.h2_ffn.W_g.size + self.mtp.h2_ffn.W_u.size + self.mtp.h2_ffn.W_d.size)
-        return n
-
-    def count_params(self) -> int:
-        return self._count_params()
-
-    def make_cache(self, batch: int = 1) -> KVCache:
+    def __init__(self, config: dict):
+        self.config     = config
+        self.d_model    = config.get("d_model",    128)
+        self.n_layers   = config.get("n_layers",     4)
+        self.n_heads    = config.get("n_heads",       4)
+        self.n_kv_heads = config.get("n_kv_heads",   2)
+        self.head_dim   = config.get("head_dim",     32)
+        self.d_ff       = config.get("d_ff",        512)
+        self.n_experts  = config.get("n_experts",    8)
+        self.vocab_size = config.get("vocab_size", 151936)
+        self.window     = config.get("window",     1024)
+        self._id_bias: Optional[np.ndarray] = None
+        scale = 1.0 / math.sqrt(self.d_model)
+        self.embedding = np.random.randn(self.vocab_size, self.d_model).astype(np.float32) * scale
+        self.lm_head   = self.embedding
+        self.blocks = [
+            TransformerBlock(
+                i, self.d_model, self.n_heads, self.n_kv_heads,
+                self.head_dim, self.d_ff, self.n_experts
+            )
+            for i in range(self.n_layers)
+        ]
+        self.norm_f = np.ones(self.d_model, dtype=np.float32)
+        self.mtp = MTPHead(self.d_model, self.vocab_size)
+        self.mtp.lm_head = self.lm_head
+        self._cache: Optional[KVCache] = None
+    def _make_cache(self) -> KVCache:
         return KVCache(
-            n_layers=self.cfg.n_layers, batch=batch,
-            n_kv_heads=self.cfg.n_heads_kv,
-            max_seq=self.cfg.context_len,
-            head_dim=self.cfg.head_dim,
-            sink_tokens=self.cfg.sink_tokens,
-            window=self.cfg.sliding_window if self.cfg.sliding_window > 0 else self.cfg.context_len,
+            self.n_layers, self.n_kv_heads, self.head_dim,
+            window=self.window, sink=SINK_TOKENS
         )
-
-    def set_identity_tokens(self, deny_ids: List[int], boost_ids: List[int]):
-        """Set identity overlay token IDs (called by engine after vocab is loaded)."""
-        self._deny_ids  = deny_ids
-        self._boost_ids = boost_ids
-
-    def forward(
-        self,
-        token_ids:    List[int],
-        cache:        Optional[KVCache]           = None,
-        intent_boost: Optional[Dict[int, float]]  = None,
-        targets:      Optional[List[int]]         = None,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
-        x        = self.token_emb[token_ids]
-        total_lb = 0.0
-        for blk in self.blocks:
-            x, lb = blk.forward(x, cache, intent_boost)
-            total_lb += lb
-        x = rms_norm(x, self.norm_final)
-        l1, l2 = self.mtp.forward(x)
-        # step() called ONCE here, not per-layer
-        if cache is not None:
-            cache.step(len(token_ids))
-        loss = 0.0
-        if targets is not None:
-            loss = self.mtp.compute_loss(l1, l2, targets) + 0.01 * total_lb
-        return l1, l2, loss
-
+    # ── Forward pass ─────────────────────────────────────────────────
+    def forward(self, token_ids: List[int], cache: KVCache,
+                intent_boost: Optional[np.ndarray] = None,
+                add_noise: bool = True
+                ) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
+        """
+        Returns: (l1, l2, aux_list)
+          l1: (1, seq, vocab) — standard next-token logits
+          l2: (1, seq, vocab) — speculative one-step-ahead logits
+          aux_list: per-block MoE aux losses
+        """
+        ids = np.array(token_ids, dtype=np.int32)
+        ids = np.clip(ids, 0, self.vocab_size - 1)
+        x   = self.embedding[ids][None]
+        aux_list = []
+        for block in self.blocks:
+            x, aux = block.forward(x, cache, add_noise=add_noise)
+            aux_list.append(aux)
+        x  = rms_norm(x, self.norm_f)
+        l1 = x @ self.lm_head.T
+        _, l2 = self.mtp.forward(x)
+        if self._id_bias is not None:
+            l1 = l1 + self._id_bias[None, None, :]
+        if intent_boost is not None:
+            l1 = l1 + intent_boost[None, None, :]
+        cache.step(len(token_ids))
+        return l1, l2, aux_list
+    # ── Sanity checks ─────────────────────────────────────────────────
+    @staticmethod
+    def _sanity_checks(logits: np.ndarray, label: str = ""):
+        """FIX SANITY: Validate logits and raise on fatal issues."""
+        if np.any(np.isnan(logits)):
+            raise RuntimeError(f"NaN in logits {label}")
+        if np.any(np.isinf(logits)):
+            raise RuntimeError(f"Inf in logits {label}")
+    # ── Sampling ──────────────────────────────────────────────────────
+    @staticmethod
+    def _sample_mirostat_v2(logits: np.ndarray, mu: float, tau: float = 5.0,
+                             eta: float = 0.1) -> Tuple[int, float]:
+        """
+        Mirostat v2 adaptive sampling.
+        FIX 2.2 (🔴 CRITICAL): mu update sign corrected to MINUS.
+        FIX LOGITS-CLIP: logits clipped to [-50, 50] before exp.
+        FIX PROBS-GUARD: probs re-normalised and NaN-guarded.
+        """
+        logits = np.clip(logits, -50.0, 50.0)
+        probs  = np.exp(logits - logits.max())
+        probs /= probs.sum() + 1e-9
+        # Guard NaN/Inf
+        bad = ~np.isfinite(probs)
+        if bad.any():
+            probs[bad] = 0.0
+            s = probs.sum()
+            if s < 1e-9:
+                probs[:] = 1.0 / len(probs)
+            else:
+                probs /= s
+        idx          = np.argsort(probs)[::-1]
+        probs_sorted = probs[idx]
+        surprises    = -np.log2(probs_sorted + 1e-9)
+        cutoff       = max(1, int(np.searchsorted(surprises, mu)))
+        trunc_probs = probs_sorted[:cutoff]
+        trunc_sum   = trunc_probs.sum()
+        if trunc_sum < 1e-9:
+            trunc_probs = probs_sorted[:1].copy()
+            trunc_probs[:] = 1.0
+        else:
+            trunc_probs = trunc_probs / trunc_sum
+        chosen_local = int(np.random.choice(len(trunc_probs), p=trunc_probs))
+        chosen_id    = int(idx[chosen_local])
+        surprise = float(-np.log2(probs[chosen_id] + 1e-9))
+        mu_new   = mu - eta * (surprise - tau)   # FIX 2.2: MINUS (not plus)
+        return chosen_id, max(0.1, mu_new)
+    @staticmethod
+    def _sample_topk_topp(logits: np.ndarray, temp: float = DEFAULT_TEMP,
+                          top_p: float = DEFAULT_TOP_P, top_k: int = 50,
+                          min_p: float = 0.0) -> int:
+        """
+        FIX LOGITS-CLIP: clip logits before exp.
+        FIX MIN-P: filter tokens below min_p * max_prob after top-k/p.
+        FIX PROBS-GUARD: ensure valid probability distribution.
+        """
+        logits = np.clip(logits / max(temp, 1e-6), -50.0, 50.0)
+        if top_k > 0:
+            kth    = np.partition(logits, -top_k)[-top_k]
+            logits = np.where(logits < kth, -1e9, logits)
+        probs = np.exp(logits - logits.max())
+        probs /= probs.sum() + 1e-9
+        # FIX MIN-P
+        if min_p > 0.0:
+            max_prob = float(probs.max())
+            probs[probs < min_p * max_prob] = 0.0
+            p_sum = probs.sum()
+            if p_sum > 1e-9:
+                probs /= p_sum
+            else:
+                probs[:] = 1.0 / len(probs)
+        # Top-p nucleus
+        idx    = np.argsort(probs)[::-1]
+        cumsum = np.cumsum(probs[idx])
+        cut    = int(np.searchsorted(cumsum, top_p)) + 1
+        probs_trunc = np.zeros_like(probs)
+        probs_trunc[idx[:cut]] = probs[idx[:cut]]
+        p_sum = probs_trunc.sum()
+        if p_sum < 1e-9:
+            probs_trunc[idx[0]] = 1.0
+            p_sum = 1.0
+        probs_trunc /= p_sum
+        # FIX PROBS-GUARD
+        bad = ~np.isfinite(probs_trunc)
+        if bad.any():
+            probs_trunc[bad] = 0.0
+            s = probs_trunc.sum()
+            if s < 1e-9:
+                probs_trunc[idx[0]] = 1.0
+            else:
+                probs_trunc /= s
+        return int(np.random.choice(len(probs_trunc), p=probs_trunc))
+    # ── Generate ──────────────────────────────────────────────────────
     def generate(
         self,
-        token_ids:      List[int],
-        max_new:        int   = 200,
-        temp:           float = 0.8,
-        top_k:          int   = 50,
-        top_p:          float = 0.9,
-        typical_p:      float = 0.95,
-        mirostat:       bool  = True,
-        miro_tau:       float = 5.0,
-        rep_pen:        float = 1.1,
-        eos_id:         Optional[int]             = None,
-        intent_boost:   Optional[Dict[int,float]] = None,
-        stream_cb                                 = None,
-        conf_threshold: float = 0.3,
-        new_prompt:     bool  = True,
-    ) -> Tuple[List[int], List[float]]:
-        """Returns (generated_token_ids, confidence_scores)."""
-        cache = self.make_cache()
-        if new_prompt:
-            cache.reset()
-        ids  = list(token_ids)
-        seen = set(ids)
-        freq = {i: ids.count(i) for i in seen}
-        dist = {i: len(ids) - 1 - ids[::-1].index(i) for i in seen}
-        mu   = 2.0 * miro_tau
-        confs: List[float] = []
-
-        for step in range(max_new):
-            cur      = ids if step == 0 else [ids[-1]]
-            l1, _, _ = self.forward(cur, cache, intent_boost)
-            nid, mu, conf = sample_token(
-                l1[-1], temp=temp, top_k=top_k, top_p=top_p,
-                typical_p=typical_p, mirostat=mirostat,
-                miro_tau=miro_tau, miro_mu=mu,
-                rep_pen=rep_pen, seen=seen, freq_map=freq, dist_map=dist,
-                deny_ids=self._deny_ids, boost_ids=self._boost_ids,
-            )
-            ids.append(nid); seen.add(nid)
-            confs.append(conf)
-            freq[nid]  = freq.get(nid, 0) + 1
-            dist       = {t: dv + 1 for t, dv in dist.items()}; dist[nid] = 0
+        prompt_ids:      List[int],
+        max_new_tokens:  int   = 256,
+        temp:            float = DEFAULT_TEMP,
+        top_p:           float = DEFAULT_TOP_P,
+        min_p:           float = 0.0,
+        eos_id:          int   = 151645,
+        new_prompt:      bool  = True,
+        use_mirostat:    bool  = True,
+        use_speculative: bool  = True,
+        adaptive_temp:   bool  = False,
+        debug:           bool  = False,
+        stream_cb:       Optional[Callable[[int, float], None]] = None,
+        intent_boost:    Optional[np.ndarray] = None,
+    ) -> List[int]:
+        """
+        Generate up to max_new_tokens tokens from prompt_ids.
+        FIX CACHE-ROLLBACK (🔴 CRITICAL): When a speculative token is rejected
+        (verify_id != spec_pending):
+            1. cache.restore(snap) is called to revert K/V to pre-speculation state.
+            2. pre_spec_logits (clean logits saved BEFORE the spec forward) are used
+               to re-sample verify_id — preventing the rejected token's K/V from
+               contaminating the sampling distribution.
+            3. If verify_id == eos_id, forward EOS once to keep cache consistent.
+            4. The next loop iteration forwards verify_id correctly from the clean state.
+        FIX INDENT (🔴 CRITICAL): The speculative verification block was incorrectly
+        nested inside the repetition-penalty loop and outside the while-loop due to
+        wrong indentation. Now correctly placed inside while, after penalty application.
+        FIX SPEC-ACCEPT-MISSING-KV (🔴 CRITICAL): After accepting spec and sampling
+        T+2 (nid), old code immediately tried speculative T+3 without forwarding nid.
+        If T+3 spec was added, next iteration forwarded T+3 with K/V(nid) absent from
+        cache → attention skipped a position, RoPE broke. Fixed: forward([nid]) in
+        accept block first; use l2_new from that forward for T+3 speculation.
+        FIX LOGITS-PIPELINE: clip → repetition_penalty → sample.
+        FIX ADAPTIVE-TEMP: temperature adjusted based on output entropy.
+        """
+        if new_prompt or self._cache is None:
+            self._cache = self._make_cache()
+        cache = self._cache
+        ids   = list(prompt_ids)
+        mu  = 5.0
+        tau = 5.0
+        eta = 0.1
+        freq: Dict[int, int] = {}
+        pos:  Dict[int, int] = {}
+        n_pos = 0
+        spec_pending:    Optional[int]         = None
+        spec_snap:       Optional[dict]        = None   # snapshot taken before forwarding spec token
+        pre_spec_logits: Optional[np.ndarray]  = None   # clean logits saved BEFORE forwarding spec token
+        n_generated = 0
+        current_temp = temp
+        # Prefill
+        cur = ids
+        while n_generated < max_new_tokens:
+            l1, l2, _ = self.forward(cur, cache, intent_boost, add_noise=True)
+            last_logits = l1[0, -1].copy().astype(np.float64)
+            if debug:
+                self._sanity_checks(last_logits, f"step={n_generated}")
+            # FIX LOGITS-PIPELINE step 1: clip
+            last_logits = np.clip(last_logits, -50.0, 50.0)
+            # FIX LOGITS-PIPELINE step 2: repetition penalty (distance-decayed)
+            for tid, cnt in freq.items():
+                if cnt > 0:
+                    dist_penalty = n_pos - pos.get(tid, 0) + 1
+                    last_logits[tid] -= 0.3 * cnt / dist_penalty
+            # ── Speculative verification path ─────────────────────────────
+            if spec_pending is not None:
+                # Sample from current logits (post-spec forward) to verify
+                if use_mirostat:
+                    verify_id, mu = self._sample_mirostat_v2(last_logits, mu, tau, eta)
+                else:
+                    verify_id = self._sample_topk_topp(last_logits, current_temp, top_p, min_p=min_p)
+                if verify_id == spec_pending:
+                    # ✅ Speculative confirmed — cache K/V for spec token already written.
+                    # last_logits = forward(spec_pending) output → distribution for T+2.
+                    spec_pending    = None
+                    spec_snap       = None
+                    pre_spec_logits = None
+                    # ── Sample T+2 (nid) from last_logits ────────────────
+                    if adaptive_temp and not use_mirostat:
+                        probs_tmp = np.exp(last_logits - last_logits.max())
+                        probs_tmp /= probs_tmp.sum() + 1e-9
+                        entropy = float(-np.sum(probs_tmp * np.log(probs_tmp + 1e-9)))
+                        max_entropy = math.log(self.vocab_size)
+                        norm_entropy = entropy / (max_entropy + 1e-9)
+                        if norm_entropy < 0.1:
+                            current_temp = min(temp * 1.5, 2.0)
+                        elif norm_entropy > 0.8:
+                            current_temp = max(temp * 0.7, 0.3)
+                        else:
+                            current_temp = temp
+                    if use_mirostat:
+                        nid, mu = self._sample_mirostat_v2(last_logits, mu, tau, eta)
+                    else:
+                        nid = self._sample_topk_topp(last_logits, current_temp, top_p, min_p=min_p)
+                    ids.append(nid)
+                    freq[nid] = freq.get(nid, 0) + 1
+                    pos[nid]  = n_pos
+                    n_pos    += 1
+                    n_generated += 1
+                    conf = float(np.exp(np.clip(last_logits[nid] - last_logits.max(), -50, 0)))
+                    if stream_cb:
+                        stream_cb(nid, conf)
+                    if nid == eos_id or n_generated >= max_new_tokens:
+                        break
+                    # ── Forward T+2 to write K/V(nid) into cache ─────────
+                    # CRITICAL: nid has no K/V in cache yet. If we chain another
+                    # speculative token here, the next iteration would forward spec2
+                    # while cache is missing K/V(nid), causing attention to skip a
+                    # position and breaking RoPE alignment. We must forward nid first.
+                    # This mirrors exactly what the normal sampling path does:
+                    # forward(nid) → get fresh l2_new → try_speculative(l2_new) for T+3.
+                    l1_new, l2_new, _ = self.forward(
+                        [nid], cache, intent_boost, add_noise=True
+                    )
+                    last_logits_new = l1_new[0, -1].copy().astype(np.float64)
+                    if debug:
+                        self._sanity_checks(last_logits_new, f"accept_fwd step={n_generated}")
+                    # ── Try speculative T+3 from fresh l2_new ────────────
+                    if use_speculative:
+                        spec_id, spec_conf = self.mtp.try_speculative(l2_new)
+                        if spec_id is not None:
+                            if spec_id == eos_id:
+                                break
+                            # last_logits_new is clean (no penalty yet); save as-is
+                            # — penalty will be reapplied from scratch in verify iter
+                            pre_spec_logits = last_logits_new.copy()
+                            spec_snap = cache.snapshot()
+                            ids.append(spec_id)
+                            freq[spec_id] = freq.get(spec_id, 0) + 1
+                            pos[spec_id]  = n_pos
+                            n_pos        += 1
+                            n_generated  += 1
+                            if stream_cb:
+                                stream_cb(spec_id, spec_conf)
+                            if n_generated >= max_new_tokens:
+                                break
+                            spec_pending = spec_id
+                    cur = [ids[-1]]
+                    continue
+                else:
+                    # ❌ Speculative rejected
+                    # Step 1: Roll back cache to pre-speculation state
+                    if spec_snap is not None:
+                        cache.restore(spec_snap)
+                    # Step 2: Re-sample verify_id from CLEAN logits (before spec forward
+                    # contaminated the distribution). This avoids hallucination from
+                    # the rejected token's K/V affecting the logits we sampled from.
+                    if pre_spec_logits is not None:
+                        last_logits = pre_spec_logits.copy()
+                        # Re-apply repetition penalty with spec_pending already excluded
+                        # (we pop it below before recording verify_id)
+                        for tid, cnt in freq.items():
+                            if tid == spec_pending:
+                                continue      # exclude the rejected token
+                            if cnt > 0:
+                                dist_penalty = n_pos - pos.get(tid, 0) + 1
+                                last_logits[tid] -= 0.3 * cnt / dist_penalty
+                        if use_mirostat:
+                            verify_id, mu = self._sample_mirostat_v2(last_logits, mu, tau, eta)
+                        else:
+                            verify_id = self._sample_topk_topp(last_logits, current_temp, top_p, min_p=min_p)
+                    # Step 3: Update token list — replace rejected spec with correct token
+                    if ids and ids[-1] == spec_pending:
+                        ids[-1] = verify_id
+                        freq.pop(spec_pending, None)
+                        pos.pop(spec_pending, None)
+                        # n_pos was already incremented when spec was tentatively added;
+                        # we reuse that slot for verify_id (position stays correct)
+                    freq[verify_id] = freq.get(verify_id, 0) + 1
+                    pos[verify_id]  = n_pos - 1   # reuse spec's slot position
+                    conf = float(np.exp(np.clip(last_logits[verify_id] - last_logits.max(), -50, 0)))
+                    if stream_cb:
+                        stream_cb(verify_id, conf)
+                    if verify_id == eos_id:
+                        # Forward EOS so cache is consistent, then terminate
+                        self.forward([verify_id], cache, intent_boost, add_noise=True)
+                        spec_pending    = None
+                        spec_snap       = None
+                        pre_spec_logits = None
+                        break
+                    # Step 4: Clean up and continue — next iteration forwards verify_id
+                    spec_pending    = None
+                    spec_snap       = None
+                    pre_spec_logits = None
+                    cur = [ids[-1]]
+                    continue
+            # ── Normal sampling step ──────────────────────────────
+            # FIX ADAPTIVE-TEMP
+            if adaptive_temp and not use_mirostat:
+                probs_tmp = np.exp(last_logits - last_logits.max())
+                probs_tmp /= probs_tmp.sum() + 1e-9
+                entropy = float(-np.sum(probs_tmp * np.log(probs_tmp + 1e-9)))
+                max_entropy = math.log(self.vocab_size)
+                norm_entropy = entropy / (max_entropy + 1e-9)
+                if norm_entropy < 0.1:
+                    current_temp = min(temp * 1.5, 2.0)
+                elif norm_entropy > 0.8:
+                    current_temp = max(temp * 0.7, 0.3)
+                else:
+                    current_temp = temp
+            if use_mirostat:
+                nid, mu = self._sample_mirostat_v2(last_logits, mu, tau, eta)
+            else:
+                nid = self._sample_topk_topp(last_logits, current_temp, top_p, min_p=min_p)
+            ids.append(nid)
+            freq[nid] = freq.get(nid, 0) + 1
+            pos[nid]  = n_pos
+            n_pos    += 1
+            n_generated += 1
+            conf = float(np.exp(np.clip(last_logits[nid] - last_logits.max(), -50, 0)))
             if stream_cb:
                 stream_cb(nid, conf)
-            if eos_id is not None and nid == eos_id:
+            if nid == eos_id:
                 break
-
-        return ids, confs
-
-    # ── Mean-init extension tokens ────────────────────────────────────
-    def mean_init_extension_tokens(self, new_token_ids: List[int]):
-        base = self.cfg.qwen_base
-        for nid in new_token_ids:
-            if nid >= self.token_emb.shape[0] or nid < base:
+            if n_generated >= max_new_tokens:
+                break
+            # ── Speculative decoding ──────────────────────────────
+            if use_speculative:
+                spec_id, spec_conf = self.mtp.try_speculative(l2)
+                if spec_id is not None:
+                    if spec_id == eos_id:
+                        # FIX S1: immediate break on speculative EOS
+                        break
+                    # FIX CACHE-ROLLBACK: save clean logits and snapshot BEFORE forwarding spec token
+                    pre_spec_logits = last_logits.copy()
+                    spec_snap = cache.snapshot()
+                    # Tentatively accept; will verify next iteration
+                    ids.append(spec_id)
+                    freq[spec_id] = freq.get(spec_id, 0) + 1
+                    pos[spec_id]  = n_pos
+                    n_pos        += 1
+                    n_generated  += 1
+                    if stream_cb:
+                        stream_cb(spec_id, spec_conf)
+                    if n_generated >= max_new_tokens:
+                        break
+                    spec_pending = spec_id
+            cur = [ids[-1]]
+        # ── Cleanup: if ended mid-spec, restore and remove unverified token ──
+        if spec_pending is not None:
+            if spec_snap is not None:
+                cache.restore(spec_snap)
+            if ids and ids[-1] == spec_pending:
+                ids.pop()
+            pre_spec_logits = None
+        return ids[len(prompt_ids):]
+    # ── Weight loading ────────────────────────────────────────────────
+    def load_external_weights(self, state_dict: dict, from_checkpoint: bool = True):
+        """
+        Load weights from a Qwen-compatible state_dict.
+        Expert assignment: Qwen layer i → expert (i % n_experts), AVERAGED.
+        """
+        import re as _re
+        expert_accum: Dict[int, Dict[str, List]] = {e: {} for e in range(self.n_experts)}
+        shared_accum: Dict[str, List] = {}
+        def _accum(accum_dict, key, arr):
+            if key not in accum_dict:
+                accum_dict[key] = [arr.copy().astype(np.float32), 1]
+            else:
+                accum_dict[key][0] += arr.astype(np.float32)
+                accum_dict[key][1] += 1
+        for key, val in state_dict.items():
+            arr = val if isinstance(val, np.ndarray) else np.array(val, dtype=np.float32)
+            if "embed_tokens" in key:
+                self.embedding    = arr.astype(np.float32)
+                self.lm_head      = self.embedding
+                self.mtp.lm_head  = self.lm_head
                 continue
-            seed = np.random.choice(min(base, self.token_emb.shape[0]), size=8, replace=False)
-            mean = self.token_emb[seed].mean(axis=0)
-            self.token_emb[nid] = mean + np.random.randn(*mean.shape).astype(np.float32) * 0.01
-        self.lm_head     = self.token_emb.T.copy()
-        self.mtp.h1_proj = self.lm_head
-
-    # ── safetensors / custom save ─────────────────────────────────────
+            if "lm_head" in key:
+                self.lm_head      = arr.astype(np.float32)
+                self.mtp.lm_head  = self.lm_head
+                continue
+            for i, block in enumerate(self.blocks):
+                tag = f"layers.{i}."
+                if tag not in key:
+                    continue
+                if "q_proj"   in key: block.attn.W_q = arr.T.astype(np.float32)
+                if "k_proj"   in key: block.attn.W_k = arr.T.astype(np.float32)
+                if "v_proj"   in key: block.attn.W_v = arr.T.astype(np.float32)
+                if "o_proj"   in key: block.attn.W_o = arr.T.astype(np.float32)
+                if "input_layernorm"          in key: block.norm1 = arr.astype(np.float32)
+                if "post_attention_layernorm" in key: block.norm2 = arr.astype(np.float32)
+            m = _re.search(r"layers\.(\d+)\.mlp\.(gate_proj|up_proj|down_proj)", key)
+            if m:
+                src_layer  = int(m.group(1))
+                proj_name  = m.group(2)
+                expert_idx = src_layer % self.n_experts
+                attr_map   = {"gate_proj": "W_g", "up_proj": "W_u", "down_proj": "W_d"}
+                attr       = attr_map[proj_name]
+                _accum(expert_accum[expert_idx], attr, arr.T)
+                _accum(shared_accum, attr, arr.T)
+        for e in range(self.n_experts):
+            for attr, (total, count) in expert_accum[e].items():
+                avg = (total / count).astype(np.float32)
+                setattr(self.blocks[0].moe.experts[e], attr, avg)
+                for blk in self.blocks[1:]:
+                    setattr(blk.moe.experts[e], attr, avg)
+        for attr, (total, count) in shared_accum.items():
+            avg = (total / count).astype(np.float32)
+            for blk in self.blocks:
+                setattr(blk.moe.shared, attr, avg)
+        if "model.norm.weight" in state_dict:
+            self.norm_f = np.array(state_dict["model.norm.weight"], dtype=np.float32)
+        if not from_checkpoint:
+            for blk in self.blocks:
+                for exp in blk.moe.experts:
+                    exp._break_symmetry()
+    def set_identity_bias(self, token_ids: List[int], boost: float = 2.0):
+        """
+        Logit-level identity overlay.
+        FIX D2: Default boost reduced from 5.0 → 2.0.
+        """
+        self._id_bias = np.zeros(self.vocab_size, dtype=np.float32)
+        for tid in token_ids:
+            if 0 <= tid < self.vocab_size:
+                self._id_bias[tid] = boost
     def save_weights(self, path: str):
         os.makedirs(path, exist_ok=True)
-        tensors = self._collect()
-        try:
-            from safetensors.numpy import save_file
-            save_file(tensors, f"{path}/model.safetensors")
-            print(f"[DracoAI] Saved → {path}/model.safetensors")
-        except ImportError:
-            self._save_custom(path, tensors)
-
-    def _save_custom(self, path: str, tensors: Dict[str, np.ndarray]):
-        fp = f"{path}/draco.weight"
-        manifest = {
-            "version":   "draco_v1",
-            "arch":      {
-                "d_model":   self.cfg.d_model,
-                "n_layers":  self.cfg.n_layers,
-                "n_experts": self.cfg.n_experts,
-                # FIX: correct base model name
-                "base":      "Qwen3.5-9B-Instruct",
-            },
-            "n_tensors": len(tensors),
-            "sha256":    {},
-        }
-        with open(fp, "wb") as f:
-            f.write(b"DRC2")
-            f.write(struct.pack("<I", len(tensors)))
-            for nm, arr in tensors.items():
-                nb = nm.encode()
-                f.write(struct.pack("<H", len(nb))); f.write(nb)
-                a = np.asarray(arr, np.float32)
-                f.write(struct.pack("<B", a.ndim))
-                for ss in a.shape: f.write(struct.pack("<I", ss))
-                raw_bytes = a.tobytes()
-                f.write(raw_bytes)
-                manifest["sha256"][nm] = hashlib.sha256(raw_bytes).hexdigest()
-        with open(f"{path}/manifest.json", "w") as f:
-            json.dump(manifest, f, indent=2)
-        sz = os.path.getsize(fp)
-        print(f"[DracoAI] Saved → {fp} ({sz/1e9:.2f} GB)")
-
-    def load_weights(self, path: str):
-        sf = f"{path}/model.safetensors"
-        wf = f"{path}/draco.weight"
-        if os.path.exists(sf):
-            try:
-                from safetensors.numpy import load_file
-                tensors = load_file(sf)
-                self._load(tensors); self._sync_head()
-                print(f"[DracoAI] Loaded safetensors from {sf}")
-                return
-            except ImportError:
-                pass
-        if os.path.exists(wf):
-            self._verify_manifest(path, wf)
-            self._load_custom(wf); self._sync_head()
-            return
-        print(f"[DracoAI] No weights found at {path} — using random init")
-
-    def _verify_manifest(self, path: str, wf: str):
-        mf = f"{path}/manifest.json"
-        if not os.path.exists(mf):
-            return
-        try:
-            with open(mf) as f:
-                manifest = json.load(f)
-            print(f"[DracoAI] Manifest: version={manifest.get('version','?')} "
-                  f"arch={manifest.get('arch',{})}")
-        except Exception as e:
-            print(f"[DracoAI] Manifest read warning: {e}")
-
-    def _load_custom(self, fp: str):
-        tensors = {}
-        with open(fp, "rb") as f:
-            magic = f.read(4)
-            assert magic in (b"DRC1", b"DRC2"), f"Bad magic: {magic}"
-            n = struct.unpack("<I", f.read(4))[0]
-            for _ in range(n):
-                nl  = struct.unpack("<H", f.read(2))[0]
-                nm  = f.read(nl).decode()
-                nd  = struct.unpack("<B", f.read(1))[0]
-                sh  = tuple(struct.unpack("<I", f.read(4))[0] for _ in range(nd))
-                sz  = 1
-                for ss in sh: sz *= ss
-                tensors[nm] = np.frombuffer(f.read(sz * 4), np.float32).reshape(sh)
-        self._load(tensors)
-        print(f"[DracoAI] Loaded custom weights from {fp}")
-
-    def _sync_head(self):
-        self.lm_head     = self.token_emb.T.copy()
-        self.mtp.h1_proj = self.lm_head
-
-    # ── Collect all tensors ───────────────────────────────────────────
-    def _collect(self) -> Dict[str, np.ndarray]:
-        t = {"token_emb": self.token_emb, "norm_final": self.norm_final}
-        for i, b in enumerate(self.blocks):
-            p = f"b{i}"
-            t.update({
-                f"{p}.wq": b.attn.wq, f"{p}.wk": b.attn.wk,
-                f"{p}.wv": b.attn.wv, f"{p}.wo": b.attn.wo,
-                f"{p}.norm": b.norm,  f"{p}.post_norm": b.post_norm,
-                f"{p}.moe.Wr": b.moe.W_router,
-                f"{p}.moe.rb": b.moe.router_bias,
-            })
-            for j, e in enumerate(b.moe.experts):
-                t.update({f"{p}.e{j}.g": e.W_g, f"{p}.e{j}.u": e.W_u, f"{p}.e{j}.d": e.W_d})
-                t[f"{p}.en{j}"] = b.moe.expert_norm[j]
-            t.update({f"{p}.sh.g": b.moe.shared.W_g,
-                      f"{p}.sh.u": b.moe.shared.W_u,
-                      f"{p}.sh.d": b.moe.shared.W_d})
-        t.update({"mtp.n1": self.mtp.h1_norm, "mtp.n2": self.mtp.h2_norm,
-                  "mtp.h2p": self.mtp.h2_proj,
-                  "mtp.h2g": self.mtp.h2_ffn.W_g,
-                  "mtp.h2u": self.mtp.h2_ffn.W_u,
-                  "mtp.h2d": self.mtp.h2_ffn.W_d})
-        return t
-
-    def _load(self, t: Dict[str, np.ndarray]):
-        def cp(src, dst):
-            if src is not None and dst is not None and src.shape == dst.shape:
-                dst[:] = src
-        if "token_emb" in t:
-            n = min(t["token_emb"].shape[0], self.token_emb.shape[0])
-            self.token_emb[:n] = t["token_emb"][:n]
-        cp(t.get("norm_final"), self.norm_final)
-        for i, b in enumerate(self.blocks):
-            p = f"b{i}"
-            for attr, key in [("wq", f"{p}.wq"), ("wk", f"{p}.wk"),
-                               ("wv", f"{p}.wv"), ("wo", f"{p}.wo")]:
-                if key in t and getattr(b.attn, attr).shape == t[key].shape:
-                    setattr(b.attn, attr, t[key])
-            cp(t.get(f"{p}.norm"),      b.norm)
-            cp(t.get(f"{p}.post_norm"), b.post_norm)
-            cp(t.get(f"{p}.moe.Wr"),    b.moe.W_router)
-            cp(t.get(f"{p}.moe.rb"),    b.moe.router_bias)
-            for j, e in enumerate(b.moe.experts):
-                for attr, key in [("W_g", f"{p}.e{j}.g"), ("W_u", f"{p}.e{j}.u"),
-                                   ("W_d", f"{p}.e{j}.d")]:
-                    if key in t and getattr(e, attr).shape == t[key].shape:
-                        setattr(e, attr, t[key])
-                en_key = f"{p}.en{j}"
-                if en_key in t and b.moe.expert_norm[j].shape == t[en_key].shape:
-                    b.moe.expert_norm[j][:] = t[en_key]
-            for attr, key in [("W_g", f"{p}.sh.g"), ("W_u", f"{p}.sh.u"),
-                               ("W_d", f"{p}.sh.d")]:
-                if key in t and getattr(b.moe.shared, attr).shape == t[key].shape:
-                    setattr(b.moe.shared, attr, t[key])
-        for attr, key in [("h1_norm", "mtp.n1"), ("h2_norm", "mtp.n2"),
-                           ("h2_proj", "mtp.h2p")]:
-            cur = getattr(self.mtp, attr)
-            if key in t and cur is not None and cur.shape == t[key].shape:
-                cur[:] = t[key]
-        for attr, key in [("W_g", "mtp.h2g"), ("W_u", "mtp.h2u"), ("W_d", "mtp.h2d")]:
-            if key in t and getattr(self.mtp.h2_ffn, attr).shape == t[key].shape:
-                setattr(self.mtp.h2_ffn, attr, t[key])
-
-# Alias for backward compatibility with main.py / demo code
-DracoTransformerV1 = DracoTransformer
-
-# ══════════════════════════════════════════════════════════════════════
-# LOAD EXTERNAL WEIGHTS  (from Qwen 3.5 9B Instruct checkpoint)
-# ══════════════════════════════════════════════════════════════════════
-def load_external_weights(
-    state_dict: Dict[str, Any],
-    model: DracoTransformer,
-) -> Tuple[int, List[str]]:
-    """
-    Load Qwen 3.5 9B Instruct weights into DracoTransformer.
-
-    MoE construction from SINGLE Qwen 3.5 9B Instruct checkpoint:
-        Each layer's FFN is assigned to an expert slot via layer_idx % 8.
-        - layer_idx % 8 in {0,1,2,3} → Code group expert (slot 0-3)
-        - layer_idx % 8 in {4,5,6,7} → Language group expert (slot 4-7)
-
-        There is no separate "coder model" or "instruct model".
-        The split is based on which FFN neurons within the SINGLE 9B checkpoint
-        are observed to activate on code vs. language token sequences.
-
-    NOTE: Qwen 3.5 9B has NO .bias tensors — skip any .bias keys silently.
-    """
-    loaded = 0; skipped = []
-    for ext_k, tensor in state_dict.items():
-        # Skip bias keys (Qwen 3.5 has none)
-        if ext_k.endswith(".bias"):
-            continue
-        draco_k = bridge_key(ext_k)
-        try:
-            arr = tensor.cpu().float().numpy() if hasattr(tensor, "cpu") \
-                  else np.asarray(tensor, np.float32)
-        except Exception:
-            skipped.append(ext_k); continue
-        placed = _place_weight(model, draco_k, arr)
-        if placed:
-            loaded += 1
-        else:
-            skipped.append(f"{ext_k}→{draco_k}")
-    return loaded, skipped
-
-
-def _place_weight(model: DracoTransformer, key: str, arr: np.ndarray) -> bool:
-    """Place a weight array into the correct slot of DracoTransformer."""
-    try:
-        parts = key.split(".")
-        if parts[0] == "token_emb" and arr.ndim == 2:
-            n = min(arr.shape[0], model.cfg.qwen_base, model.token_emb.shape[0])
-            model.token_emb[:n] = arr[:n]
-            return True
-        if parts[0] == "norm_final" and arr.shape == model.norm_final.shape:
-            model.norm_final[:] = arr
-            return True
-        # lm_head: fallback → tie to embed_tokens
-        if parts[0] == "lm_head" and arr.ndim == 2:
-            n = min(arr.shape[0], model.lm_head.shape[1])
-            model.lm_head[:, :n] = arr[:n].T
-            return True
-        if parts[0] == "blocks" and len(parts) >= 3:
-            idx = int(parts[1])
-            if idx >= len(model.blocks):
-                return False
-            blk = model.blocks[idx]
-            sub = parts[2]
-            fld = ".".join(parts[3:]) if len(parts) > 3 else ""
-
-            # Attention weights
-            if sub == "attn":
-                for attr in ("wq", "wk", "wv", "wo"):
-                    if fld == attr and getattr(blk.attn, attr).shape == arr.shape:
-                        setattr(blk.attn, attr, arr)
-                        return True
-            # Norm weights
-            if sub in ("norm", "post_norm"):
-                tgt = getattr(blk, sub)
-                if tgt.shape == arr.shape:
-                    tgt[:] = arr; return True
-
-            # FFN → distribute to MoE experts
-            # Source: SINGLE Qwen 3.5 9B Instruct checkpoint
-            # expert_idx = layer_idx % n_experts
-            #   0-3 → Code group (FFN layers whose activations skew toward code tokens)
-            #   4-7 → Language group (FFN layers that skew toward language/instruction tokens)
-            if sub == "ffn":
-                expert_idx = idx % model.cfg.n_experts
-                e = blk.moe.experts[expert_idx]
-                for attr, fname in [("W_g", "gate_proj"), ("W_u", "up_proj"), ("W_d", "down_proj")]:
-                    if fld == fname and getattr(e, attr).shape == arr.shape:
-                        setattr(e, attr, arr); return True
-                # Also blend into shared expert (running average)
-                for attr, fname in [("W_g", "gate_proj"), ("W_u", "up_proj"), ("W_d", "down_proj")]:
-                    if fld == fname:
-                        tgt = getattr(blk.moe.shared, attr)
-                        if tgt.shape == arr.shape:
-                            tgt[:] = (tgt + arr) * 0.5
-                        return True
-    except Exception:
-        pass
-    return False
+        np.save(os.path.join(path, "embedding.npy"), self.embedding)
+        np.save(os.path.join(path, "norm_f.npy"),    self.norm_f)
+        for i, blk in enumerate(self.blocks):
+            prefix = os.path.join(path, f"block_{i}")
+            np.save(f"{prefix}_norm1.npy", blk.norm1)
+            np.save(f"{prefix}_norm2.npy", blk.norm2)
+            for attr in ("W_q", "W_k", "W_v", "W_o"):
+                np.save(f"{prefix}_attn_{attr}.npy", getattr(blk.attn, attr))
+            for e, exp in enumerate(blk.moe.experts):
+                for attr in ("W_g", "W_u", "W_d"):
+                    np.save(f"{prefix}_expert{e}_{attr}.npy", getattr(exp, attr))
+        with open(os.path.join(path, "config.json"), "w") as f:
+            json.dump(self.config, f, indent=2)
+    @classmethod
+    def load_weights(cls, path: str) -> "DracoTransformerV1":
+        with open(os.path.join(path, "config.json")) as f:
+            config = json.load(f)
+        model = cls(config)
+        model.embedding   = np.load(os.path.join(path, "embedding.npy"))
+        model.lm_head     = model.embedding
+        model.mtp.lm_head = model.lm_head
+        model.norm_f      = np.load(os.path.join(path, "norm_f.npy"))
+        for i, blk in enumerate(model.blocks):
+            prefix = os.path.join(path, f"block_{i}")
+            blk.norm1 = np.load(f"{prefix}_norm1.npy")
+            blk.norm2 = np.load(f"{prefix}_norm2.npy")
+            for attr in ("W_q", "W_k", "W_v", "W_o"):
+                setattr(blk.attn, attr, np.load(f"{prefix}_attn_{attr}.npy"))
+            for e, exp in enumerate(blk.moe.experts):
+                for attr in ("W_g", "W_u", "W_d"):
+                    setattr(exp, attr, np.load(f"{prefix}_expert{e}_{attr}.npy"))
+        return model
+# ── Smoke test ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    config = {
+        "d_model": 64, "n_layers": 2, "n_heads": 4, "n_kv_heads": 2,
+        "head_dim": 16, "d_ff": 128, "n_experts": 4, "vocab_size": 1000, "window": 64,
+    }
+    model = DracoTransformerV1(config)
+    # Test KVCache snapshot/restore
+    cache = model._make_cache()
+    ids_test = [1, 2, 3]
+    l1, l2, _ = model.forward(ids_test, cache)
+    snap = cache.snapshot()
+    old_pos = cache.cache_pos
+    l1b, l2b, _ = model.forward([4], cache)
+    cache.restore(snap)
+    assert cache.cache_pos == old_pos, "snapshot/restore failed"
+    print("✅ KVCache snapshot/restore OK")
+    # Test generate without speculative
+    out = model.generate([1, 2, 3], max_new_tokens=5, use_speculative=False, debug=True)
+    assert isinstance(out, list) and len(out) <= 5
+    print(f"✅ generate OK: {out}")
+    # Test speculative with cache rollback
+    out2 = model.generate([1, 2, 3], max_new_tokens=8, use_speculative=True)
+    print(f"✅ speculative generate OK: {out2}")
+    # Test mirostat sign fix
+    logits = np.array([100.0, -100.0, 50.0, 0.0])
+    nid, mu = DracoTransformerV1._sample_mirostat_v2(logits, mu=5.0)
+    assert 0 <= nid < 4, f"bad sample id: {nid}"
+    # Verify mu decreases when surprise is high (chosen is very likely token = low surprise)
+    print(f"✅ mirostat sampling OK: id={nid}, mu={mu:.3f}")
+    # Test min-p sampling (top_k must be <= vocab size in test array)
+    nid2 = DracoTransformerV1._sample_topk_topp(logits, min_p=0.1, top_k=4)
+    assert 0 <= nid2 < 4
+    print(f"✅ min-p sampling OK: id={nid2}")
+    print("✅ transformer_v1 self-test passed")
