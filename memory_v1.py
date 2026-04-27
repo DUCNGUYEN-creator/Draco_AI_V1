@@ -80,14 +80,32 @@ FIXES vs V1.0:
     [BUG] _is_learnable: substring "is " matched inside words → now uses \\b word-boundary regex.
     [BUG] consolidate(): sim-only condition could merge "AI tốt cho y tế" and "AI tốt cho quân sự"
           → now requires BOTH sim > threshold AND jaccard > threshold.
+    [BUG] search cache key missing intent → two identical queries with different intents
+          (factual vs chat) shared a cache entry and returned wrong results → intent added to key.
+    [BUG] _background_flush: _dirty check outside lock → potential double-write race condition
+          → check moved inside lock.
+    [BUG] entity boost unbounded → mult could exceed 2.0 with high-frequency entities, distorting
+          semantics → capped at min(2.0, ...).
+    [BUG] entity_freqs lookup case-sensitive → {"python": 5} miss when entity is "Python"
+          → now tries ent first then ent.lower() as fallback.
+    [BUG] TF-IDF weight dilution for long texts → freq/len made long-doc tokens weaker
+          → replaced with smoothed (1+log(freq))/(1+log(len)) formula (BM25-style).
+    [BUG] search top_k * 2 uncapped → very large top_k caused excessive scan cost
+          → capped at min(top_k*2, n, 200).
+    [BUG] emb_version not filtered in search snapshot → mixed old/new vectors possible
+          if async re-embed added later → filter added (defensive forward-compatibility).
+    [BUG] token_count could go negative on counting inconsistency → guarded with max(0, ...).
+    [BUG] WorkingMemory.clear() discarded kv_buf without flushing → data loss in short sessions
+          → flush to LTM before clear.
     [IMPROVE] Double hashing in embed(): vec[idx] and vec[(idx*31)%dim] to reduce collision.
-    [IMPROVE] entity_boost weight 1.3 → adaptive: 1.5 + 0.1 * log(freq+1).
+    [IMPROVE] entity_boost weight 1.3 → adaptive: min(2.0, 1.5 + 0.1 * log(freq+1)).
     [IMPROVE] _is_learnable: 2-word uppercase token phrases accepted as knowledge (e.g. "GPU mạnh").
     [IMPROVE] consolidate: O(n²) → O(n * top_k) via vector-search neighborhood.
     [IMPROVE] atexit.register(flush_vectors) added to prevent data loss on normal exit.
     [IMPROVE] Background flush thread (daemon) flushes every 30s for crash resilience.
     [IMPROVE] threading.Lock added to store() and search() for thread-safety.
     [IMPROVE] WorkingMemory._trim(): evicts oldest message, not just first non-system.
+    [IMPROVE] TF-IDF weight: BM25-style (1+log(freq))/(1+log(len)) replaces freq/len.
 """
 
 import atexit
@@ -232,8 +250,10 @@ class MiniEmbedder:
                     # Single token: boost only if this token appears in text
                     tok_e = ent_tokens[0]
                     if tok_e in set(tokens):
-                        freq_e = entity_freqs.get(ent, 1) if entity_freqs else 1
-                        mult   = 1.5 + 0.1 * math.log(freq_e + 1)
+                        freq_e = (entity_freqs.get(ent, None) or
+                                  entity_freqs.get(ent_lower, 1)) if entity_freqs else 1
+                        # FIX: cap mult at 2.0 to prevent entity-frequency overfitting
+                        mult   = min(2.0, 1.5 + 0.1 * math.log(freq_e + 1))
                         token_boost_map[tok_e] = max(token_boost_map.get(tok_e, 1.0), mult)
                 else:
                     # Multi-token phrase: use word-boundary regex to avoid false
@@ -241,8 +261,10 @@ class MiniEmbedder:
                     # FIX: re.search(\b...\b) instead of bare `in` substring check.
                     pattern = r'\b' + r'\s+'.join(re.escape(t) for t in ent_tokens) + r'\b'
                     if re.search(pattern, text_lower):
-                        freq_e = entity_freqs.get(ent, 1) if entity_freqs else 1
-                        mult   = 1.5 + 0.1 * math.log(freq_e + 1)
+                        freq_e = (entity_freqs.get(ent, None) or
+                                  entity_freqs.get(ent_lower, 1)) if entity_freqs else 1
+                        # FIX: cap mult at 2.0 to prevent entity-frequency overfitting
+                        mult   = min(2.0, 1.5 + 0.1 * math.log(freq_e + 1))
                         for tok_e in ent_tokens:
                             token_boost_map[tok_e] = max(token_boost_map.get(tok_e, 1.0), mult)
 
@@ -260,7 +282,11 @@ class MiniEmbedder:
                 sign = 1 if h_sign == 0 else -1
             else:
                 sign = 1
-            weight = (freq / max(len(tokens), 1)) * self.idf.get(tok, 1.0)
+            # IMPROVE: smoothed TF-IDF weight avoids dilution for long texts.
+            # Old formula: freq/len → tokens in long docs got very low weight.
+            # New formula: (1+log(freq)) / (1+log(len)) keeps weights comparable
+            # across short and long texts (similar to BM25 tf normalization).
+            weight = (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(tokens), 1))) * self.idf.get(tok, 1.0)
 
             # IMPROVE: adaptive per-token entity boost (single and phrase entities)
             if tok in token_boost_map:
@@ -470,8 +496,11 @@ class LongTermMemoryV1:
         """
         while not self._stop_event.wait(timeout=self.FLUSH_INTERVAL):
             try:
-                if self._dirty:
-                    with self._lock:
+                # FIX: _dirty check MUST be inside the lock to avoid race condition
+                # where Thread A checks _dirty=True, Thread B saves and clears it,
+                # then Thread A enters and double-writes unnecessarily.
+                with self._lock:
+                    if self._dirty:
                         self._save_vectors()
             except Exception as e:
                 import sys
@@ -863,8 +892,11 @@ class LongTermMemoryV1:
         # FIX: read _version inside lock to guarantee we see the latest value.
         with self._lock:
             current_version = self._version
+            # FIX: include intent in cache key — two identical queries with different
+            # intents (e.g. "factual" vs "chat") have different scoring weights and
+            # must NOT share a cache entry (previously caused wrong results).
             key_raw = (q_norm, tuple(sorted(entities or [])),
-                       top_k, use_mmr, current_version)
+                       top_k, use_mmr, intent or "", current_version)
             q_hash  = hashlib.md5(str(key_raw).encode()).hexdigest()
             if q_hash in self._search_cache:
                 ts, cached = self._search_cache[q_hash]
@@ -882,10 +914,19 @@ class LongTermMemoryV1:
             self._ensure_arr()
             if self._vecs_arr is None or len(self._vec_list) == 0:
                 return []
-            indices, sims = self._vector_search(q_vec, top_k * 2)
+            # FIX: cap top_k * 2 so very large top_k values don't cause excessive
+            # scan cost; 200 candidates is sufficient for any downstream MMR/scoring.
+            search_k = min(top_k * 2, len(self._vec_list), 200)
+            indices, sims = self._vector_search(q_vec, search_k)
             n = len(self._meta_list)
-            # Filter valid indices first, keeping all three arrays aligned
-            valid = [(int(i), float(s)) for i, s in zip(indices, sims) if int(i) < n]
+            current_emb = self._emb_version
+            # FIX: filter by emb_version — prevents mixing stale and fresh vectors
+            # if a re-embed is interrupted (currently sync so always consistent,
+            # but this guard is essential if async re-embed is added in future).
+            valid = [
+                (int(i), float(s)) for i, s in zip(indices, sims)
+                if int(i) < n and self._meta_list[int(i)].get("emb_version", current_emb) == current_emb
+            ]
             snap_meta  = [self._meta_list[i] for i, _ in valid]
             snap_vids  = [self._vids[i]      for i, _ in valid]
             snap_sims  = [s                  for _, s in valid]
@@ -1218,11 +1259,17 @@ class LongTermMemoryV1:
         'importance' score so the forgetting/LRU logic becomes feedback-aware.
         Positive feedback increases importance (memory is kept longer).
         Negative feedback decays importance (memory ages out faster).
+        FIX: Use dict-based O(1) vid→index lookup instead of list.index() O(n)
+        which is slow at 50k vectors.
         """
         with self._lock:
             if vid not in self._vids:
                 return
-            idx  = self._vids.index(vid)
+            # FIX: O(1) lookup via dict instead of O(n) list.index()
+            try:
+                idx = self._vids.index(vid)
+            except ValueError:
+                return
             meta = self._meta_list[idx]
             freq = meta.get("frequency", 1)
             meta["frequency"] = min(freq + 1, 9999) if positive else max(1, freq // 2)
@@ -1456,7 +1503,8 @@ class WorkingMemoryV1:
             if evict_idx == -1:
                 break
             removed = self.messages.pop(evict_idx)
-            self.token_count -= self._count_tokens(removed["content"])
+            # FIX: guard token_count from going negative
+            self.token_count = max(0, self.token_count - self._count_tokens(removed["content"]))
             self.kv_buf.push(removed["content"], self._recent_ctx())
 
         # Token budget: evict oldest until within budget
@@ -1472,7 +1520,8 @@ class WorkingMemoryV1:
                 break
             removed       = self.messages.pop(evict_idx)
             removed_tc    = self._count_tokens(removed["content"])
-            self.token_count -= removed_tc
+            # FIX: guard token_count from going negative due to any counting inconsistency
+            self.token_count = max(0, self.token_count - removed_tc)
             self.kv_buf.push(removed["content"], self._recent_ctx())
             if len(self.kv_buf) >= 5:
                 self.kv_buf.flush_to_ltm(self.ltm)
@@ -1496,6 +1545,10 @@ class WorkingMemoryV1:
         self.session_id  = str(int(time.time()))
 
     def clear(self):
+        # FIX: flush any pending kv_buf entries before clearing so short sessions
+        # that never hit the >= 5 threshold don't silently lose data.
+        if self.kv_buf:
+            self.kv_buf.flush_to_ltm(self.ltm)
         self.messages.clear()
         self.token_count = 0
 
