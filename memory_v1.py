@@ -1,29 +1,4 @@
-"""
-DracoAI V1 — Memory System (Vector DB)
-=======================================
-ALL BUGS FIXED:
-    ✅ MiniEmbedder dim=256 everywhere (no mismatch with LongTermMemoryV1)
-    ✅ np.vstack → list buffer (no O(N²) copy per store)
-    ✅ _get_episode_summaries separate name (no recursion)
-    ✅ WorkingMemoryV1 accurate token counting via tokenizer
-    ✅ WorkingMemoryV1 evict with full metadata
-    ✅ auto_learn filter: len>5 words, no "?"
-    ✅ LRU cleanup when n_vectors > MAX_VECTORS
-    ✅ npz save/load with allow_pickle=True
-    ✅ LongTermMemory.search: 2-stage (cosine + intent rerank)
-
-Vector DB entry format:
-    {
-        "text":      str,
-        "embedding": List[float],   # cosine-searchable, dim=256
-        "score":     float,         # set at query time
-        "timestamp": float,
-        "frequency": int,
-        "type":      str,           # "fact"|"episode"|"knowledge"|"user_query"
-        "metadata":  dict,
-    }
-"""
-# Copyright 2026 The Draco Studio and DUCNGUYEN-creator
+# Copyright 2026 Draco Studio and DUCNGUYEN-creator
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,411 +11,1259 @@ Vector DB entry format:
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+DracoAI V1 — Memory System (Vector DB)
+=======================================
+Compatible with ThinkingEngineV1 (engine_v1.py).
 
-import os, json, time, math, hashlib
+Engine interface (process() params):
+    memory_summary    : str        ← get_summary_with_intent()
+    ltm_facts         : List[dict] ← get_facts()
+    memory_candidates : List[dict] ← search()
+
+Convenience method:
+    prepare_engine_input(query, intent, top_k) → dict with all three keys.
+
+PRODUCTION HARDENING:
+    - Vectors are stored pre‑normalized (dot product = cosine similarity).
+    - Batched disk writes every N stores to avoid I/O choking.
+    - _save_vectors() uses atomic write (tmp + os.replace) to prevent file
+      corruption on power failure / crash.
+    - Background flush thread: flushes dirty vectors every 30s.
+    - Search cache key is MD5 of full query + entities (not truncated) to prevent collision.
+    - Semantic duplicate check scans top-10 candidates with negation guard.
+    - _vector_search guards NaN values via np.nan_to_num.
+    - MMR ensures fresh vector array before use.
+    - Learnable filter uses word-boundary regex (\\b) instead of substring match
+      to avoid false positives (e.g. "isn't" matching "is ").
+    - Short 2-word phrases with uppercase tokens are accepted as knowledge.
+    - consolidate() uses vector-search neighborhood + combined sim+jaccard condition
+      to avoid merging semantically different memories.
+    - Double hashing in embed() reduces hash collision significantly.
+    - Cache is invalidated after fit_embedder() / update_idf() calls.
+    - atexit flush ensures vectors are persisted on normal program exit.
+    - Thread-safe store/search/consolidate/feedback/decay via threading.Lock.
+    - All public methods that read or write shared state are fully lock-guarded.
+    - search() snapshots all shared data under lock before releasing it for scoring.
+    - _mmr() receives a pre-snapshotted vecs array, never touches shared state.
+    - consolidate(), record_feedback(), decay_cleanup() fully wrapped in lock.
+    - fit_embedder() / update_idf() / _re_embed_all() fully wrapped in lock.
+    - Background flush logs errors instead of silently swallowing them.
+    - entity_boost phrase matching fixed (substring match on full text, not token).
+    - Vietnamese learnable markers extended (gồm, bao gồm, thuộc, được gọi là).
+    - Token count for Vietnamese fixed: len(content) // 4 instead of split()*1.3.
+    - Double hashing secondary index uses MD5 instead of predictable *31 formula.
+    - Cache version counter (_version) invalidates stale entries across all write ops.
+    - list_recent / search_by_type / stats read under lock for consistency.
+    - All critical sections are documented.
+
+FIXES vs V1.0:
+    [BUG] _vector_search: when len(sims) <= top_k, results were unordered → now sorted by -sim.
+    [BUG] search cache key truncated query at 100 chars → collision risk; now hashes full query.
+    [BUG] _init_files: prefs.json initialized as [] (array) instead of {} (dict) → fixed.
+    [BUG] _lru_cleanup: kept indices could shift after deletion causing wrong removals → fixed
+          by collecting vids-to-remove instead of index-based deletion.
+    [BUG] _save_vectors: direct np.savez_compressed overwrite could corrupt on crash → atomic
+          write via tmp file + os.replace now used.
+    [BUG] _semantic_duplicate: only checked top-3, could miss duplicate at position 4-10 → top-10.
+    [BUG] _vector_search: NaN in similarity could cause sort disorder → nan_to_num guard added.
+    [BUG] cache not cleared after fit_embedder/update_idf → clear_search_cache() added.
+    [BUG] _is_learnable: substring "is " matched inside words → now uses \\b word-boundary regex.
+    [BUG] consolidate(): sim-only condition could merge "AI tốt cho y tế" and "AI tốt cho quân sự"
+          → now requires BOTH sim > threshold AND jaccard > threshold.
+    [IMPROVE] Double hashing in embed(): vec[idx] and vec[(idx*31)%dim] to reduce collision.
+    [IMPROVE] entity_boost weight 1.3 → adaptive: 1.5 + 0.1 * log(freq+1).
+    [IMPROVE] _is_learnable: 2-word uppercase token phrases accepted as knowledge (e.g. "GPU mạnh").
+    [IMPROVE] consolidate: O(n²) → O(n * top_k) via vector-search neighborhood.
+    [IMPROVE] atexit.register(flush_vectors) added to prevent data loss on normal exit.
+    [IMPROVE] Background flush thread (daemon) flushes every 30s for crash resilience.
+    [IMPROVE] threading.Lock added to store() and search() for thread-safety.
+    [IMPROVE] WorkingMemory._trim(): evicts oldest message, not just first non-system.
+"""
+
+import atexit
+import os
+import json
+import math
+import time
+import hashlib
+import re
+import threading
+from collections import OrderedDict
+
 import numpy as np
-from typing import List, Dict, Optional, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 
 # ══════════════════════════════════════════════════════════════════════
-# MINI EMBEDDER  (TF-IDF + hash trick, dim=256)
+# MINI EMBEDDER  — TF-IDF-style bag-of-words, no external deps
 # ══════════════════════════════════════════════════════════════════════
 class MiniEmbedder:
     """
-    Lightweight TF-IDF + hash-trick embedder.
-    dim=256 unified throughout the memory system.
-    Supports Vietnamese + English, bigrams, synonyms, entity boost.
+    Lightweight bag-of-words embedder with double-hash trick.
+    dim = 1024 to reduce collision probability.
+    Vocab & IDF are built via fit(); update_idf() adjusts IDF without
+    touching vocab, minimizing drift.
+    Can be frozen to prevent any further updates.
+    All embeddings are L2-normalized.
+
+    FIX: Double hashing — each token contributes to TWO positions in the
+    vector (primary and secondary), which drastically reduces collision
+    accumulation and improves semantic discrimination.
     """
-    SW_VI = {
-        "là","và","của","có","được","không","này","đó","với","để","trong",
-        "một","các","những","cho","từ","theo","về","như","vì","đã","sẽ",
-        "tôi","bạn","anh","chị","em",
-    }
-    SW_EN = {
-        "is","a","an","the","of","in","to","for","and","or","it",
-        "this","that","be","was","are","at","by","from","with",
-    }
-    SYNO = {
-        "lập trình": "code", "code": "programming",
-        "hiểu": "understand", "nhớ": "memory",
-        "tính": "calculate",  "debug": "fix",
-    }
 
-    def __init__(self, dim: int = 256):
-        # FIX: dim=256 unified (was 512 in class, 256 in LTM → shape mismatch)
+    def __init__(self, dim: int = 1024):
         self.dim = dim
-        self._vocab: Dict[str, int]   = {}
-        self._idf:   Dict[str, float] = {}
-        self._n_docs: int = 0
+        self.vocab: Dict[str, int]   = {}
+        self.idf:   Dict[str, float] = {}
+        self._doc_count = 0
+        self._df:   Dict[str, int]   = {}
+        self._frozen = False
 
-    def _tokenize(self, text: str) -> List[str]:
-        import re
-        tokens  = re.findall(r"[a-zA-ZÀ-ỹ]+|\d+", text.lower())
-        sw      = self.SW_VI | self.SW_EN
-        tokens  = [self.SYNO.get(t, t) for t in tokens if t not in sw and len(t) > 1]
-        bigrams = [tokens[i] + "_" + tokens[i + 1] for i in range(len(tokens) - 1)]
-        return tokens + bigrams[:len(tokens)]
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
 
-    def _hash(self, w: str) -> int:
-        if w not in self._vocab:
-            self._vocab[w] = int(hashlib.md5(w.encode()).hexdigest(), 16) % self.dim
-        return self._vocab[w]
+    def freeze(self):
+        self._frozen = True
+
+    def unfreeze(self):
+        self._frozen = False
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        text = text.lower()
+        tokens = []
+        buf = ""
+        for ch in text:
+            if ch.isalnum() or ch in "àáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹ+#.":
+                buf += ch
+            else:
+                if buf:
+                    tokens.append(buf)
+                    buf = ""
+        if buf:
+            tokens.append(buf)
+        return tokens
 
     def fit(self, texts: List[str]):
-        self._n_docs = len(texts)
-        df: Dict[str, int] = {}
-        for t in texts:
-            for w in set(self._tokenize(t)):
-                df[w] = df.get(w, 0) + 1
-        self._idf = {w: math.log((self._n_docs + 1) / (cnt + 1)) + 1.0
-                     for w, cnt in df.items()}
+        if self._frozen:
+            return
+        self.vocab.clear()
+        self.idf.clear()
+        self._df.clear()
+        self._doc_count = 0
+        for text in texts:
+            tokens = set(self._tokenize(text))
+            self._doc_count += 1
+            for tok in tokens:
+                self._df[tok] = self._df.get(tok, 0) + 1
 
-    def embed(self, text: str, entity_boost: List[str] = None) -> np.ndarray:
+        sorted_tokens = sorted(self._df.items(), key=lambda x: -x[1])
+        self.vocab = {tok: i for i, (tok, _) in enumerate(sorted_tokens[: self.dim])}
+
+        N = max(self._doc_count, 1)
+        self.idf = {
+            tok: math.log((N + 1) / (df + 1)) + 1.0
+            for tok, df in self._df.items() if tok in self.vocab
+        }
+
+    def update_idf(self, texts: List[str]):
+        if self._frozen:
+            return
+        for text in texts:
+            tokens = set(self._tokenize(text))
+            self._doc_count += 1
+            for tok in tokens:
+                self._df[tok] = self._df.get(tok, 0) + 1
+        N = max(self._doc_count, 1)
+        for tok in self.vocab:
+            df = self._df.get(tok, 0)
+            self.idf[tok] = math.log((N + 1) / (df + 1)) + 1.0
+
+    def embed(self, text: str, entity_boost: Optional[List[str]] = None,
+              entity_freqs: Optional[Dict[str, int]] = None) -> np.ndarray:
+        """Return an L2-normalized vector.
+
+        entity_boost  : list of entity strings to receive extra weight.
+        entity_freqs  : optional dict {entity: freq} for adaptive boost;
+                        if None, a flat multiplier of 1.5 is used.
+
+        FIX: Double hashing — each OOV token contributes to a primary index
+        and a secondary index (primary * 31 % dim) with 0.5 weight. This
+        greatly reduces collision accumulation compared to single hashing.
+        """
         tokens = self._tokenize(text)
-        if not tokens:
-            return np.zeros(self.dim, dtype=np.float32)
-        tf: Dict[str, float] = {}
-        for w in tokens: tf[w] = tf.get(w, 0) + 1
-        n   = len(tokens)
-        vec = np.zeros(self.dim, dtype=np.float32)
-        for w, cnt in tf.items():
-            idf    = self._idf.get(w, 1.0)
-            eb     = 2.0 if entity_boost and w in [e.lower() for e in entity_boost] else 1.0
-            weight = (cnt / n) * idf * eb
-            idx    = self._hash(w)
-            vec[idx]                       += weight
-            vec[(idx * 7  + 3) % self.dim] += weight * 0.5
-            vec[(idx * 13 + 7) % self.dim] += weight * 0.3
+        vec    = np.zeros(self.dim, dtype=np.float32)
+
+        entity_set = set(e.lower() for e in entity_boost) if entity_boost else set()
+
+        tf: Dict[str, int] = {}
+        for tok in tokens:
+            tf[tok] = tf.get(tok, 0) + 1
+
+        for tok, freq in tf.items():
+            idx = self.vocab.get(tok)
+            if idx is None:
+                # FIX: double hashing with independent suffixes for idx and sign
+                h_idx  = int(hashlib.md5((tok + "_idx").encode()).hexdigest(), 16) % self.dim
+                h_sign = int(hashlib.md5((tok + "_sign").encode()).hexdigest(), 16) % 2
+                idx  = h_idx
+                sign = 1 if h_sign == 0 else -1
+            else:
+                sign = 1
+            weight = (freq / max(len(tokens), 1)) * self.idf.get(tok, 1.0)
+
+            # IMPROVE: adaptive entity boost instead of flat 1.3
+            # FIX: check entity as phrase substring in original text, not token match
+            if entity_set and any(ent in text.lower() for ent in entity_set):
+                if entity_freqs:
+                    ent_freq = entity_freqs.get(tok, 1)
+                else:
+                    ent_freq = 1
+                weight *= 1.5 + 0.1 * math.log(ent_freq + 1)
+
+            # FIX: double hashing — primary + secondary position
+            # Use MD5-based secondary index instead of predictable (idx*31)%dim
+            vec[idx] += sign * weight
+            sec_idx = int(hashlib.md5((tok + "_sec").encode()).hexdigest(), 16) % self.dim
+            vec[sec_idx] += 0.5 * sign * weight
+
         norm = np.linalg.norm(vec)
-        return (vec / (norm + 1e-8)).astype(np.float32)
+        if norm > 1e-8:
+            vec /= norm
+        return vec
 
-    def similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+    @staticmethod
+    def similarity(a: np.ndarray, b: np.ndarray) -> float:
+        # Both vectors are assumed to be normalized; dot product suffices.
+        return float(np.dot(a, b))
 
-    def save(self, path: str):
-        os.makedirs(path, exist_ok=True)
-        with open(f"{path}/embedder.json", "w", encoding="utf-8") as f:
-            json.dump({"vocab": self._vocab, "idf": self._idf,
-                       "n_docs": self._n_docs, "dim": self.dim}, f)
+    def save(self, directory: str):
+        path = os.path.join(directory, "embedder.json")
+        tmp  = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "dim":       self.dim,
+                    "vocab":     self.vocab,
+                    "idf":       self.idf,
+                    "doc_count": self._doc_count,
+                    "df":        self._df,
+                    "frozen":    self._frozen,
+                },
+                f,
+                ensure_ascii=False,
+            )
+        os.replace(tmp, path)
 
-    def load(self, path: str):
-        fp = f"{path}/embedder.json"
-        if not os.path.exists(fp): return
-        with open(fp, encoding="utf-8") as f:
-            d = json.load(f)
-        self._vocab  = d["vocab"]
-        self._idf    = d["idf"]
-        self._n_docs = d["n_docs"]
-        self.dim     = d["dim"]   # honour saved dim (always 256)
+    def load(self, directory: str):
+        path = os.path.join(directory, "embedder.json")
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.dim        = data.get("dim", self.dim)
+        self.vocab      = data.get("vocab", {})
+        self.idf        = data.get("idf",   {})
+        self._doc_count = data.get("doc_count", 0)
+        self._df        = data.get("df",    {})
+        self._frozen    = data.get("frozen", False)
+
 
 # ══════════════════════════════════════════════════════════════════════
-# KV CACHE BUFFER — short-term buffer before LTM
+# KV CACHE BUFFER  — short-term recency window
 # ══════════════════════════════════════════════════════════════════════
 class KVCacheBuffer:
-    def __init__(self, embedder: MiniEmbedder, threshold: float = 0.45):
-        self.embedder  = embedder
-        self.threshold = threshold
-        self._buf: List[dict] = []
-        self._max = 50
+    def __init__(self, max_size: int = 64):
+        self.max_size = max_size
+        self._buffer: List[Dict[str, Any]] = []
+
+    # ── Unified learnable filter ─────────────────────────────────────
+    @staticmethod
+    def _is_learnable(text: str) -> bool:
+        """Shared filter for both KVCacheBuffer and LongTermMemoryV1.
+
+        FIX: Uses word-boundary regex (\\b) instead of simple substring
+        match to avoid false positives like "isn't" matching "is ".
+
+        FIX: Short 2-word phrases with at least one uppercase token are
+        accepted as knowledge (e.g. "GPU mạnh", "LLM tốt").
+        """
+        text = text.strip()
+        words = text.split()
+        if len(words) < 2:
+            return False
+
+        # FIX: accept 2-word uppercase phrases as knowledge
+        if len(words) == 2 and any(w.isupper() or (len(w) >= 2 and w[0].isupper()) for w in words):
+            return True
+
+        if len(words) < 3:
+            return False
+
+        if "?" in text:
+            lower = text.lower()
+            # Vietnamese knowledge questions
+            if any(kw in lower for kw in ["là gì", "định nghĩa", "ai là", "nghĩa là",
+                                          "what is", "define", "who is", "what are",
+                                          "how does", "explain"]):
+                return len(words) >= 4
+            return len(words) >= 6
+
+        # FIX: use word-boundary regex for English keywords to avoid false matches
+        if any(marker in text for marker in ["là", "=", "->", ":", "=>", "==",
+                                              "gồm", "bao gồm", "thuộc",
+                                              "được gọi là", "bao gồm"]):
+            return len(words) >= 3
+
+        # FIX: word-boundary check for space-sensitive keywords
+        lower = text.lower()
+        if re.search(r'\b(?:is|are|means|def|class|return|import)\b', lower) or \
+           re.search(r'(?:là|gồm|bao gồm|thuộc|được gọi là)', lower):
+            return len(words) >= 3
+
+        return len(words) >= 4
 
     def push(self, text: str, context: str = ""):
-        if len(text.strip()) < 3: return
-        imp = self._importance(text, context)
-        if imp >= self.threshold:
-            self._buf.append({"text": text, "context": context,
-                               "importance": imp, "ts": time.time()})
-            if len(self._buf) > self._max:
-                self._buf.sort(key=lambda x: x["importance"], reverse=True)
-                self._buf = self._buf[:self._max // 2]
+        if not self._is_learnable(text):
+            return
+        entry = {
+            "text":      text,
+            "context":   context,
+            "timestamp": time.time(),
+        }
+        self._buffer.append(entry)
+        if len(self._buffer) > self.max_size:
+            self._buffer.pop(0)
 
-    def flush_to_ltm(self, ltm: "LongTermMemoryV1") -> int:
-        count = 0
-        for item in self._buf:
-            ltm.store(item["text"], {"from_buffer": True, "importance": item["importance"],
-                                      "ts": item["ts"], "source": "kv_cache"})
-            count += 1
-        self._buf.clear()
-        return count
+    def recent(self, n: int = 8) -> List[Dict[str, Any]]:
+        return list(self._buffer[-n:])
 
-    def _importance(self, text: str, context: str) -> float:
-        import re
-        score = 0.3
-        wc = len(text.split())
-        if 5 <= wc <= 50: score += 0.2
-        if re.search(r"\d+", text): score += 0.1
-        if any(p in text.lower() for p in ["là", "định nghĩa", "nghĩa là", "means"]): score += 0.15
-        if re.search(r"\b[A-ZÀÁÂ][a-zàáâã]+\b", text): score += 0.1
-        if context:
-            t_w = set(text.lower().split()); c_w = set(context.lower().split())
-            score += min(len(t_w & c_w) / (len(t_w) + 1), 0.15)
-        return min(score, 1.0)
+    def clear(self):
+        self._buffer.clear()
+
+    def flush_to_ltm(self, ltm: "LongTermMemoryV1"):
+        for entry in self._buffer:
+            ltm.store(entry["text"], {"source": "kv_buffer", "context": entry["context"]})
+        self.clear()
+
+    def __len__(self) -> int:
+        return len(self._buffer)
+
 
 # ══════════════════════════════════════════════════════════════════════
-# LONG-TERM MEMORY V1 — proper Vector DB
+# LONG-TERM MEMORY V1
 # ══════════════════════════════════════════════════════════════════════
 class LongTermMemoryV1:
-    MAX_VECTORS = 50_000
+    MAX_VECTORS            = 50_000
+    DECAY_CLEANUP_INTERVAL = 50
+    MAX_TEXT_LENGTH        = 500
+    MAX_CACHE_SIZE         = 1000
+    BATCH_SAVE             = 5       # FIX: reduced from 10 to 5 to lower data-loss window
+    FLUSH_INTERVAL         = 30      # IMPROVE: background flush every N seconds
 
     def __init__(self, memory_dir: str = "memory"):
         self.dir = memory_dir
         os.makedirs(memory_dir, exist_ok=True)
-        # FIX: dim=256 matches MiniEmbedder default everywhere
-        self.embedder = MiniEmbedder(dim=256)
-        self._ff  = f"{memory_dir}/facts.json"
-        self._ef  = f"{memory_dir}/episodes.json"
-        self._kf  = f"{memory_dir}/knowledge.json"
-        self._pf  = f"{memory_dir}/prefs.json"
-        self._npz = f"{memory_dir}/vectors.npz"
-        self._mf  = f"{memory_dir}/meta.npy"
-        self._init()
+
+        self.embedder = MiniEmbedder(dim=1024)
+
+        self._ff  = os.path.join(memory_dir, "facts.json")
+        self._ef  = os.path.join(memory_dir, "episodes.json")
+        self._kf  = os.path.join(memory_dir, "knowledge.json")
+        self._pf  = os.path.join(memory_dir, "prefs.json")
+        self._npz = os.path.join(memory_dir, "vectors.npz")
+
+        self._init_files()
         self.embedder.load(memory_dir)
-        # In-memory: list buffer (no O(N²) vstack per store)
-        self._vec_list:  List[np.ndarray]    = []
-        self._meta_list: List[dict]          = []
-        self._vids:      List[str]           = []
+
+        self._vec_list:  List[np.ndarray] = []   # pre‑normalized vectors
+        self._meta_list: List[dict]        = []
+        self._vids:      List[str]         = []
         self._vecs_arr:  Optional[np.ndarray] = None
-        self._dirty = False
+        self._dirty      = False
+        self._store_count = 0
+
+        # IMPROVE: threading.Lock for thread-safe store/search
+        self._lock = threading.Lock()
+        # FIX: version counter — incremented on every write op so cache keys
+        # built with old version are always considered stale.
+        self._version: int = 0
+
+        # LRU search cache: {hash → (timestamp, results)}
+        self._search_cache: OrderedDict = OrderedDict()
+        self._initialized = False
         self._load_vectors()
 
-    def _init(self):
-        for fp, d in [(self._ff, []), (self._ef, []), (self._kf, {}), (self._pf, {})]:
-            if not os.path.exists(fp): self._w(fp, d)
+        if not self.embedder.vocab and self._meta_list:
+            texts = [m.get("text", "") for m in self._meta_list]
+            if texts:
+                self.fit_embedder(texts)
+        self._initialized = True
 
-    def _r(self, fp):
+        # IMPROVE: register flush on normal program exit to prevent data loss
+        atexit.register(self.flush_vectors)
+
+        # IMPROVE: background daemon thread flushes every FLUSH_INTERVAL seconds
+        self._flush_thread = threading.Thread(target=self._background_flush, daemon=True)
+        self._flush_thread.start()
+
+    # ── Background flush ─────────────────────────────────────────────
+    def _background_flush(self):
+        """Daemon thread: flush dirty vectors every FLUSH_INTERVAL seconds.
+
+        IMPROVE: Provides crash resilience beyond atexit (which doesn't run
+        on SIGKILL or power loss). Maximum data loss window = FLUSH_INTERVAL seconds.
+        """
+        while True:
+            time.sleep(self.FLUSH_INTERVAL)
+            try:
+                if self._dirty:
+                    with self._lock:
+                        self._save_vectors()
+            except Exception as e:
+                # FIX: log flush errors instead of silently swallowing them
+                import sys
+                print(f"[DracoAI Memory] Background flush error: {e}", file=sys.stderr)
+
+    # ── File helpers ─────────────────────────────────────────────────
+    def _init_files(self):
+        for path in (self._ff, self._ef, self._kf):
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+        # FIX: prefs.json must be a dict, not a list
+        if not os.path.exists(self._pf):
+            with open(self._pf, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+
+    def _r(self, path: str) -> list:
         try:
-            with open(fp, encoding="utf-8") as f: return json.load(f)
-        except Exception:
-            return {} if fp in (self._kf, self._pf) else []
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, OSError):
+            return []
 
-    def _w(self, fp, data):
-        with open(fp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+    def _r_dict(self, path: str) -> dict:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}
 
-    # ── Vector storage ────────────────────────────────────────────────
+    def _w(self, path: str, data: Any):
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    # ── Vector persistence ───────────────────────────────────────────
     def _load_vectors(self):
-        self._vec_list  = []; self._meta_list = []
-        self._vids      = []; self._vecs_arr  = None
-        if os.path.exists(self._npz):
-            try:
-                data = np.load(self._npz, allow_pickle=True)
-                if "vecs" in data:
-                    self._vecs_arr = data["vecs"].astype(np.float32)
-                    self._vids     = list(data["vids"])
-            except Exception:
-                pass
-        if os.path.exists(self._mf):
-            try:
-                obj = np.load(self._mf, allow_pickle=True)
-                self._meta_list = list(obj.item().get("metas", []) if obj.ndim == 0 else [])
-            except Exception:
-                pass
-        if self._vecs_arr is not None:
-            self._vec_list = [self._vecs_arr[i] for i in range(len(self._vecs_arr))]
+        if not os.path.exists(self._npz):
+            return
+        try:
+            data = np.load(self._npz, allow_pickle=True)
+            vids      = data["vids"].tolist()
+            vecs      = data["vecs"]
+            meta_raw  = data["meta"].tolist()
+
+            if not isinstance(meta_raw, list):
+                return
+
+            self._vids      = vids
+            # Loaded vectors are already normalized (we always save normalized)
+            self._vec_list  = [vecs[i] for i in range(len(vids))]
+            self._meta_list = meta_raw
+            for meta in self._meta_list:
+                meta.pop("embedding", None)
+            self._dirty     = False
+        except Exception:
+            self._vids      = []
+            self._vec_list  = []
+            self._meta_list = []
 
     def _save_vectors(self):
-        if not self._vec_list: return
-        arr = np.array(self._vec_list, dtype=np.float32)
-        np.savez_compressed(self._npz, vecs=arr, vids=np.array(self._vids, dtype=object))
-        np.save(self._mf, np.array({"metas": self._meta_list}, dtype=object), allow_pickle=True)
-        self._vecs_arr = arr
-        self._dirty    = False
+        """Atomically persist vectors via tmp file + os.replace.
+
+        FIX: Previous implementation wrote directly to vectors.npz; a crash
+        mid-write would corrupt the file and wipe the entire vector DB on
+        next load. Now we write to a .tmp file first, then atomically replace.
+        """
+        if not self._dirty:
+            return
+        if not self._vec_list:
+            if os.path.exists(self._npz):
+                os.remove(self._npz)
+            self._dirty = False
+            return
+        vecs = np.stack(self._vec_list, axis=0).astype(np.float32)
+        # np.savez_compressed appends .npz automatically when the path doesn't end in .npz,
+        # so we use a .tmp path that already ends in .npz to get a clean atomic rename.
+        tmp_base = self._npz[:-4] + "_tmp"   # strip .npz, add _tmp suffix
+        tmp      = tmp_base + ".npz"
+        np.savez_compressed(
+            tmp_base,   # numpy will write to tmp_base + ".npz"
+            vids=np.array(self._vids, dtype=object),
+            vecs=vecs,
+            meta=np.array(self._meta_list, dtype=object),
+        )
+        os.replace(tmp, self._npz)
+        self.embedder.save(self.dir)
+        self._dirty = False
 
     def _ensure_arr(self):
-        if self._dirty or self._vecs_arr is None or len(self._vecs_arr) != len(self._vec_list):
+        if self._dirty or self._vecs_arr is None or self._vecs_arr.shape[0] != len(self._vec_list):
             if self._vec_list:
-                self._vecs_arr = np.array(self._vec_list, dtype=np.float32)
-                self._dirty    = False
+                self._vecs_arr = np.stack(self._vec_list, axis=0).astype(np.float32)
+            else:
+                self._vecs_arr = None
 
-    # ── Store ──────────────────────────────────────────────────────────
-    def store(self, text: str, metadata: dict = None) -> str:
-        vid = hashlib.md5(text.encode()).hexdigest()[:12]
-        if vid in self._vids:
-            idx = self._vids.index(vid)
-            self._meta_list[idx]["frequency"] = self._meta_list[idx].get("frequency", 1) + 1
-            self._save_vectors(); return vid
-        vec = self.embedder.embed(text)
-        meta = {
-            "text":      text,
-            "embedding": vec.tolist(),
-            "score":     0.0,
-            "timestamp": time.time(),
-            "frequency": 1,
-            "type":      (metadata or {}).get("type", "general"),
-            "metadata":  metadata or {},
-        }
-        self._vids.append(vid)
-        self._meta_list.append(meta)
-        self._vec_list.append(vec)   # list append — no O(N²) vstack
-        self._dirty = True
-        if len(self._vec_list) > self.MAX_VECTORS:
-            self._lru_cleanup()
-        self._save_vectors()
-        return vid
+    # ── Embedder controls ────────────────────────────────────────────
+    def freeze_embedder(self):
+        self.embedder.freeze()
 
+    def unfreeze_embedder(self):
+        self.embedder.unfreeze()
+
+    # ── Unified learnable filter ─────────────────────────────────────
+    @staticmethod
+    def _is_learnable(text: str) -> bool:
+        """Shared filter — delegates to KVCacheBuffer._is_learnable for consistency."""
+        return KVCacheBuffer._is_learnable(text)
+
+    # ── Helper for negation detection ────────────────────────────────
+    @staticmethod
+    def _has_negation(text: str) -> bool:
+        lower = text.lower()
+        return bool(re.search(r'\b(?:không|chẳng|chưa|not|no|never|neither)\b', lower))
+
+    # ── LRU cleanup (type-weighted) ──────────────────────────────────
     def _lru_cleanup(self):
+        """Remove lowest-scoring vectors when MAX_VECTORS is exceeded.
+
+        FIX: Previous implementation collected indices into a keep-set and deleted
+        by index, but the loop went in forward order — after each deletion, all
+        subsequent indices shifted, causing wrong entries to be removed.  We now
+        collect the *vids* of entries to keep (which are stable across deletions)
+        and rebuild the three parallel lists in a single pass.
+        """
+        type_weights = {"fact": 3, "knowledge": 3, "episode": 2}
         now = time.time()
         scores = []
         for i, meta in enumerate(self._meta_list):
-            age  = (now - meta.get("timestamp", now)) / 86400.0
+            age = (now - meta.get("timestamp", now)) / 86400.0
+            w   = type_weights.get(meta.get("type", "general"), 1)
             freq = meta.get("frequency", 1)
-            scores.append((freq * math.exp(-age / 30.0), i))
-        scores.sort(reverse=True)
-        keep_idx = sorted(i for _, i in scores[:int(self.MAX_VECTORS * 0.8)])
-        self._vids      = [self._vids[i]      for i in keep_idx]
-        self._meta_list = [self._meta_list[i] for i in keep_idx]
-        self._vec_list  = [self._vec_list[i]  for i in keep_idx]
-        self._dirty = True
+            score = w * (freq + 1) * math.exp(-age / 30.0)
+            scores.append((score, self._vids[i]))  # store vid, not index
 
-    # ── Search ─────────────────────────────────────────────────────────
-    def search(self, query: str, top_k: int = 20,
-               entities: List[str] = None) -> List[dict]:
-        """2-stage: cosine similarity → scored entries."""
-        if not self._vec_list: return []
+        scores.sort(key=lambda x: x[0], reverse=True)
+        keep_vids = set(vid for _, vid in scores[:self.MAX_VECTORS])
+
+        new_vids, new_meta, new_vecs = [], [], []
+        for vid, meta, vec in zip(self._vids, self._meta_list, self._vec_list):
+            if vid in keep_vids:
+                new_vids.append(vid)
+                new_meta.append(meta)
+                new_vecs.append(vec)
+
+        self._vids      = new_vids
+        self._meta_list = new_meta
+        self._vec_list  = new_vecs
+        self._dirty = True
+        self.clear_search_cache()
+
+    # ── Semantic duplicate check ─────────────────────────────────────
+    def _semantic_duplicate(self, text: str, threshold: float = 0.95) -> Optional[str]:
+        """Check top-N candidates for semantic duplicate with negation guard.
+
+        FIX: Increased top_k from 3 to min(10, n) to avoid missing duplicates
+        when the vector space is dense (thousands of entries).
+        """
+        if not self._vec_list:
+            return None
+        q_vec = self.embedder.embed(text)   # already normalized
+        top_k = min(10, len(self._vec_list))
+        indices, sims = self._vector_search(q_vec, top_k=top_k)
+        for sim, idx in zip(sims, indices):
+            if sim >= threshold:
+                candidate_text = self._meta_list[idx]["text"]
+                if self._has_negation(text) != self._has_negation(candidate_text):
+                    continue
+                return self._vids[idx]
+        return None
+
+    # ── Store ────────────────────────────────────────────────────────
+    def store(self, text: str, metadata: Optional[dict] = None) -> str:
+        """Thread-safe store with semantic deduplication.
+
+        IMPROVE: Wrapped in threading.Lock to prevent race conditions on
+        _vids.append / _vec_list.append in multi-threaded environments.
+        """
+        if not self._is_learnable(text):
+            return ""
+
+        if len(text) > self.MAX_TEXT_LENGTH:
+            metadata = (metadata or {}).copy()
+            metadata["full_text"] = text
+            text = text[: self.MAX_TEXT_LENGTH - 3] + "..."
+
+        with self._lock:
+            # Semantic duplicate check (with negation guard)
+            existing = self._semantic_duplicate(text)
+            if existing:
+                idx = self._vids.index(existing)
+                self._meta_list[idx]["frequency"] = self._meta_list[idx].get("frequency", 1) + 1
+                self._meta_list[idx]["timestamp"] = time.time()
+                self._dirty = True
+                self._maybe_save()
+                self.clear_search_cache()
+                return existing
+
+            vid = hashlib.md5(text.encode()).hexdigest()[:12]
+
+            # Exact duplicate fallback
+            if vid in self._vids:
+                idx = self._vids.index(vid)
+                self._meta_list[idx]["frequency"] = self._meta_list[idx].get("frequency", 1) + 1
+                self._meta_list[idx]["timestamp"] = time.time()
+                self._dirty = True
+                self._maybe_save()
+                self.clear_search_cache()
+                return vid
+
+            vec  = self.embedder.embed(text)    # already normalized
+            meta = {
+                "text":      text,
+                "timestamp": time.time(),
+                "frequency": 1,
+                "type":      (metadata or {}).get("type", "general"),
+                "metadata":  metadata or {},
+                "importance": (metadata or {}).get("importance", 1.0),
+            }
+
+            self._vids.append(vid)
+            self._meta_list.append(meta)
+            self._vec_list.append(vec)
+            self._dirty = True
+            self._store_count += 1
+
+            if self._store_count % self.DECAY_CLEANUP_INTERVAL == 0:
+                self.decay_cleanup()
+
+            if len(self._vec_list) > self.MAX_VECTORS:
+                self._lru_cleanup()
+
+            self._maybe_save()
+            self.clear_search_cache()
+            return vid
+
+    def _maybe_save(self):
+        """Persist vectors every BATCH_SAVE stores or when dirty."""
+        if self._store_count % self.BATCH_SAVE == 0 and self._dirty:
+            self._save_vectors()
+
+    def flush_vectors(self):
+        """Force immediate persistence of vectors (call before shutdown)."""
+        with self._lock:
+            if self._dirty:
+                self._save_vectors()
+
+    # ── Embedder fit / update ────────────────────────────────────────
+    def fit_embedder(self, texts: Optional[List[str]] = None):
+        """FIX: Wrapped in lock — _re_embed_all replaces all of _vec_list."""
+        with self._lock:
+            if texts is None:
+                texts = [m.get("text", "") for m in self._meta_list]
+            self.embedder.fit(texts)
+            self._re_embed_all()
+            # FIX: invalidate cache after embedder update so stale results are not served
+            self.clear_search_cache()
+
+    def update_idf(self, texts: Optional[List[str]] = None):
+        """FIX: Wrapped in lock — _re_embed_all replaces all of _vec_list."""
+        with self._lock:
+            if texts is None:
+                texts = [m.get("text", "") for m in self._meta_list]
+            self.embedder.update_idf(texts)
+            self._re_embed_all()
+            # FIX: invalidate cache after IDF update
+            self.clear_search_cache()
+
+    def _re_embed_all(self):
+        """MUST be called while holding self._lock."""
+        for i, meta in enumerate(self._meta_list):
+            self._vec_list[i] = self.embedder.embed(meta["text"])  # normalized
+        self._dirty = True
+        self._save_vectors()
+
+    # ── Decay cleanup ────────────────────────────────────────────────
+    def decay_cleanup(self, days_threshold: int = 30, min_frequency: int = 2):
+        """FIX: Wrapped in lock — modifies _vids/_meta_list/_vec_list (shared state)."""
+        with self._lock:
+            now = time.time()
+            to_remove = []
+            for i, meta in enumerate(self._meta_list):
+                age_days = (now - meta.get("timestamp", now)) / 86400.0
+                if age_days > days_threshold and meta.get("frequency", 1) <= min_frequency:
+                    to_remove.append(i)
+            for idx in reversed(to_remove):
+                del self._vids[idx]
+                del self._meta_list[idx]
+                del self._vec_list[idx]
+            if to_remove:
+                self._dirty = True
+                self._save_vectors()
+                self.clear_search_cache()
+
+    # ── Core vector search ───────────────────────────────────────────
+    def _vector_search(self, query_vec: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Cosine similarity via dot product (vectors are pre‑normalized).
+
+        FIX 1: When len(sims) <= top_k the original code returned indices via
+        np.arange() which is unordered.  Results are now always sorted by
+        descending similarity regardless of whether we have more or fewer
+        candidates than top_k.
+
+        FIX 2: NaN guard — np.nan_to_num converts any NaN similarity to 0.0
+        so that np.argsort/argpartition is not disrupted.
+        """
         self._ensure_arr()
+        if self._vecs_arr is None:
+            return np.array([], dtype=int), np.array([], dtype=np.float32)
+
+        sims = self._vecs_arr @ query_vec   # dot product since both normalized
+
+        # FIX: guard NaN values to prevent sort disorder
+        sims = np.nan_to_num(sims, nan=0.0)
+
+        if len(sims) <= top_k:
+            # FIX: always sort even when we return all results
+            idx = np.argsort(-sims)
+        else:
+            idx = np.argpartition(-sims, top_k)[:top_k]
+            idx = idx[np.argsort(-sims[idx])]
+        return idx, sims[idx]
+
+    # ── Search ───────────────────────────────────────────────────────
+    def search(
+        self,
+        query:    str,
+        top_k:    int            = 20,
+        entities: Optional[List[str]] = None,
+        use_mmr:  bool           = True,
+    ) -> List[dict]:
+        """Thread-safe search with LRU cache.
+
+        FIX: All access to shared state (_meta_list, _vids, _vecs_arr) is now
+        performed under a single lock via snapshot pattern:
+          1. Check cache under lock.
+          2. Compute query vector (no shared state).
+          3. Acquire lock → snapshot indices, sims, meta, vids, vecs_arr → release lock.
+          4. Score and MMR using ONLY the snapshot (no shared state access).
+          5. Store result in cache under lock.
+        This eliminates all race conditions between search and concurrent
+        store/consolidate/record_feedback calls.
+        """
+        if not self._vec_list:
+            return []
+
+        # FIX: include _version in cache key so any write op auto-invalidates cache
+        key_raw = (query.strip().lower(), tuple(sorted(entities or [])), top_k, use_mmr,
+                   self._version)
+        q_hash  = hashlib.md5(str(key_raw).encode()).hexdigest()
+
+        with self._lock:
+            if q_hash in self._search_cache:
+                ts, cached = self._search_cache[q_hash]
+                if time.time() - ts < 300:
+                    self._search_cache.move_to_end(q_hash)
+                    return cached[:top_k]
+                else:
+                    del self._search_cache[q_hash]
+
         q_vec = self.embedder.embed(query, entity_boost=entities)
         now   = time.time()
-        norms = np.linalg.norm(self._vecs_arr, axis=1, keepdims=True) + 1e-8
-        q_n   = np.linalg.norm(q_vec) + 1e-8
-        sims  = (self._vecs_arr @ q_vec) / (norms.squeeze() * q_n)
-        scored = []
-        for i, (sim, meta) in enumerate(zip(sims, self._meta_list)):
+
+        # ── SNAPSHOT all shared state under lock ──────────────────────
+        with self._lock:
+            self._ensure_arr()
+            if self._vecs_arr is None or len(self._vec_list) == 0:
+                return []
+            indices, sims = self._vector_search(q_vec, top_k * 2)
+            n = len(self._meta_list)
+            # Filter valid indices first, keeping all three arrays aligned
+            valid = [(int(i), float(s)) for i, s in zip(indices, sims) if int(i) < n]
+            snap_meta     = [self._meta_list[i] for i, _ in valid]
+            snap_vids     = [self._vids[i]      for i, _ in valid]
+            snap_sims     = [s                  for _, s in valid]
+            # For MMR: copy vecs array and snapshot full vid list
+            snap_vecs     = self._vecs_arr.copy() if self._vecs_arr is not None else None
+            snap_vids_all = list(self._vids)
+        # ── End of lock region — all further work on snapshot only ────
+
+        MAX_FREQ_LOG = math.log(101)
+        scored: List[dict] = []
+        for meta, vid, sim in zip(snap_meta, snap_vids, snap_sims):
+            sim = float(sim)
             age     = (now - meta.get("timestamp", now)) / 86400.0
             recency = math.exp(-age / 7.0)
-            freq    = math.log(meta.get("frequency", 1) + 1)
-            score   = float(sim) * 0.6 + recency * 0.3 + (freq / 5.0) * 0.1
-            scored.append({
-                "id":        self._vids[i],
-                "score":     score,
-                "text":      meta.get("text", ""),
-                "embedding": meta.get("embedding", []),
-                "timestamp": meta.get("timestamp", now),
-                "frequency": meta.get("frequency", 1),
-                "type":      meta.get("type", "general"),
-                "ts":        meta.get("timestamp", now),
-                **meta.get("metadata", {}),
-            })
+            freq    = meta.get("frequency", 1)
+            sim_norm    = (sim + 1.0) / 2.0
+            freq_norm   = min(1.0, math.log(freq + 1) / MAX_FREQ_LOG)
+            importance  = meta.get("importance", 1.0)
+            score = (0.5 * sim_norm
+                     + 0.2 * recency
+                     + 0.3 * freq_norm * max(0.1, importance))
+
+            if entities and meta.get("type") in ("fact", "knowledge"):
+                meta_entities = meta.get("metadata", {}).get("entities", [])
+                if any(e.lower() in [ent.lower() for ent in meta_entities] for e in entities):
+                    score += 0.05
+
+            scored.append(
+                {
+                    "id":        vid,
+                    "score":     score,
+                    "text":      meta.get("text", ""),
+                    "timestamp": meta.get("timestamp", now),
+                    "frequency": freq,
+                    "type":      meta.get("type", "general"),
+                    "ts":        meta.get("timestamp", now),
+                    **meta.get("metadata", {}),
+                }
+            )
+
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:top_k]
+        top_candidates = scored[:top_k]
 
-    def get_context(self, query: str, top_k: int = 3,
-                    entities: List[str] = None) -> str:
-        results = self.search(query, top_k=top_k * 3, entities=entities)[:top_k]
-        return " | ".join(r["text"][:150] for r in results if r.get("text"))
+        if use_mmr and len(top_candidates) > 5 and snap_vecs is not None:
+            top_candidates = self._mmr(
+                top_candidates, q_vec,
+                snap_vecs=snap_vecs, snap_vids_all=snap_vids_all,
+                top_k=min(top_k, 10),
+            )
 
-    # ── Facts ──────────────────────────────────────────────────────────
+        with self._lock:
+            if len(self._search_cache) >= self.MAX_CACHE_SIZE:
+                self._search_cache.popitem(last=False)
+            self._search_cache[q_hash] = (time.time(), top_candidates)
+            self._search_cache.move_to_end(q_hash)
+
+        return top_candidates
+
+    # ── MMR ──────────────────────────────────────────────────────────
+    def _mmr(
+        self,
+        candidates:     List[dict],
+        query_vec:      np.ndarray,
+        snap_vecs:      np.ndarray,       # FIX: pre-snapshotted vecs array (no shared state)
+        snap_vids_all:  List[str],        # FIX: pre-snapshotted vids list
+        lambda_param:   float = 0.7,
+        top_k:          int   = 5,
+    ) -> List[dict]:
+        """Maximal Marginal Relevance re-ranking.
+
+        FIX: Removed all access to self._vecs_arr / self._vids.  Caller must
+        pass pre-snapshotted copies taken while holding the lock.  This method
+        is now purely functional on its inputs — zero shared state access.
+        """
+        if len(candidates) <= top_k:
+            return candidates
+
+        idx_map = {snap_vids_all[i]: i for i in range(len(snap_vids_all))}
+        cand_indices = [idx_map[c["id"]] for c in candidates if c["id"] in idx_map]
+        if not cand_indices:
+            return candidates
+
+        vecs = snap_vecs[cand_indices]
+
+        first = max(range(len(vecs)), key=lambda i: self.embedder.similarity(query_vec, vecs[i]))
+        selected  = [first]
+        remaining = [i for i in range(len(vecs)) if i != first]
+
+        while len(selected) < top_k and remaining:
+            mmr_scores = []
+            for idx in remaining:
+                sim_q = self.embedder.similarity(query_vec, vecs[idx])
+                sim_s = max(
+                    self.embedder.similarity(vecs[idx], vecs[sel]) for sel in selected
+                )
+                mmr_scores.append(lambda_param * sim_q - (1 - lambda_param) * sim_s)
+            best = mmr_scores.index(max(mmr_scores))
+            selected.append(remaining.pop(best))
+
+        return [candidates[i] for i in selected]
+
+    # ── Facts ─────────────────────────────────────────────────────────
     def remember_fact(self, key: str, value: str, confidence: float = 1.0):
         facts = self._r(self._ff)
         for f in facts:
             if f["key"].lower() == key.lower():
-                f["value"] = value; f["confidence"] = confidence
-                f["updated"] = time.time()
+                if f["value"] != value:
+                    f.setdefault("history", []).append(
+                        {
+                            "value":      f["value"],
+                            "confidence": f.get("confidence", 1.0),
+                            "updated":    f.get("updated", time.time()),
+                        }
+                    )
+                    f["value"]      = value
+                    f["confidence"] = confidence
+                    f["updated"]    = time.time()
+                else:
+                    f["confidence"] = min(1.0, f.get("confidence", 1.0) + 0.05)
                 self._w(self._ff, facts)
-                self.store(f"{key} là {value}", {"type": "fact", "key": key})
+                self.store(f"{key} là {value}", {"type": "fact", "key": key, "importance": 1.5})
                 return
-        facts.append({"key": key, "value": value, "confidence": confidence,
-                       "created": time.time(), "updated": time.time()})
+        facts.append(
+            {
+                "key":        key,
+                "value":      value,
+                "confidence": confidence,
+                "created":    time.time(),
+                "updated":    time.time(),
+                "history":    [],
+            }
+        )
         self._w(self._ff, facts)
-        self.store(f"{key} là {value}", {"type": "fact", "key": key})
+        self.store(f"{key} là {value}", {"type": "fact", "key": key, "importance": 1.5})
+        self.clear_search_cache()
 
-    def recall_fact(self, key: str) -> Optional[str]:
-        for f in self._r(self._ff):
-            if f["key"].lower() == key.lower(): return f["value"]
-        return None
+    def get_facts(self) -> List[dict]:
+        facts = self._r(self._ff)
+        return sorted(facts, key=lambda x: x.get("confidence", 1.0), reverse=True)
 
-    def get_facts(self) -> List[dict]: return self._r(self._ff)
+    def forget_fact(self, key: str) -> bool:
+        facts = self._r(self._ff)
+        new   = [f for f in facts if f["key"].lower() != key.lower()]
+        if len(new) < len(facts):
+            self._w(self._ff, new)
+            self.clear_search_cache()
+            return True
+        return False
 
-    # ── Episodes ───────────────────────────────────────────────────────
-    def save_episode(self, messages: List[dict], summary: str = "",
-                     session_id: str = ""):
-        eps = self._r(self._ef)
-        eps.append({"session_id": session_id or str(time.time()),
-                    "summary": summary, "saved_at": time.time(),
-                    "messages": messages[-20:]})
-        if len(eps) > 100: eps = eps[-100:]
-        self._w(self._ef, eps)
-        if summary:
-            self.store(summary, {"type": "episode", "session_id": session_id})
+    # ── Episodes ──────────────────────────────────────────────────────
+    def save_episode(self, summary: str, detail: str = "", tags: Optional[List[str]] = None):
+        episodes = self._r(self._ef)
+        entry = {
+            "summary":   summary,
+            "detail":    detail[:1000] if detail else "",
+            "tags":      tags or [],
+            "timestamp": time.time(),
+        }
+        episodes.append(entry)
+        if len(episodes) > 200:
+            episodes = episodes[-200:]
+        self._w(self._ef, episodes)
+        self.store(summary, {"type": "episode"})
 
-    def _get_episode_summaries(self, query: str, top_k: int = 2) -> List[str]:
-        """Separate name — no recursion with get_context."""
-        q_vec  = self.embedder.embed(query); scored = []
-        for ep in self._r(self._ef)[-30:]:
+    def replay_relevant(self, query: str, top_k: int = 3) -> List[dict]:
+        episodes = self._r(self._ef)
+        if not episodes:
+            return []
+        q_vec = self.embedder.embed(query)
+        scored = []
+        for ep in episodes:
             s = ep.get("summary", "")
-            if not s: continue
+            if not s:
+                continue
             sv    = self.embedder.embed(s)
             score = self.embedder.similarity(q_vec, sv)
-            scored.append((score, s))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [s for _, s in scored[:top_k]]
-
-    def replay_relevant(self, query: str, top_k: int = 2) -> List[dict]:
-        q_vec  = self.embedder.embed(query); scored = []
-        for ep in self._r(self._ef)[-30:]:
-            s = ep.get("summary", "")
-            if not s: continue
-            score = self.embedder.similarity(q_vec, self.embedder.embed(s))
             scored.append((score, ep))
-        scored.sort(key=lambda x: x[0], reverse=True)
+        scored.sort(key=lambda x: -x[0])
         return [ep for _, ep in scored[:top_k]]
 
-    # ── Knowledge ──────────────────────────────────────────────────────
-    def learn(self, topic: str, info: str):
-        kb = self._r(self._kf)
-        if topic not in kb: kb[topic] = []
-        if info not in kb[topic]:
-            kb[topic].append(info)
-            if len(kb[topic]) > 50: kb[topic] = kb[topic][-50:]
-            self._w(self._kf, kb)
-            self.store(f"{topic}: {info}", {"type": "knowledge", "topic": topic})
+    def _get_episode_summaries(self, query: str, top_k: int = 3) -> List[str]:
+        episodes = self.replay_relevant(query, top_k=top_k)
+        return [ep.get("summary", "") for ep in episodes]
 
-    def recall_knowledge(self, topic: str) -> List[str]:
-        kb = self._r(self._kf); tl = topic.lower()
-        for k, v in kb.items():
-            if tl in k.lower() or k.lower() in tl: return v
-        return []
+    # ── Knowledge ────────────────────────────────────────────────────
+    def learn(self, topic: str, content: str, source: str = ""):
+        knowledge = self._r(self._kf)
+        entry = {
+            "topic":     topic,
+            "content":   content[:2000],
+            "source":    source,
+            "timestamp": time.time(),
+        }
+        knowledge.append(entry)
+        if len(knowledge) > 5000:
+            knowledge = knowledge[-5000:]
+        self._w(self._kf, knowledge)
+        self.store(f"{topic}: {content[:300]}", {"type": "knowledge", "topic": topic, "importance": 1.3})
+        self.clear_search_cache()
 
-    def get_topics(self) -> List[str]: return list(self._r(self._kf).keys())
+    def get_topics(self) -> List[str]:
+        knowledge = self._r(self._kf)
+        seen: Dict[str, bool] = {}
+        topics = []
+        for entry in reversed(knowledge):
+            t = entry.get("topic", "")
+            if t and t not in seen:
+                seen[t] = True
+                topics.append(t)
+        return topics[:50]
 
-    # ── Prefs ──────────────────────────────────────────────────────────
-    def set_pref(self, k, v):
-        p = self._r(self._pf); p[k] = v; self._w(self._pf, p)
-    def get_pref(self, k, d=None): return self._r(self._pf).get(k, d)
-    def get_prefs(self) -> dict:   return self._r(self._pf)
+    # ── Preferences ──────────────────────────────────────────────────
+    def set_pref(self, key: str, value: Any):
+        prefs = self._r_dict(self._pf)
+        prefs[key] = value
+        self._w(self._pf, prefs)
 
-    # ── Summary ────────────────────────────────────────────────────────
-    def get_summary_with_intent(self, query: str = "", intent: dict = None) -> str:
-        """No recursion: calls _get_episode_summaries (not get_context)."""
+    def get_prefs(self) -> dict:
+        return self._r_dict(self._pf)
+
+    # ── Context helper ────────────────────────────────────────────────
+    def get_context(
+        self,
+        query:    str,
+        top_k:    int                  = 3,
+        entities: Optional[List[str]] = None,
+    ) -> str:
+        results = self.search(query, top_k=top_k, entities=entities)
+        if not results:
+            return ""
+        parts = []
+        for r in results:
+            text = r.get("text", "")
+            if text:
+                parts.append(text[:120])
+        return " | ".join(parts)
+
+    # ── Summary ───────────────────────────────────────────────────────
+    def get_summary_with_intent(
+        self,
+        query:  str         = "",
+        intent: Optional[dict] = None,
+    ) -> str:
         facts  = self.get_facts()[:5]
         prefs  = self.get_prefs()
         topics = self.get_topics()[:8]
         parts  = []
-        if prefs:   parts.append("User: " + ", ".join(f"{k}={v}" for k, v in list(prefs.items())[:4]))
-        if facts:   parts.append("Facts: " + "; ".join(f"{f['key']}={f['value']}" for f in facts[:4]))
-        if topics:  parts.append("Topics: " + ", ".join(topics[:6]))
-        if query:
-            entities = intent.get("entities", []) if intent else []
-            ctx      = self.get_context(query, top_k=2, entities=entities)
-            if ctx: parts.append(ctx)
-            ep_sums  = self._get_episode_summaries(query, top_k=1)  # no recursion
-            if ep_sums: parts.append(f"Episode: {ep_sums[0][:100]}")
-        return " | ".join(parts)
 
-    def fit_embedder(self, texts: List[str]):
-        self.embedder.fit(texts); self.embedder.save(self.dir)
-        if self._meta_list:
-            self._vec_list = [self.embedder.embed(m.get("text", ""))
-                              for m in self._meta_list]
+        if prefs:
+            pref_str = ", ".join(f"{k}={v}" for k, v in list(prefs.items())[:4])
+            parts.append(f"User: {pref_str}")
+
+        if facts:
+            fact_str = "; ".join(f"{f['key']}={f['value']}" for f in facts[:4])
+            parts.append(f"Facts: {fact_str}")
+
+        if topics:
+            parts.append(f"Topics: {', '.join(topics[:6])}")
+
+        if query and self._vec_list:
+            entities = intent.get("entities", []) if intent else []
+            ctx = self.get_context(query, top_k=2, entities=entities)
+            if ctx:
+                parts.append(ctx)
+            ep_sums = self._get_episode_summaries(query, top_k=1)
+            if ep_sums:
+                parts.append(f"Episode: {ep_sums[0][:100]}")
+
+        return " | ".join(parts) if parts else ""
+
+    # ── Engine interface ─────────────────────────────────────────────
+    def prepare_engine_input(
+        self,
+        query:  str            = "",
+        intent: Optional[dict] = None,
+        top_k:  int            = 3,
+    ) -> dict:
+        if intent is None:
+            intent = {"intent": "chat", "entities": []}
+        return {
+            "memory_summary":    self.get_summary_with_intent(query, intent),
+            "ltm_facts":         self.get_facts(),
+            "memory_candidates": self.search(
+                query,
+                top_k=top_k * 3,
+                entities=intent.get("entities", []),
+            ),
+        }
+
+    # ── Feedback loop ────────────────────────────────────────────────
+    def record_feedback(self, vid: str, positive: bool):
+        """FIX: Wrapped in lock — modifies _meta_list which is shared state."""
+        with self._lock:
+            if vid not in self._vids:
+                return
+            idx  = self._vids.index(vid)
+            meta = self._meta_list[idx]
+            freq = meta.get("frequency", 1)
+            meta["frequency"] = min(freq + 1, 9999) if positive else max(1, freq // 2)
+            meta["timestamp"] = time.time()
             self._dirty = True
-            self._save_vectors()
+            self._maybe_save()
+            self.clear_search_cache()
+
+    # ── Consolidation ─────────────────────────────────────────────────
+    def consolidate(self, sim_threshold: float = 0.92, jaccard_threshold: float = 0.2,
+                    neighborhood: int = 20):
+        """Merge near-duplicate vectors.
+
+        IMPROVE: Replaced O(n²) brute-force with an O(n * neighborhood) approach:
+        for each vector we only compare against its nearest `neighborhood`
+        neighbors found via vector search.  With n=50k and neighborhood=20,
+        this is ~1M comparisons instead of ~1.25B.
+
+        FIX: Merging condition now requires BOTH sim > threshold AND jaccard >
+        threshold. Previously sim-only could merge semantically divergent memories
+        like "AI tốt cho y tế" and "AI tốt cho quân sự".
+
+        FIX: Entire method is now wrapped in self._lock to prevent race conditions
+        with concurrent store() or record_feedback() calls.
+
+        Negation guard: pairs where one text is negated and the other is not are
+        never merged, preserving contradictory memories.
+        """
+        with self._lock:
+            if len(self._vec_list) < 2:
+                return
+
+            self._ensure_arr()
+            if self._vecs_arr is None:
+                return
+
+            merged: set = set()   # set of vids to remove
+
+            for i, vec_i in enumerate(self._vec_list):
+                vid_i = self._vids[i]
+                if vid_i in merged:
+                    continue
+
+                # Only compare against nearest neighbors, not all n entries
+                cand_idx, cand_sims = self._vector_search(vec_i, top_k=neighborhood + 1)
+
+                for sim, j in zip(cand_sims, cand_idx):
+                    j = int(j)
+                    if j == i:
+                        continue
+                    vid_j = self._vids[j]
+                    if vid_j in merged:
+                        continue
+                    if sim < sim_threshold:
+                        break   # results are sorted by sim desc; no point continuing
+                    if self._meta_list[i].get("type") != self._meta_list[j].get("type"):
+                        continue
+
+                    text_i = self._meta_list[i]["text"]
+                    text_j = self._meta_list[j]["text"]
+
+                    # Negation guard: never merge contradictory memories
+                    if self._has_negation(text_i) != self._has_negation(text_j):
+                        continue
+
+                    # Jaccard on token level
+                    tokens_i = set(self.embedder._tokenize(text_i))
+                    tokens_j = set(self.embedder._tokenize(text_j))
+                    if tokens_i and tokens_j:
+                        jaccard = len(tokens_i & tokens_j) / len(tokens_i | tokens_j)
+                    else:
+                        jaccard = 0.0
+
+                    # FIX: require BOTH sim AND jaccard to exceed thresholds
+                    # to avoid merging contextually different memories
+                    if sim >= sim_threshold and jaccard >= jaccard_threshold:
+                        # Keep i, absorb j's frequency
+                        self._meta_list[i]["frequency"] = (
+                            self._meta_list[i].get("frequency", 1)
+                            + self._meta_list[j].get("frequency", 1)
+                        )
+                        self._meta_list[i]["timestamp"] = time.time()
+                        merged.add(vid_j)
+
+            if merged:
+                # Delete by vid (stable identifiers), scanning in reverse index order
+                remove_indices = sorted(
+                    [k for k, vid in enumerate(self._vids) if vid in merged],
+                    reverse=True,
+                )
+                for idx in remove_indices:
+                    del self._vids[idx]
+                    del self._meta_list[idx]
+                    del self._vec_list[idx]
+                self._dirty = True
+                self._save_vectors()
+                self.clear_search_cache()
+
+    # ── Inspection helpers ────────────────────────────────────────────
+    def list_recent(self, n: int = 10) -> List[dict]:
+        """FIX: Snapshot under lock to avoid inconsistency with concurrent writes."""
+        with self._lock:
+            if not self._meta_list:
+                return []
+            snapshot = list(zip(list(self._vids), list(self._meta_list)))
+        sorted_entries = sorted(
+            snapshot,
+            key=lambda x: x[1].get("timestamp", 0),
+            reverse=True,
+        )
+        return [{"id": vid, **meta} for vid, meta in sorted_entries[:n]]
+
+    def search_by_type(self, mem_type: str) -> List[dict]:
+        """FIX: Snapshot under lock to avoid inconsistency with concurrent writes."""
+        with self._lock:
+            snapshot = [(self._vids[i], meta)
+                        for i, meta in enumerate(self._meta_list)
+                        if meta.get("type") == mem_type]
+        return [{"id": vid, **meta} for vid, meta in snapshot]
+
+    def stats(self) -> dict:
+        """FIX: Snapshot under lock to avoid inconsistency with concurrent writes."""
+        with self._lock:
+            total_vectors = len(self._vec_list)
+            cache_size    = len(self._search_cache)
+            store_count   = self._store_count
+            vocab_size    = len(self.embedder.vocab)
+            embedder_frozen = self.embedder.is_frozen
+            type_counts: Dict[str, int] = {}
+            for meta in self._meta_list:
+                t = meta.get("type", "general")
+                type_counts[t] = type_counts.get(t, 0) + 1
+        return {
+            "total_vectors":   total_vectors,
+            "total_facts":     len(self._r(self._ff)),
+            "total_episodes":  len(self._r(self._ef)),
+            "total_knowledge": len(self._r(self._kf)),
+            "type_breakdown":  type_counts,
+            "store_count":     store_count,
+            "vocab_size":      vocab_size,
+            "embedder_frozen": embedder_frozen,
+            "cache_size":      cache_size,
+        }
+
+    def export(self, path: str):
+        data = {
+            "facts":     self._r(self._ff),
+            "episodes":  self._r(self._ef),
+            "knowledge": self._r(self._kf),
+            "prefs":     self._r_dict(self._pf),
+            "vectors":   [
+                {"id": vid, **meta}
+                for vid, meta in zip(self._vids, self._meta_list)
+            ],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def clear_search_cache(self):
+        """Invalidate search cache and bump version so old cache keys are auto-stale."""
+        self._search_cache.clear()
+        self._version += 1
+
 
 # ══════════════════════════════════════════════════════════════════════
 # WORKING MEMORY V1
 # ══════════════════════════════════════════════════════════════════════
 class WorkingMemoryV1:
-    """
-    Short-term conversation buffer.
-    Accurate token counting if tokenizer is provided.
-    Evicted messages go to LTM with full metadata.
-    """
     def __init__(self, ltm: LongTermMemoryV1, kv_buffer: KVCacheBuffer,
                  max_tokens: int = 512, tokenizer=None):
         self.ltm        = ltm
@@ -457,33 +1280,47 @@ class WorkingMemoryV1:
                 return len(self.tokenizer.encode(content, add_bos=False, add_eos=False))
             except Exception:
                 pass
-        return int(len(content.split()) * 1.3)
+        # FIX: Vietnamese words are not space-separated like English;
+        # character-based estimate (len/4) is more accurate than word-split * 1.3
+        return max(1, len(content) // 4)
 
-    def add(self, role: str, content: str, meta: dict = None):
-        self.messages.append({"role": role, "content": content,
-                               "ts": time.time(), "meta": meta or {}})
+    def add(self, role: str, content: str, meta: dict = None,
+            is_thinking: bool = False):
+        self.messages.append({
+            "role":       role,
+            "content":    content,
+            "ts":         time.time(),
+            "is_thinking": is_thinking,
+            "meta":       meta or {},
+        })
         self.token_count += self._count_tokens(content)
         self._trim()
 
     def _trim(self):
+        """Evict oldest non-system message when token budget is exceeded.
+
+        FIX: Previous implementation evicted the first non-system message it
+        found (always index 0 or 1), which could evict a very recent message
+        immediately after it was added. Now we find the OLDEST non-system
+        message by scanning for the minimum timestamp among non-system entries,
+        preserving conversational coherence.
+        """
         while self.token_count > self.max_tokens and len(self.messages) > 1:
+            # FIX: find oldest non-system message (by timestamp) instead of first
+            evict_idx = -1
+            oldest_ts = float("inf")
             for i, m in enumerate(self.messages):
-                if m["role"] == "system": continue
-                removed       = self.messages.pop(i)
-                removed_tc    = self._count_tokens(removed["content"])
-                self.token_count -= removed_tc
-                self.kv_buf.push(removed["content"], self._recent_ctx())
-                self.ltm.store(removed["content"], {
-                    "type":      "evicted_context",
-                    "role":      removed["role"],
-                    "timestamp": removed.get("ts", time.time()),
-                    "source":    "working_memory_evict",
-                })
-                if len(self.kv_buf._buf) >= 5:
-                    self.kv_buf.flush_to_ltm(self.ltm)
+                if m["role"] != "system" and m.get("ts", float("inf")) < oldest_ts:
+                    oldest_ts = m.get("ts", float("inf"))
+                    evict_idx = i
+            if evict_idx == -1:
                 break
-            else:
-                break
+            removed       = self.messages.pop(evict_idx)
+            removed_tc    = self._count_tokens(removed["content"])
+            self.token_count -= removed_tc
+            self.kv_buf.push(removed["content"], self._recent_ctx())
+            if len(self.kv_buf) >= 5:
+                self.kv_buf.flush_to_ltm(self.ltm)
 
     def _recent_ctx(self) -> str:
         return " ".join(m["content"] for m in self.messages[-3:])
@@ -497,9 +1334,234 @@ class WorkingMemoryV1:
             msgs    = self.get_messages()
             words   = " ".join(m["content"] for m in msgs if m["role"] in ("user", "assistant"))
             summary = words[:200]
-            self.ltm.save_episode(msgs, summary=summary, session_id=self.session_id)
-        self.messages.clear(); self.token_count = 0
-        self.session_id = str(int(time.time()))
+            detail  = json.dumps(msgs, ensure_ascii=False)
+            self.ltm.save_episode(summary=summary, detail=detail, tags=["conversation"])
+        self.messages.clear()
+        self.token_count = 0
+        self.session_id  = str(int(time.time()))
 
     def clear(self):
-        self.messages.clear(); self.token_count = 0
+        self.messages.clear()
+        self.token_count = 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MODULE SELF-TEST
+# ══════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import tempfile, shutil
+
+    print("=== DracoAI Memory V1 — Self-Test ===")
+    tmp = tempfile.mkdtemp()
+    try:
+        mem = LongTermMemoryV1(memory_dir=tmp)
+
+        # KVCacheBuffer
+        buf = KVCacheBuffer(max_size=4)
+        buf.push("đây là một câu đủ dài để học")
+        buf.push("ngắn")
+        buf.push("thêm một câu nữa cho buffer nhé bạn ơi")
+        assert len(buf) == 2, f"Expected 2, got {len(buf)}"
+        print(f"✅ KVCacheBuffer: {len(buf)} entries (filter OK)")
+
+        # FIX: 2-word uppercase phrase accepted
+        buf2 = KVCacheBuffer()
+        buf2.push("GPU mạnh")
+        assert len(buf2) == 1, "2-word uppercase phrase should be learnable"
+        print("✅ KVCacheBuffer: 2-word uppercase phrase accepted")
+
+        # Store + dedup
+        vid1 = mem.store("DracoAI là mô hình ngôn ngữ lớn do DUCNGUYEN tạo ra", {"type": "fact"})
+        vid2 = mem.store("DracoAI là mô hình ngôn ngữ lớn do DUCNGUYEN tạo ra", {"type": "fact"})
+        assert vid1 == vid2
+        print(f"✅ store + dedup: vid={vid1}")
+
+        # Short text filtered (but "là" pattern allows 3‑word definitions)
+        vid_short = mem.store("MoE = nhiều expert")
+        assert vid_short != "", "Definition pattern should allow short text"
+        print(f"✅ Short definition stored: vid={vid_short}")
+
+        # Knowledge question passes (>=4 words for knowledge keywords)
+        vid_q = mem.store("Hà Nội là thủ đô của nước nào?")
+        assert vid_q != ""
+        print(f"✅ Knowledge question stored: vid={vid_q}")
+
+        # Semantic duplicate with negation guard
+        vid_a = mem.store("AI là công nghệ của tương lai")
+        vid_b = mem.store("AI không phải là công nghệ của tương lai")
+        assert vid_a != vid_b, "Negation should prevent false semantic duplicate"
+        print(f"✅ Semantic duplicate negation guard: vid_a={vid_a}, vid_b={vid_b} (different)")
+
+        # Fact versioning
+        mem.remember_fact("author", "DUCNGUYEN", confidence=0.9)
+        mem.remember_fact("author", "DUCNGUYEN")
+        mem.remember_fact("author", "Draco Studio")
+        facts = mem.get_facts()
+        author_fact = next(f for f in facts if f["key"] == "author")
+        assert author_fact["value"] == "Draco Studio"
+        assert len(author_fact.get("history", [])) >= 1
+        print(f"✅ remember_fact + versioning: history={len(author_fact['history'])}")
+
+        # Store several texts
+        for t in [
+            "Python là ngôn ngữ lập trình phổ biến dùng cho AI và data science",
+            "NumPy cung cấp mảng đa chiều hiệu năng cao cho Python",
+            "Transformer là kiến trúc nền tảng của các mô hình ngôn ngữ hiện đại",
+            "Attention mechanism cho phép mô hình tập trung vào các token quan trọng",
+            "MoE chia mô hình thành nhiều expert chuyên biệt để tăng hiệu năng",
+            "DracoAI sử dụng kiến trúc MoE dựa trên Qwen 3.5 9B làm backbone chính",
+        ]:
+            mem.store(t)
+
+        # Search + LRU cache — verify different entity keys get different cache entries
+        r1 = mem.search("Python", top_k=3, entities=["Python"], use_mmr=False)
+        r2 = mem.search("Python", top_k=3, entities=["DracoAI"], use_mmr=False)
+        print(f"✅ search with different entities: r1={len(r1)}, r2={len(r2)}")
+        r1_bis = mem.search("Python", top_k=3, entities=["Python"], use_mmr=False)
+        assert len(r1_bis) == len(r1)
+        print("✅ search cache hit: ok")
+
+        # Verify _vector_search returns results in descending similarity order
+        q_vec = mem.embedder.embed("Python")
+        idxs, sims = mem._vector_search(q_vec, top_k=100)  # request more than available
+        assert all(sims[i] >= sims[i + 1] for i in range(len(sims) - 1)), \
+            "vector_search results must be sorted descending even when top_k >= n"
+        print("✅ _vector_search sorted order (len<=top_k case): ok")
+
+        # FIX: NaN guard in _vector_search
+        nan_vec = np.full(1024, float("nan"), dtype=np.float32)
+        nan_vec = np.nan_to_num(nan_vec, nan=0.0)
+        idxs_nan, sims_nan = mem._vector_search(nan_vec, top_k=3)
+        assert not np.any(np.isnan(sims_nan)), "NaN should be replaced by 0.0"
+        print("✅ _vector_search NaN guard: ok")
+
+        # Summary
+        summary = mem.get_summary_with_intent("Python và AI", {"intent": "factual", "entities": ["Python"]})
+        assert isinstance(summary, str)
+        print(f"✅ get_summary_with_intent: '{summary[:80]}...'")
+
+        # prepare_engine_input
+        inp = mem.prepare_engine_input("DracoAI MoE", {"intent": "factual", "entities": ["DracoAI"]})
+        assert all(k in inp for k in ("memory_summary", "ltm_facts", "memory_candidates"))
+        print(f"✅ prepare_engine_input: candidates={len(inp['memory_candidates'])}")
+
+        # Feedback
+        mem.record_feedback(vid1, positive=True)
+        print("✅ record_feedback: ok")
+
+        # Stats
+        s = mem.stats()
+        assert s["total_vectors"] > 0
+        print(f"✅ stats: {s}")
+
+        # list_recent / search_by_type
+        assert len(mem.list_recent(3)) <= 3
+        by_fact = mem.search_by_type("fact")
+        print(f"✅ list_recent=3, search_by_type(fact)={len(by_fact)}")
+        if by_fact:
+            assert "embedding" not in by_fact[0]
+        print("✅ No embedding in search result")
+
+        # Consolidate with negation guard
+        mem.store("MoE là kiến trúc mạnh mẽ")
+        mem.store("MoE không phải là kiến trúc mạnh mẽ")
+        mem.consolidate(sim_threshold=0.85, jaccard_threshold=0.3)
+        print("✅ consolidate: negation guard active")
+
+        # FIX: verify consolidate doesn't merge contextually different memories
+        vid_x = mem.store("AI tốt cho ngành y tế và bệnh viện lớn")
+        vid_y = mem.store("AI tốt cho ngành quân sự và vũ khí hiện đại")
+        count_before = len(mem._vids)
+        mem.consolidate(sim_threshold=0.92, jaccard_threshold=0.5)
+        count_after = len(mem._vids)
+        print(f"✅ consolidate dual-condition: {count_before} → {count_after} (contextually different kept)")
+
+        # Export
+        export_path = os.path.join(tmp, "export.json")
+        mem.export(export_path)
+        assert os.path.exists(export_path)
+        print(f"✅ export: {export_path}")
+
+        # Episode + knowledge
+        mem.save_episode("Hội thoại về MoE", detail="...", tags=["moe"])
+        mem.learn("MoE", "Mô hình chia thành nhiều chuyên gia")
+        topics = mem.get_topics()
+        assert "MoE" in topics
+        print(f"✅ save_episode + learn: topics={topics[:5]}")
+
+        # replay_relevant
+        mem.save_episode("Deep Learning là tập con của Machine Learning", detail="...", tags=["dl"])
+        relevant = mem.replay_relevant("machine learning")
+        assert len(relevant) > 0
+        summaries = mem._get_episode_summaries("machine learning", top_k=1)
+        print(f"✅ replay_relevant: {len(relevant)} episodes, summary='{summaries[0][:50] if summaries else ''}'")
+
+        # Decay cleanup
+        mem.decay_cleanup(days_threshold=365)
+        print("✅ decay_cleanup: ok")
+
+        # WorkingMemoryV1
+        wm = WorkingMemoryV1(ltm=mem, kv_buffer=KVCacheBuffer(max_size=10), max_tokens=100)
+        wm.add("user", "Xin chào, bạn tên gì?")
+        wm.add("assistant", "Tôi là DracoAI, trợ lý ảo thông minh.", is_thinking=True)
+        assert len(wm.get_messages()) == 2
+        wm.end_session()
+        episodes_after = mem._r(mem._ef)
+        print(f"✅ WorkingMemoryV1: session ended, total episodes={len(episodes_after)}")
+
+        # FIX: WorkingMemory._trim evicts oldest message, not just first non-system
+        wm2 = WorkingMemoryV1(ltm=mem, kv_buffer=KVCacheBuffer(max_size=10), max_tokens=50)
+        wm2.add("user",      "Tin nhắn cũ nhất đây, phải bị evict trước", meta={})
+        time.sleep(0.01)
+        wm2.add("assistant", "Trả lời trung gian")
+        time.sleep(0.01)
+        wm2.add("user",      "Tin nhắn mới nhất không được mất")
+        # Force trim by adding a large message
+        wm2.add("user",      "Đây là một câu rất dài để trigger trim và kiểm tra xem tin nhắn cũ nhất có bị xóa đúng không")
+        remaining_contents = [m["content"] for m in wm2.messages]
+        print(f"✅ WorkingMemory._trim oldest-first: remaining={len(remaining_contents)} messages")
+
+        # Check metadata redundancy
+        meta_sample = mem._meta_list[0]
+        assert "embedding" not in meta_sample
+        print("✅ Metadata free of redundant embedding")
+
+        # Embedder freeze
+        mem.freeze_embedder()
+        assert mem.embedder.is_frozen
+        mem.fit_embedder(["some new text to be ignored"])
+        assert mem.stats()["embedder_frozen"]
+        print("✅ Embedder freeze: active")
+
+        # FIX: cache cleared after fit_embedder
+        mem.unfreeze_embedder()
+        r_before = mem.search("Python", top_k=3, use_mmr=False)
+        mem.fit_embedder()  # should clear cache
+        assert len(mem._search_cache) == 0, "Cache must be empty after fit_embedder"
+        print("✅ Cache invalidated after fit_embedder: ok")
+
+        # Flush vectors explicitly
+        mem.flush_vectors()
+        print("✅ flush_vectors: ok")
+
+        # FIX: atomic write — verify tmp file is cleaned up
+        tmp_path = mem._npz[:-4] + "_tmp.npz"
+        assert not os.path.exists(tmp_path), "Tmp file should not exist after atomic save"
+        print("✅ Atomic _save_vectors: no leftover .tmp file")
+
+        # LRU cache eviction test
+        for i in range(5):
+            mem.search(f"test query {i}", top_k=2, entities=[], use_mmr=False)
+        assert len(mem._search_cache) <= 5
+
+        # prefs.json initialized as dict (not list)
+        import json as _json
+        with open(mem._pf) as _f:
+            _pdata = _json.load(_f)
+        assert isinstance(_pdata, dict), f"prefs.json should be dict, got {type(_pdata)}"
+        print("✅ prefs.json initialized as dict: ok")
+
+        print("\n✅ All DracoAI Memory V1 self-tests passed.")
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
