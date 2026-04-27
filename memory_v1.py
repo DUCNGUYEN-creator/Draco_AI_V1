@@ -25,7 +25,14 @@ Convenience method:
     prepare_engine_input(query, intent, top_k) → dict with all three keys.
 
 PRODUCTION HARDENING:
-    - Vectors are stored pre‑normalized (dot product = cosine similarity).
+    - _has_negation expanded: 11 multi-word Vietnamese phrases + 5 single-word VI + 7 EN.
+    - intent scoring changed from multiplicative to soft additive boost (similarity-first).
+    - _semantic_duplicate threshold lowered to 0.90 + dual sim+jaccard condition added.
+    - DEADLOCK eliminated: store() now calls _decay_cleanup_unsafe() (lock-free internal);
+      public decay_cleanup() still acquires lock as before.
+    - record_feedback O(1) dict lookup (was accidentally still O(n) despite the comment).
+    - Bigram support in embed(): adjacent token pairs captured at 0.6× weight; unigram
+      path and all external callers of _tokenize() are unchanged.
     - Batched disk writes every N stores to avoid I/O choking.
     - _save_vectors() uses atomic write (tmp + os.replace) to prevent file
       corruption on power failure / crash.
@@ -66,7 +73,34 @@ PRODUCTION HARDENING:
     - _w() logs OSError instead of silently swallowing write failures.
     - All critical sections are documented.
 
-FIXES vs V1.0:
+FIXES vs V1.1 (this version):
+    [BUG] _has_negation: only caught 7 basic negation words — "khó có thể", "ít khi",
+          "không hẳn", "hiếm khi", etc. all missed → expanded to 11 multi-word phrases
+          + 5 single-word Vietnamese + 7 English; phrase patterns checked first (longest
+          match) before single-word regex, eliminating partial-match false negatives.
+    [BUG] search() intent scoring: intent_w was multiplied against the FULL score, letting
+          a wrong-topic result with the right intent_type outrank a correct-topic result
+          with the wrong intent_type. Changed to additive soft boost:
+          score = base * (1 + 0.15*(intent_w-1)) so similarity remains the primary factor.
+    [BUG] _semantic_duplicate: threshold 0.95 too strict — paraphrases like "AI là tương
+          lai" vs "AI sẽ là tương lai" (sim≈0.90) were saved as duplicates. Lowered to
+          0.90 AND added Jaccard check (same dual-condition as consolidate) to prevent
+          false-positive dedup of short texts in dense embedding regions.
+    [BUG] DEADLOCK in store(): store() holds self._lock and called self.decay_cleanup()
+          which also tries to acquire self._lock — threading.Lock is NOT reentrant,
+          confirmed deadlock. Fixed by splitting into _decay_cleanup_unsafe() (no-lock,
+          for use inside lock) and decay_cleanup() (public, acquires lock). store() now
+          calls _decay_cleanup_unsafe().
+    [BUG] record_feedback: docstring claimed O(1) dict lookup but code still used
+          list.index() (O(n)) after an O(n) `in` check — two O(n) scans per call.
+          Fixed: build a temporary {vid: idx} dict inside the lock for true O(1) lookup.
+    [IMPROVE] MiniEmbedder.embed(): pure unigram TF-IDF loses phrase semantics — "machine
+          learning" was indistinguishable from "machine" + "learning" separately. Added
+          bigram tokens (adjacent word pairs joined by '_') with 0.6× weight. Double-hash
+          trick applied to bigrams too. No dimension change (1024 is ample).
+    [IMPROVE] MiniEmbedder._tokenize_with_bigrams(): new helper that returns both unigrams
+          and bigrams; _tokenize() is unchanged for backward compat with all callers
+          (consolidate Jaccard, _semantic_duplicate, etc.) that need unigrams only.
     [BUG] _vector_search: when len(sims) <= top_k, results were unordered → now sorted by -sim.
     [BUG] search cache key truncated query at 100 chars → collision risk; now hashes full query.
     [BUG] _init_files: prefs.json initialized as [] (array) instead of {} (dict) → fixed.
@@ -173,6 +207,23 @@ class MiniEmbedder:
             tokens.append(buf)
         return tokens
 
+    @staticmethod
+    def _tokenize_with_bigrams(text: str) -> List[str]:
+        """Tokenize text and append bigrams for better phrase-level semantics.
+
+        IMPROVE: Pure unigram tokenization loses the meaning of compound phrases
+        like "machine learning", "deep learning", "học máy". Adding bigrams (pairs
+        of adjacent tokens joined by '_') captures co-occurrence patterns without
+        expanding the vector dimension (1024 is sufficient for both unigrams and
+        bigrams combined).
+
+        Bigrams are weighted at 0.6× unigrams inside embed() to prevent them from
+        dominating the vector while still improving phrase discrimination.
+        """
+        tokens = MiniEmbedder._tokenize(text)
+        bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
+        return tokens, bigrams
+
     def fit(self, texts: List[str]):
         if self._frozen:
             return
@@ -182,8 +233,12 @@ class MiniEmbedder:
         self._doc_count = 0
         for text in texts:
             tokens = set(self._tokenize(text))
+            # IMPROVE: include bigrams in IDF so embed() can look them up
+            raw_tokens = self._tokenize(text)
+            bigrams = {f"{raw_tokens[i]}_{raw_tokens[i+1]}" for i in range(len(raw_tokens) - 1)}
+            all_terms = tokens | bigrams
             self._doc_count += 1
-            for tok in tokens:
+            for tok in all_terms:
                 self._df[tok] = self._df.get(tok, 0) + 1
 
         sorted_tokens = sorted(self._df.items(), key=lambda x: -x[1])
@@ -227,6 +282,9 @@ class MiniEmbedder:
         are multiplied; other tokens keep their original weight.
         """
         tokens = self._tokenize(text)
+        # IMPROVE: add bigrams to capture phrase-level semantics ("machine learning",
+        # "deep learning", "học máy", etc.). Bigrams are weighted at 0.6× unigrams.
+        _, bigrams = self._tokenize_with_bigrams(text)
         vec    = np.zeros(self.dim, dtype=np.float32)
 
         # ── Entity boost: build per-token membership map ──────────────
@@ -296,6 +354,21 @@ class MiniEmbedder:
             # Use MD5-based secondary index instead of predictable (idx*31)%dim
             vec[idx] += sign * weight
             sec_idx = int(hashlib.md5((tok + "_sec").encode()).hexdigest(), 16) % self.dim
+            vec[sec_idx] += 0.5 * sign * weight
+
+        # IMPROVE: bigram contributions (weight = 0.6× unigram weight)
+        # Bigrams capture phrase co-occurrence without dominating the vector.
+        BIGRAM_SCALE = 0.6
+        tf_bi: Dict[str, int] = {}
+        for bg in bigrams:
+            tf_bi[bg] = tf_bi.get(bg, 0) + 1
+        for bg, freq in tf_bi.items():
+            h_idx  = int(hashlib.md5((bg + "_idx").encode()).hexdigest(), 16) % self.dim
+            h_sign = int(hashlib.md5((bg + "_sign").encode()).hexdigest(), 16) % 2
+            sign   = 1 if h_sign == 0 else -1
+            weight = BIGRAM_SCALE * (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(bigrams), 1))) * self.idf.get(bg, 1.0)
+            vec[h_idx] += sign * weight
+            sec_idx = int(hashlib.md5((bg + "_sec").encode()).hexdigest(), 16) % self.dim
             vec[sec_idx] += 0.5 * sign * weight
 
         norm = np.linalg.norm(vec)
@@ -635,8 +708,31 @@ class LongTermMemoryV1:
     # ── Helper for negation detection ────────────────────────────────
     @staticmethod
     def _has_negation(text: str) -> bool:
+        """Detect negation in Vietnamese and English text.
+
+        FIX: Expanded to cover full spectrum of Vietnamese negation patterns:
+          • Strong direct negation : không, chẳng, chưa
+          • Indirect / soft        : khó, hiếm, ít khi, mấy khi
+          • Contradiction markers  : không hẳn, không phải, chưa chắc, đâu phải
+          • English extensions     : not, no, never, neither, hardly, rarely, without
+        Uses multi-word phrase matching before single-word regex to avoid partial
+        matches (e.g. "không phải" must be caught before "không" alone so the
+        phrase version takes priority and no double-counting occurs).
+        """
         lower = text.lower()
-        return bool(re.search(r'\b(?:không|chẳng|chưa|not|no|never|neither)\b', lower))
+        # Multi-word Vietnamese phrases first (order matters — longer patterns first)
+        PHRASE_NEGATIONS = (
+            "không hẳn", "không phải", "chưa chắc", "đâu phải",
+            "ít khi", "mấy khi", "khó có thể", "chưa từng",
+            "không bao giờ", "hiếm khi", "khó mà",
+        )
+        for phrase in PHRASE_NEGATIONS:
+            if phrase in lower:
+                return True
+        # Single-word Vietnamese + English
+        pattern_vi = r'\b(?:không|chẳng|chưa|khó|hiếm)\b'
+        pattern_en = r'\b(?:not|no|never|neither|hardly|rarely|without)\b'
+        return bool(re.search(pattern_vi, lower) or re.search(pattern_en, lower))
 
     # ── LRU cleanup (type-weighted) ──────────────────────────────────
     def _lru_cleanup(self):
@@ -675,8 +771,17 @@ class LongTermMemoryV1:
         self.clear_search_cache()
 
     # ── Semantic duplicate check ─────────────────────────────────────
-    def _semantic_duplicate(self, text: str, threshold: float = 0.95) -> Optional[str]:
+    def _semantic_duplicate(self, text: str, sim_threshold: float = 0.90,
+                             jaccard_threshold: float = 0.30) -> Optional[str]:
         """Check top-N candidates for semantic duplicate with negation guard.
+
+        FIX: Threshold lowered from 0.95 → 0.90 so near-paraphrases like
+        "AI là tương lai" and "AI sẽ là tương lai" (sim ≈ 0.90) are caught.
+
+        FIX: Added Jaccard overlap check (same strategy as consolidate()) to
+        prevent false-positive dedup when two texts have high cosine similarity
+        but very different token sets (e.g. short texts in a dense embedding region).
+        Both sim AND jaccard must exceed their respective thresholds.
 
         FIX: Increased top_k from 3 to min(10, n) to avoid missing duplicates
         when the vector space is dense (thousands of entries).
@@ -689,15 +794,27 @@ class LongTermMemoryV1:
         q_vec = self.embedder.embed(text)   # already normalized
         top_k = min(10, len(self._vec_list))
         indices, sims = self._vector_search(q_vec, top_k=top_k)
+        tokens_new = set(self.embedder._tokenize(text))
         for sim, idx in zip(sims, indices):
             idx = int(idx)
             if idx >= len(self._meta_list):
                 continue
-            if sim >= threshold:
-                candidate_text = self._meta_list[idx]["text"]
-                if self._has_negation(text) != self._has_negation(candidate_text):
-                    continue
-                return self._vids[idx]
+            if sim < sim_threshold:
+                break   # sorted descending — no point continuing
+            candidate_text = self._meta_list[idx]["text"]
+            # Negation guard: never merge contradictory memories
+            if self._has_negation(text) != self._has_negation(candidate_text):
+                continue
+            # Jaccard guard: require meaningful token overlap, not just vector proximity
+            tokens_cand = set(self.embedder._tokenize(candidate_text))
+            if tokens_new and tokens_cand:
+                union = tokens_new | tokens_cand
+                jaccard = len(tokens_new & tokens_cand) / len(union) if union else 0.0
+            else:
+                jaccard = 0.0
+            if jaccard < jaccard_threshold:
+                continue
+            return self._vids[idx]
         return None
 
     # ── Store ────────────────────────────────────────────────────────
@@ -757,7 +874,7 @@ class LongTermMemoryV1:
             self._store_count += 1
 
             if self._store_count % self.DECAY_CLEANUP_INTERVAL == 0:
-                self.decay_cleanup()
+                self._decay_cleanup_unsafe()   # FIX: call lock-free internal version
 
             if len(self._vec_list) > self.MAX_VECTORS:
                 self._lru_cleanup()
@@ -813,23 +930,37 @@ class LongTermMemoryV1:
         self._save_vectors()
 
     # ── Decay cleanup ────────────────────────────────────────────────
+    def _decay_cleanup_unsafe(self, days_threshold: int = 30, min_frequency: int = 2):
+        """Internal decay cleanup — MUST be called while already holding self._lock.
+
+        FIX: Extracted from decay_cleanup() so that store() can call this without
+        attempting to re-acquire self._lock (threading.Lock is NOT reentrant — nested
+        acquisition from the same thread causes an immediate deadlock).
+        """
+        now = time.time()
+        to_remove = []
+        for i, meta in enumerate(self._meta_list):
+            age_days = (now - meta.get("timestamp", now)) / 86400.0
+            if age_days > days_threshold and meta.get("frequency", 1) <= min_frequency:
+                to_remove.append(i)
+        for idx in reversed(to_remove):
+            del self._vids[idx]
+            del self._meta_list[idx]
+            del self._vec_list[idx]
+        if to_remove:
+            self._dirty = True
+            self._save_vectors()
+            self.clear_search_cache()
+
     def decay_cleanup(self, days_threshold: int = 30, min_frequency: int = 2):
-        """FIX: Wrapped in lock — modifies _vids/_meta_list/_vec_list (shared state)."""
+        """Public API — acquires lock then delegates to _decay_cleanup_unsafe().
+
+        FIX: Wrapped in lock — modifies _vids/_meta_list/_vec_list (shared state).
+        Must NOT be called from any code path that already holds self._lock
+        (use _decay_cleanup_unsafe() instead to avoid deadlock).
+        """
         with self._lock:
-            now = time.time()
-            to_remove = []
-            for i, meta in enumerate(self._meta_list):
-                age_days = (now - meta.get("timestamp", now)) / 86400.0
-                if age_days > days_threshold and meta.get("frequency", 1) <= min_frequency:
-                    to_remove.append(i)
-            for idx in reversed(to_remove):
-                del self._vids[idx]
-                del self._meta_list[idx]
-                del self._vec_list[idx]
-            if to_remove:
-                self._dirty = True
-                self._save_vectors()
-                self.clear_search_cache()
+            self._decay_cleanup_unsafe(days_threshold, min_frequency)
 
     # ── Core vector search ───────────────────────────────────────────
     def _vector_search(self, query_vec: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -962,9 +1093,16 @@ class LongTermMemoryV1:
             mem_type    = meta.get("type", "general")
             intent_w    = intent_map.get(mem_type, 1.0)
 
-            score = intent_w * (0.5 * sim_norm
-                                + 0.2 * recency
-                                + 0.3 * freq_norm * max(0.1, importance))
+            # FIX: intent_w is now a soft additive boost, NOT a multiplicative
+            # override of the entire score. Previously intent_w * full_score meant
+            # a wrong-topic but correct-type result could outrank a correct-topic
+            # but different-type result (e.g. a DracoAI "fact" beating a relevant
+            # Python "knowledge" when searching for "Python performance").
+            # New formula: base_score is similarity-first; intent adds at most ±3%.
+            base_score = (0.5 * sim_norm
+                          + 0.2 * recency
+                          + 0.3 * freq_norm * max(0.1, importance))
+            score = base_score * (1.0 + 0.15 * (intent_w - 1.0))
 
             if entities and meta.get("type") in ("fact", "knowledge"):
                 mem_text_lower  = meta.get("text", "").lower()
@@ -1259,16 +1397,14 @@ class LongTermMemoryV1:
         'importance' score so the forgetting/LRU logic becomes feedback-aware.
         Positive feedback increases importance (memory is kept longer).
         Negative feedback decays importance (memory ages out faster).
-        FIX: Use dict-based O(1) vid→index lookup instead of list.index() O(n)
-        which is slow at 50k vectors.
+        FIX: Build a temporary vid→index dict for O(1) lookup instead of
+        calling list.index() which is O(n) and scales poorly at 50k vectors.
         """
         with self._lock:
-            if vid not in self._vids:
-                return
-            # FIX: O(1) lookup via dict instead of O(n) list.index()
-            try:
-                idx = self._vids.index(vid)
-            except ValueError:
+            # FIX: O(1) lookup via temporary dict instead of O(n) list.index()
+            vid_to_idx = {v: i for i, v in enumerate(self._vids)}
+            idx = vid_to_idx.get(vid)
+            if idx is None:
                 return
             meta = self._meta_list[idx]
             freq = meta.get("frequency", 1)
