@@ -186,17 +186,54 @@ class MiniEmbedder:
         """Return an L2-normalized vector.
 
         entity_boost  : list of entity strings to receive extra weight.
-        entity_freqs  : optional dict {entity: freq} for adaptive boost;
+                        Supports single-token entities ("Python") and multi-token
+                        phrase entities ("machine learning", "deep learning").
+                        Only tokens that BELONG to a matched entity are boosted —
+                        not all tokens in the document (previous bug was global boost).
+        entity_freqs  : optional dict {entity: freq} for adaptive boost multiplier;
                         if None, a flat multiplier of 1.5 is used.
 
         FIX: Double hashing — each OOV token contributes to a primary index
-        and a secondary index (primary * 31 % dim) with 0.5 weight. This
-        greatly reduces collision accumulation compared to single hashing.
+        and a secondary index (MD5-based) with 0.5 weight. This greatly reduces
+        collision accumulation compared to single hashing.
+        FIX: Per-token entity boost — only tokens belonging to a matched entity
+        are multiplied; other tokens keep their original weight.
         """
         tokens = self._tokenize(text)
         vec    = np.zeros(self.dim, dtype=np.float32)
 
-        entity_set = set(e.lower() for e in entity_boost) if entity_boost else set()
+        # ── Entity boost: build per-token membership map ──────────────
+        # Supports both single-token entities ("Python") and multi-token phrase
+        # entities ("machine learning", "deep learning").
+        # Strategy:
+        #   • Single-token entity  → mark that token directly.
+        #   • Multi-token phrase   → mark every token inside the phrase, but only
+        #     when the phrase actually appears as a substring in the lowercased text.
+        # This avoids the previous bug where ANY entity presence in the text caused
+        # ALL tokens to be boosted — now only relevant tokens are boosted.
+        token_boost_map: Dict[str, float] = {}   # tok → boost_multiplier
+        if entity_boost:
+            text_lower = text.lower()
+            for ent in entity_boost:
+                ent_lower = ent.lower()
+                ent_tokens = self._tokenize(ent_lower)
+                if not ent_tokens:
+                    continue
+                if len(ent_tokens) == 1:
+                    # Single token: boost only if this token appears in text
+                    tok_e = ent_tokens[0]
+                    if tok_e in set(tokens):
+                        freq_e = entity_freqs.get(ent, 1) if entity_freqs else 1
+                        mult   = 1.5 + 0.1 * math.log(freq_e + 1)
+                        token_boost_map[tok_e] = max(token_boost_map.get(tok_e, 1.0), mult)
+                else:
+                    # Multi-token phrase: boost its constituent tokens only when the
+                    # full phrase appears as a substring in text (exact phrase match).
+                    if ent_lower in text_lower:
+                        freq_e = entity_freqs.get(ent, 1) if entity_freqs else 1
+                        mult   = 1.5 + 0.1 * math.log(freq_e + 1)
+                        for tok_e in ent_tokens:
+                            token_boost_map[tok_e] = max(token_boost_map.get(tok_e, 1.0), mult)
 
         tf: Dict[str, int] = {}
         for tok in tokens:
@@ -214,14 +251,9 @@ class MiniEmbedder:
                 sign = 1
             weight = (freq / max(len(tokens), 1)) * self.idf.get(tok, 1.0)
 
-            # IMPROVE: adaptive entity boost instead of flat 1.3
-            # FIX: check entity as phrase substring in original text, not token match
-            if entity_set and any(ent in text.lower() for ent in entity_set):
-                if entity_freqs:
-                    ent_freq = entity_freqs.get(tok, 1)
-                else:
-                    ent_freq = 1
-                weight *= 1.5 + 0.1 * math.log(ent_freq + 1)
+            # IMPROVE: adaptive per-token entity boost (single and phrase entities)
+            if tok in token_boost_map:
+                weight *= token_boost_map[tok]
 
             # FIX: double hashing — primary + secondary position
             # Use MD5-based secondary index instead of predictable (idx*31)%dim
@@ -311,16 +343,17 @@ class KVCacheBuffer:
                 return len(words) >= 4
             return len(words) >= 6
 
-        # FIX: use word-boundary regex for English keywords to avoid false matches
-        if any(marker in text for marker in ["là", "=", "->", ":", "=>", "==",
-                                              "gồm", "bao gồm", "thuộc",
-                                              "được gọi là", "bao gồm"]):
+        # FIX: consolidated marker list — no duplicates.
+        # First check coarse markers (fast string contains), then regex for word-boundary.
+        COARSE_MARKERS = ("là", "=", "->", ":", "=>", "==",
+                          "gồm", "bao gồm", "thuộc", "được gọi là")
+        if any(marker in text for marker in COARSE_MARKERS):
             return len(words) >= 3
 
-        # FIX: word-boundary check for space-sensitive keywords
+        # FIX: word-boundary check for English keywords and Vietnamese patterns
         lower = text.lower()
         if re.search(r'\b(?:is|are|means|def|class|return|import)\b', lower) or \
-           re.search(r'(?:là|gồm|bao gồm|thuộc|được gọi là)', lower):
+           re.search(r'(?:gồm|bao gồm|thuộc|được gọi là)', lower):
             return len(words) >= 3
 
         return len(words) >= 4
@@ -585,6 +618,9 @@ class LongTermMemoryV1:
 
         FIX: Increased top_k from 3 to min(10, n) to avoid missing duplicates
         when the vector space is dense (thousands of entries).
+
+        NOTE: This method MUST be called while already holding self._lock
+        (store() acquires the lock before calling this).
         """
         if not self._vec_list:
             return None
@@ -592,6 +628,9 @@ class LongTermMemoryV1:
         top_k = min(10, len(self._vec_list))
         indices, sims = self._vector_search(q_vec, top_k=top_k)
         for sim, idx in zip(sims, indices):
+            idx = int(idx)
+            if idx >= len(self._meta_list):
+                continue
             if sim >= threshold:
                 candidate_text = self._meta_list[idx]["text"]
                 if self._has_negation(text) != self._has_negation(candidate_text):
@@ -774,12 +813,15 @@ class LongTermMemoryV1:
         if not self._vec_list:
             return []
 
-        # FIX: include _version in cache key so any write op auto-invalidates cache
-        key_raw = (query.strip().lower(), tuple(sorted(entities or [])), top_k, use_mmr,
-                   self._version)
-        q_hash  = hashlib.md5(str(key_raw).encode()).hexdigest()
-
+        # FIX: read _version inside lock to guarantee we see the latest value.
+        # Reading outside the lock could return a stale version and serve a
+        # cache entry that was already invalidated by a concurrent write.
         with self._lock:
+            current_version = self._version
+            # Check cache while holding lock (version already captured)
+            key_raw = (query.strip().lower(), tuple(sorted(entities or [])),
+                       top_k, use_mmr, current_version)
+            q_hash  = hashlib.md5(str(key_raw).encode()).hexdigest()
             if q_hash in self._search_cache:
                 ts, cached = self._search_cache[q_hash]
                 if time.time() - ts < 300:
@@ -800,12 +842,16 @@ class LongTermMemoryV1:
             n = len(self._meta_list)
             # Filter valid indices first, keeping all three arrays aligned
             valid = [(int(i), float(s)) for i, s in zip(indices, sims) if int(i) < n]
-            snap_meta     = [self._meta_list[i] for i, _ in valid]
-            snap_vids     = [self._vids[i]      for i, _ in valid]
-            snap_sims     = [s                  for _, s in valid]
-            # For MMR: copy vecs array and snapshot full vid list
-            snap_vecs     = self._vecs_arr.copy() if self._vecs_arr is not None else None
-            snap_vids_all = list(self._vids)
+            snap_meta  = [self._meta_list[i] for i, _ in valid]
+            snap_vids  = [self._vids[i]      for i, _ in valid]
+            snap_sims  = [s                  for _, s in valid]
+            # FIX: copy ONLY the candidate rows (K×1024), not the full 200 MB array.
+            # This reduces per-query memory from ~200 MB to a few KB.
+            cand_row_indices = [i for i, _ in valid]
+            snap_vecs_cand   = (self._vecs_arr[cand_row_indices].copy()
+                                if cand_row_indices else None)
+            # vid → position inside snap_vecs_cand (for MMR lookup)
+            snap_vid_to_pos  = {vid: pos for pos, vid in enumerate(snap_vids)}
         # ── End of lock region — all further work on snapshot only ────
 
         MAX_FREQ_LOG = math.log(101)
@@ -823,8 +869,19 @@ class LongTermMemoryV1:
                      + 0.3 * freq_norm * max(0.1, importance))
 
             if entities and meta.get("type") in ("fact", "knowledge"):
-                meta_entities = meta.get("metadata", {}).get("entities", [])
-                if any(e.lower() in [ent.lower() for ent in meta_entities] for e in entities):
+                mem_text_lower  = meta.get("text", "").lower()
+                meta_entities   = meta.get("metadata", {}).get("entities", [])
+                # FIX: match entities against both the stored metadata.entities list
+                # AND the raw text content.  metadata.entities is sparsely populated
+                # (only set when caller explicitly passes it during store), so
+                # text-level matching ensures entity boost always fires for relevant
+                # memories regardless of how they were originally stored.
+                entity_hit = any(
+                    e.lower() in [ent.lower() for ent in meta_entities]
+                    or e.lower() in mem_text_lower
+                    for e in entities
+                )
+                if entity_hit:
                     score += 0.05
 
             scored.append(
@@ -843,10 +900,11 @@ class LongTermMemoryV1:
         scored.sort(key=lambda x: x["score"], reverse=True)
         top_candidates = scored[:top_k]
 
-        if use_mmr and len(top_candidates) > 5 and snap_vecs is not None:
+        if use_mmr and len(top_candidates) > 5 and snap_vecs_cand is not None:
             top_candidates = self._mmr(
                 top_candidates, q_vec,
-                snap_vecs=snap_vecs, snap_vids_all=snap_vids_all,
+                snap_vecs_cand=snap_vecs_cand,
+                snap_vid_to_pos=snap_vid_to_pos,
                 top_k=min(top_k, 10),
             )
 
@@ -861,28 +919,32 @@ class LongTermMemoryV1:
     # ── MMR ──────────────────────────────────────────────────────────
     def _mmr(
         self,
-        candidates:     List[dict],
-        query_vec:      np.ndarray,
-        snap_vecs:      np.ndarray,       # FIX: pre-snapshotted vecs array (no shared state)
-        snap_vids_all:  List[str],        # FIX: pre-snapshotted vids list
-        lambda_param:   float = 0.7,
-        top_k:          int   = 5,
+        candidates:      List[dict],
+        query_vec:       np.ndarray,
+        snap_vecs_cand:  np.ndarray,   # FIX: compact K×dim array of candidate vectors only
+        snap_vid_to_pos: Dict[str, int], # FIX: vid → row index in snap_vecs_cand
+        lambda_param:    float = 0.7,
+        top_k:           int   = 5,
     ) -> List[dict]:
         """Maximal Marginal Relevance re-ranking.
 
-        FIX: Removed all access to self._vecs_arr / self._vids.  Caller must
-        pass pre-snapshotted copies taken while holding the lock.  This method
-        is now purely functional on its inputs — zero shared state access.
+        FIX: Accepts a compact (K×dim) array containing only candidate vectors
+        instead of the full N×dim vecs array, cutting per-query memory to a few KB.
+        FIX: Uses a pre-built vid→pos map for O(1) lookup instead of scanning
+        the full vids list.  Zero shared state access — purely functional.
         """
         if len(candidates) <= top_k:
             return candidates
 
-        idx_map = {snap_vids_all[i]: i for i in range(len(snap_vids_all))}
-        cand_indices = [idx_map[c["id"]] for c in candidates if c["id"] in idx_map]
-        if not cand_indices:
+        # Map each candidate dict to its row in snap_vecs_cand
+        cand_pos = [snap_vid_to_pos.get(c["id"]) for c in candidates]
+        valid_pairs = [(i, pos) for i, pos in enumerate(cand_pos) if pos is not None]
+        if not valid_pairs:
             return candidates
 
-        vecs = snap_vecs[cand_indices]
+        local_indices = [i   for i, _   in valid_pairs]
+        vecs_rows     = [pos for _, pos in valid_pairs]
+        vecs          = snap_vecs_cand[vecs_rows]   # shape (M, dim), M ≤ K
 
         first = max(range(len(vecs)), key=lambda i: self.embedder.similarity(query_vec, vecs[i]))
         selected  = [first]
@@ -899,7 +961,7 @@ class LongTermMemoryV1:
             best = mmr_scores.index(max(mmr_scores))
             selected.append(remaining.pop(best))
 
-        return [candidates[i] for i in selected]
+        return [candidates[local_indices[i]] for i in selected]
 
     # ── Facts ─────────────────────────────────────────────────────────
     def remember_fact(self, key: str, value: str, confidence: float = 1.0):
