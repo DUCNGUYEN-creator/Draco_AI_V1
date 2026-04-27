@@ -45,16 +45,25 @@ PRODUCTION HARDENING:
     - Thread-safe store/search/consolidate/feedback/decay via threading.Lock.
     - All public methods that read or write shared state are fully lock-guarded.
     - search() snapshots all shared data under lock before releasing it for scoring.
-    - _mmr() receives a pre-snapshotted vecs array, never touches shared state.
+    - _mmr() receives a compact pre-snapshotted vecs array (K×dim, not full N×dim).
     - consolidate(), record_feedback(), decay_cleanup() fully wrapped in lock.
     - fit_embedder() / update_idf() / _re_embed_all() fully wrapped in lock.
+    - Background flush uses threading.Event for graceful shutdown (stop() method).
     - Background flush logs errors instead of silently swallowing them.
-    - entity_boost phrase matching fixed (substring match on full text, not token).
+    - entity_boost uses \b word-boundary regex for phrase matching (no false substrings).
+    - Entity boost is per-token only — non-entity tokens keep original weight.
     - Vietnamese learnable markers extended (gồm, bao gồm, thuộc, được gọi là).
     - Token count for Vietnamese fixed: len(content) // 4 instead of split()*1.3.
     - Double hashing secondary index uses MD5 instead of predictable *31 formula.
     - Cache version counter (_version) invalidates stale entries across all write ops.
-    - list_recent / search_by_type / stats read under lock for consistency.
+    - Query is whitespace-normalized before cache key hashing (strip/lower/collapse).
+    - search() emptiness check is inside lock to avoid TOCTOU race.
+    - list_recent / search_by_type / stats / export read under lock for consistency.
+    - Intent-aware scoring (factual/code/chat) multiplies type-matched results.
+    - record_feedback() adjusts importance score for smarter LRU forgetting.
+    - WorkingMemory has a hard message cap (MAX_MESSAGES=200) to prevent RAM leak.
+    - _emb_version tracks embedding generation; stored in each vector's metadata.
+    - _w() logs OSError instead of silently swallowing write failures.
     - All critical sections are documented.
 
 FIXES vs V1.0:
@@ -227,9 +236,11 @@ class MiniEmbedder:
                         mult   = 1.5 + 0.1 * math.log(freq_e + 1)
                         token_boost_map[tok_e] = max(token_boost_map.get(tok_e, 1.0), mult)
                 else:
-                    # Multi-token phrase: boost its constituent tokens only when the
-                    # full phrase appears as a substring in text (exact phrase match).
-                    if ent_lower in text_lower:
+                    # Multi-token phrase: use word-boundary regex to avoid false
+                    # substring matches (e.g. "AI" matching inside "chair").
+                    # FIX: re.search(\b...\b) instead of bare `in` substring check.
+                    pattern = r'\b' + r'\s+'.join(re.escape(t) for t in ent_tokens) + r'\b'
+                    if re.search(pattern, text_lower):
                         freq_e = entity_freqs.get(ent, 1) if entity_freqs else 1
                         mult   = 1.5 + 0.1 * math.log(freq_e + 1)
                         for tok_e in ent_tokens:
@@ -423,6 +434,12 @@ class LongTermMemoryV1:
         # FIX: version counter — incremented on every write op so cache keys
         # built with old version are always considered stale.
         self._version: int = 0
+        # IMPROVE: embedding version — incremented every time embedder is re-fitted.
+        # Stored in each vector's metadata so stale-version vectors can be filtered
+        # or skipped during search when a full re-embed hasn't completed yet.
+        self._emb_version: int = 0
+        # FIX: stop event for graceful background thread shutdown
+        self._stop_event = threading.Event()
 
         # LRU search cache: {hash → (timestamp, results)}
         self._search_cache: OrderedDict = OrderedDict()
@@ -448,17 +465,32 @@ class LongTermMemoryV1:
 
         IMPROVE: Provides crash resilience beyond atexit (which doesn't run
         on SIGKILL or power loss). Maximum data loss window = FLUSH_INTERVAL seconds.
+        FIX: Uses threading.Event.wait() instead of time.sleep(True) so the
+        thread wakes immediately on stop() instead of blocking for FLUSH_INTERVAL.
         """
-        while True:
-            time.sleep(self.FLUSH_INTERVAL)
+        while not self._stop_event.wait(timeout=self.FLUSH_INTERVAL):
             try:
                 if self._dirty:
                     with self._lock:
                         self._save_vectors()
             except Exception as e:
-                # FIX: log flush errors instead of silently swallowing them
                 import sys
                 print(f"[DracoAI Memory] Background flush error: {e}", file=sys.stderr)
+        # Final flush on clean stop
+        try:
+            with self._lock:
+                self._save_vectors()
+        except Exception:
+            pass
+
+    def stop(self):
+        """Gracefully stop the background flush thread and flush pending data.
+
+        Call this instead of (or in addition to) flush_vectors() before
+        destroying the instance to ensure the daemon thread exits cleanly.
+        """
+        self._stop_event.set()
+        self._flush_thread.join(timeout=5)
 
     # ── File helpers ─────────────────────────────────────────────────
     def _init_files(self):
@@ -493,8 +525,9 @@ class LongTermMemoryV1:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
-        except OSError:
-            pass
+        except OSError as e:
+            import sys
+            print(f"[DracoAI Memory] Write error {path}: {e}", file=sys.stderr)
 
     # ── Vector persistence ───────────────────────────────────────────
     def _load_vectors(self):
@@ -679,12 +712,13 @@ class LongTermMemoryV1:
 
             vec  = self.embedder.embed(text)    # already normalized
             meta = {
-                "text":      text,
-                "timestamp": time.time(),
-                "frequency": 1,
-                "type":      (metadata or {}).get("type", "general"),
-                "metadata":  metadata or {},
-                "importance": (metadata or {}).get("importance", 1.0),
+                "text":        text,
+                "timestamp":   time.time(),
+                "frequency":   1,
+                "type":        (metadata or {}).get("type", "general"),
+                "metadata":    metadata or {},
+                "importance":  (metadata or {}).get("importance", 1.0),
+                "emb_version": self._emb_version,   # IMPROVE: track embedding version
             }
 
             self._vids.append(vid)
@@ -736,9 +770,16 @@ class LongTermMemoryV1:
             self.clear_search_cache()
 
     def _re_embed_all(self):
-        """MUST be called while holding self._lock."""
+        """MUST be called while holding self._lock.
+
+        IMPROVE: Bumps _emb_version after re-embedding so callers can detect
+        embedding drift.  Each vector's metadata gets 'emb_version' updated so
+        stale entries can be identified without a full scan.
+        """
+        self._emb_version += 1
         for i, meta in enumerate(self._meta_list):
             self._vec_list[i] = self.embedder.embed(meta["text"])  # normalized
+            meta["emb_version"] = self._emb_version
         self._dirty = True
         self._save_vectors()
 
@@ -797,29 +838,32 @@ class LongTermMemoryV1:
         top_k:    int            = 20,
         entities: Optional[List[str]] = None,
         use_mmr:  bool           = True,
+        intent:   Optional[str]  = None,
     ) -> List[dict]:
         """Thread-safe search with LRU cache.
 
         FIX: All access to shared state (_meta_list, _vids, _vecs_arr) is now
         performed under a single lock via snapshot pattern:
-          1. Check cache under lock.
+          1. Check cache (+ version) under lock.
           2. Compute query vector (no shared state).
-          3. Acquire lock → snapshot indices, sims, meta, vids, vecs_arr → release lock.
+          3. Acquire lock → snapshot indices, sims, meta, vids, compact vecs → release.
           4. Score and MMR using ONLY the snapshot (no shared state access).
           5. Store result in cache under lock.
-        This eliminates all race conditions between search and concurrent
-        store/consolidate/record_feedback calls.
+        IMPROVE: intent-aware scoring multiplier (factual/code/chat).
         """
-        if not self._vec_list:
-            return []
+        # FIX: check emptiness under lock to avoid TOCTOU with concurrent store()
+        with self._lock:
+            if not self._vec_list:
+                return []
+
+        # FIX: normalize query — strip, lowercase, collapse internal whitespace —
+        # before hashing so "Python " and " Python" share the same cache entry.
+        q_norm = " ".join(query.strip().lower().split())
 
         # FIX: read _version inside lock to guarantee we see the latest value.
-        # Reading outside the lock could return a stale version and serve a
-        # cache entry that was already invalidated by a concurrent write.
         with self._lock:
             current_version = self._version
-            # Check cache while holding lock (version already captured)
-            key_raw = (query.strip().lower(), tuple(sorted(entities or [])),
+            key_raw = (q_norm, tuple(sorted(entities or [])),
                        top_k, use_mmr, current_version)
             q_hash  = hashlib.md5(str(key_raw).encode()).hexdigest()
             if q_hash in self._search_cache:
@@ -830,7 +874,7 @@ class LongTermMemoryV1:
                 else:
                     del self._search_cache[q_hash]
 
-        q_vec = self.embedder.embed(query, entity_boost=entities)
+        q_vec = self.embedder.embed(q_norm, entity_boost=entities)
         now   = time.time()
 
         # ── SNAPSHOT all shared state under lock ──────────────────────
@@ -854,6 +898,16 @@ class LongTermMemoryV1:
             snap_vid_to_pos  = {vid: pos for pos, vid in enumerate(snap_vids)}
         # ── End of lock region — all further work on snapshot only ────
 
+        # IMPROVE: intent-aware score multiplier
+        # factual/knowledge queries weight higher-confidence, fact/knowledge-type results.
+        # code queries weight code/knowledge type. chat is neutral.
+        INTENT_TYPE_WEIGHTS: Dict[str, Dict[str, float]] = {
+            "factual": {"fact": 1.2, "knowledge": 1.1, "episode": 0.9,  "general": 1.0},
+            "code":    {"fact": 1.0, "knowledge": 1.2, "episode": 0.8,  "general": 1.0},
+            "chat":    {"fact": 1.0, "knowledge": 1.0, "episode": 1.1,  "general": 1.0},
+        }
+        intent_map = INTENT_TYPE_WEIGHTS.get(intent or "chat", INTENT_TYPE_WEIGHTS["chat"])
+
         MAX_FREQ_LOG = math.log(101)
         scored: List[dict] = []
         for meta, vid, sim in zip(snap_meta, snap_vids, snap_sims):
@@ -864,9 +918,12 @@ class LongTermMemoryV1:
             sim_norm    = (sim + 1.0) / 2.0
             freq_norm   = min(1.0, math.log(freq + 1) / MAX_FREQ_LOG)
             importance  = meta.get("importance", 1.0)
-            score = (0.5 * sim_norm
-                     + 0.2 * recency
-                     + 0.3 * freq_norm * max(0.1, importance))
+            mem_type    = meta.get("type", "general")
+            intent_w    = intent_map.get(mem_type, 1.0)
+
+            score = intent_w * (0.5 * sim_norm
+                                + 0.2 * recency
+                                + 0.3 * freq_norm * max(0.1, importance))
 
             if entities and meta.get("type") in ("fact", "knowledge"):
                 mem_text_lower  = meta.get("text", "").lower()
@@ -891,7 +948,7 @@ class LongTermMemoryV1:
                     "text":      meta.get("text", ""),
                     "timestamp": meta.get("timestamp", now),
                     "frequency": freq,
-                    "type":      meta.get("type", "general"),
+                    "type":      mem_type,
                     "ts":        meta.get("timestamp", now),
                     **meta.get("metadata", {}),
                 }
@@ -1141,6 +1198,7 @@ class LongTermMemoryV1:
     ) -> dict:
         if intent is None:
             intent = {"intent": "chat", "entities": []}
+        intent_str = intent.get("intent", "chat")
         return {
             "memory_summary":    self.get_summary_with_intent(query, intent),
             "ltm_facts":         self.get_facts(),
@@ -1148,12 +1206,19 @@ class LongTermMemoryV1:
                 query,
                 top_k=top_k * 3,
                 entities=intent.get("entities", []),
+                intent=intent_str,
             ),
         }
 
     # ── Feedback loop ────────────────────────────────────────────────
     def record_feedback(self, vid: str, positive: bool):
-        """FIX: Wrapped in lock — modifies _meta_list which is shared state."""
+        """Thread-safe feedback recording with importance learning.
+
+        IMPROVE: In addition to updating frequency, we also adjust the
+        'importance' score so the forgetting/LRU logic becomes feedback-aware.
+        Positive feedback increases importance (memory is kept longer).
+        Negative feedback decays importance (memory ages out faster).
+        """
         with self._lock:
             if vid not in self._vids:
                 return
@@ -1162,6 +1227,12 @@ class LongTermMemoryV1:
             freq = meta.get("frequency", 1)
             meta["frequency"] = min(freq + 1, 9999) if positive else max(1, freq // 2)
             meta["timestamp"] = time.time()
+            # IMPROVE: importance learning via feedback
+            imp = meta.get("importance", 1.0)
+            if positive:
+                meta["importance"] = min(3.0, imp * 1.2)   # cap at 3× baseline
+            else:
+                meta["importance"] = max(0.1, imp * 0.7)   # floor at 0.1
             self._dirty = True
             self._maybe_save()
             self.clear_search_cache()
@@ -1303,15 +1374,18 @@ class LongTermMemoryV1:
         }
 
     def export(self, path: str):
+        """FIX: Snapshot shared vectors/meta under lock for a consistent export."""
+        with self._lock:
+            vectors_snapshot = [
+                {"id": vid, **meta}
+                for vid, meta in zip(list(self._vids), list(self._meta_list))
+            ]
         data = {
             "facts":     self._r(self._ff),
             "episodes":  self._r(self._ef),
             "knowledge": self._r(self._kf),
             "prefs":     self._r_dict(self._pf),
-            "vectors":   [
-                {"id": vid, **meta}
-                for vid, meta in zip(self._vids, self._meta_list)
-            ],
+            "vectors":   vectors_snapshot,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1326,6 +1400,8 @@ class LongTermMemoryV1:
 # WORKING MEMORY V1
 # ══════════════════════════════════════════════════════════════════════
 class WorkingMemoryV1:
+    MAX_MESSAGES = 200   # hard cap: prevent unbounded RAM growth in long sessions
+
     def __init__(self, ltm: LongTermMemoryV1, kv_buffer: KVCacheBuffer,
                  max_tokens: int = 512, tokenizer=None):
         self.ltm        = ltm
@@ -1359,14 +1435,31 @@ class WorkingMemoryV1:
         self._trim()
 
     def _trim(self):
-        """Evict oldest non-system message when token budget is exceeded.
+        """Evict oldest non-system message when token budget or hard cap is exceeded.
 
         FIX: Previous implementation evicted the first non-system message it
         found (always index 0 or 1), which could evict a very recent message
         immediately after it was added. Now we find the OLDEST non-system
         message by scanning for the minimum timestamp among non-system entries,
         preserving conversational coherence.
+        IMPROVE: MAX_MESSAGES hard cap prevents unbounded RAM growth in long
+        automation sessions even if token_count stays small (e.g. very short msgs).
         """
+        # Hard cap: evict oldest until within limit
+        while len(self.messages) > self.MAX_MESSAGES:
+            evict_idx = -1
+            oldest_ts = float("inf")
+            for i, m in enumerate(self.messages):
+                if m["role"] != "system" and m.get("ts", float("inf")) < oldest_ts:
+                    oldest_ts = m.get("ts", float("inf"))
+                    evict_idx = i
+            if evict_idx == -1:
+                break
+            removed = self.messages.pop(evict_idx)
+            self.token_count -= self._count_tokens(removed["content"])
+            self.kv_buf.push(removed["content"], self._recent_ctx())
+
+        # Token budget: evict oldest until within budget
         while self.token_count > self.max_tokens and len(self.messages) > 1:
             # FIX: find oldest non-system message (by timestamp) instead of first
             evict_idx = -1
