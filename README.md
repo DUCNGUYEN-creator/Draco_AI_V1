@@ -53,8 +53,7 @@ Every contribution, no matter how small, directly fuels model improvements, more
 Draco AI is designed as a **MoE‑ified dense model** – it starts from a Qwen 3.5 9B checkpoint and restructures the FFN layers into 8 experts via weight averaging.  
 This means **you do not need to train from scratch**, saving enormous amounts of money and time.
 
-> 💡 **Hardware Note:** You can fine‑tune Draco’s LoRA adapters on a single consumer GPU with **12 GB VRAM or more** (e.g., NVIDIA RTX 3060, RTX 4060). Full model fine‑tuning requires more VRAM but is rarely needed thanks to the MoE design. Supports QLoRA fine-tuning on 12GB VRAM
-
+> 💡 Hardware Note: You can fine-tune Draco’s LoRA adapters on a single consumer GPU with 12 GB VRAM or more (e.g., NVIDIA RTX 3060, RTX 4060) using QLoRA. Full model fine-tuning requires significantly more VRAM but is rarely necessary thanks to the efficient MoE architecture.
 **To train your own Draco model:**
 
 1. **Map the Qwen 3.5 9B weights**  
@@ -81,46 +80,78 @@ import json
 from engine_v1 import ThinkingEngineV1
 from memory_v1 import LongTermMemoryV1
 from transformer_v1 import DracoTransformerV1
-from tokenizer import BPETokenizer        # TÊN CLASS CHÍNH XÁC TRONG FILE
+from tokenizer import BPETokenizer
 
-# 1. Khởi tạo Tokenizer (Đã fix đúng tên BPETokenizer)
-# Class này xử lý BPE O(N log N) và chuẩn hóa Unicode NFC cho tiếng Việt
+# ------------------------------------------------------------------
+# 1. Prepare the Tokenizer
+# ------------------------------------------------------------------
 tokenizer = BPETokenizer()
-# Lưu ý: Bạn cần load vocab nếu có file json, ví dụ: tokenizer.load_from_json("tokenizer.json")
+# Option A: Load a Qwen-compatible vocab (Recommended)
+# tokenizer.load_from_json("qwen_tokenizer.json")
+# Option B: Quick test mode — uses base byte-vocab (0-255) automatically.
 
-# 2. Khởi tạo Long Term Memory (LTM)
-memory = LongTermMemoryV1(db_path="storage/draco_memory.npz")
+# ------------------------------------------------------------------
+# 2. Initialize the Memory System (Vector DB) — optional
+# ------------------------------------------------------------------
+# The directory is created automatically if it doesn't exist.
+memory = LongTermMemoryV1(memory_dir="storage/draco_memory")
 
-# 3. Khởi tạo Thinking Engine (Điều phối MCTS và Reasoning)
-engine = ThinkingEngineV1(memory=memory)
+# ------------------------------------------------------------------
+# 3. Initialize the Thinking Engine (The "Brain")
+# ------------------------------------------------------------------
+# max_experts: Controls the council size (4 is safe; 8 for full power).
+# The engine uses memory via the process() arguments, not the constructor.
+engine = ThinkingEngineV1(max_experts=4)
 
-# 4. Nạp cấu hình và khởi tạo Model MoE
-with open("configs/qwen_9b_moe.json", "r") as f:
-    config = json.load(f)
+# ------------------------------------------------------------------
+# 4. Load the MoE Transformer Model
+# ------------------------------------------------------------------
+# Option A: Load a Draco checkpoint (pre-converted Qwen 3.5 9B weights)
+# model = DracoTransformerV1.load_weights("checkpoints/draco_v1_9b/")
+
+# Option B: Smoke test with a tiny random configuration (fast execution)
+config = {
+    "d_model": 128, "n_layers": 2, "n_heads": 4, "n_kv_heads": 2,
+    "head_dim": 32, "d_ff": 256, "n_experts": 8, "vocab_size": 151936,
+    "window": 1024
+}
 model = DracoTransformerV1(config)
 
-# 5. Luồng xử lý Native Reasoning
-query = "Phân tích hệ thống DracoAI..."
+# ------------------------------------------------------------------
+# 5. Run a Native Reasoning Cycle
+# ------------------------------------------------------------------
+query = "Analyze the logic error in this multi-threaded code..."
 
-# Bước A: Engine xử lý để tạo ra prompt cuối cùng
-engine_output = engine.process(query)
+# Step A: Engine processes the query (Intent detection, MCTS, Debate, …)
+# It can work standalone; optionally feed memory with memory_summary, ltm_facts, etc.
+engine_out = engine.process(query)
 
-# Bước B: Mã hóa bằng BPETokenizer
-# File của bạn có cơ chế xử lý Unicode NFC giúp "hòa" và "hoà" đồng nhất
-prompt_ids = tokenizer.encode(engine_output['final_prompt'])
-
-# Bước C: Model thực hiện suy luận
-response_ids = model.generate(
-    prompt_ids, 
-    **engine.to_generate_kwargs(engine_output)
+# Step B: Encode the compiled ChatML prompt into Token IDs
+prompt_ids = tokenizer.encode_chat(
+    engine_out["messages"],
+    add_generation_prompt=True
 )
 
-# 6. Giải mã kết quả
+# Step C: Build generation parameters (Temperature, Mirostat Tau, Expert Boost)
+gen_kwargs = engine.to_generate_kwargs(
+    engine_out,
+    identity_token_ids=[tokenizer.encode("DracoAI")[0]]  # optional identity bias
+)
+
+# Step D: Inference via the pure‑NumPy engine
+response_ids = model.generate(prompt_ids, **gen_kwargs)
+
+# ------------------------------------------------------------------
+# 6. Output the Result
+# ------------------------------------------------------------------
 print(f"Draco AI Output: {tokenizer.decode(response_ids)}")
 ```
 
 ---
 
+🧪 API Status: The interfaces above match the current v1 codebase. If you want to involve the Memory system, call memory.prepare_engine_input(query, intent) first and pass the returned dict to engine.process(…, memory_summary=…, …). The engine is designed to operate with or without memory.
+> 🧩 **Architectural Note:** Draco Engine follows a **loose coupling** design. It operates independently of the Memory System by default. Contextual data (summary, facts, candidates) are injected via the `process()` method only when needed, allowing the engine to remain lightweight and stateless.
+---
 ## 🗺️ Architecture Overview
 The diagram below shows how the main modules interact during a single reasoning cycle.
 ```

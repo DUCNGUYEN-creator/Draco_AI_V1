@@ -17,3 +17,7 @@ env/
 # VS Code
 .vscode/
 .idea/
+
+# Draco AI
+storage/
+*.npz
