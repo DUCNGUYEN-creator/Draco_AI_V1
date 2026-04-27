@@ -78,6 +78,7 @@ Unlike traditional agent frameworks that depend on continuous API calls and prom
 > * **MongoDB:** Higher write throughput but watch for memory overhead on large indexes.
 > 
 > **Recommendation:** Given your existing stack, stick with **PostgreSQL + TimescaleDB** extension."
+
 ```
 
 **Draco AI Response:**
@@ -120,6 +121,7 @@ This means **you do not need to train from scratch**, saving enormous amounts of
    After training, `_full_sync()` copies all weights (including LoRA‑merged ones) to the NumPy inference engine for ultra‑fast, pure‑CPU (or NumPy‑accelerated) deployment.
 
 Because Draco AI V1 is a **completely new AI framework**, not just a model, you are free to extend, modify, and train it for your own needs. It’s designed from the ground up to be modular, hackable, and efficient.
+```
 
 ---
 
