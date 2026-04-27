@@ -73,7 +73,31 @@ PRODUCTION HARDENING:
     - _w() logs OSError instead of silently swallowing write failures.
     - All critical sections are documented.
 
-FIXES vs V1.1 (this version):
+FIXES vs V1.2 (this version):
+    [BUG] _semantic_duplicate: used _tokenize (unigrams only) for Jaccard while embed()
+          uses both unigrams+bigrams → mismatched token spaces caused wrong dedup decisions.
+          Fixed: _tokenize_with_bigrams used for both sides of Jaccard in _semantic_duplicate.
+    [BUG] search() scoring: freq_norm * importance (multiplicative) caused double-amplification
+          — high-frequency + high-importance memories could bury semantically better results.
+          Fixed: additive formula (freq_norm + capped_importance) / 2 with importance capped at 2.0.
+    [BUG] update_idf(): only added unigrams to _df; bigram IDF became stale after incremental
+          updates. Fixed: now uses _tokenize_with_bigrams — identical coverage to fit().
+    [BUG] embed(): bigram slot always resolved via hash even when the bigram was in vocab.
+          Fixed: vocab lookup first; hash fallback only for OOV bigrams (reduces collisions
+          for frequent bigrams that were learned during fit/update_idf).
+    [BUG] embed(): _tokenize called once standalone, then _tokenize_with_bigrams called again
+          (which internally calls _tokenize) — two redundant tokenizations per embed call.
+          Fixed: single _tokenize_with_bigrams call replaces both.
+    [BUG] fit(): _tokenize called twice per text (once for unigram set, once for raw_tokens
+          list). Fixed: single _tokenize_with_bigrams call covers both.
+    [BUG] consolidate() Jaccard: same unigram-only mismatch as _semantic_duplicate.
+          Fixed: _tokenize_with_bigrams used for both texts in consolidate() Jaccard check.
+    [BUG] _tokenize_with_bigrams return type annotation was List[str] but returns
+          Tuple[List[str], List[str]] — misleading for type checkers and readers.
+          Fixed: corrected to Tuple[List[str], List[str]].
+    [IMPROVE] _ensure_arr(): now re-normalizes vectors defensively during rebuild.
+          Guards against any future code path that might store a non-unit-norm vector,
+          preventing silent accuracy degradation without changing normal-path behavior.
     [BUG] _has_negation: only caught 7 basic negation words — "khó có thể", "ít khi",
           "không hẳn", "hiếm khi", etc. all missed → expanded to 11 multi-word phrases
           + 5 single-word Vietnamese + 7 English; phrase patterns checked first (longest
@@ -208,8 +232,8 @@ class MiniEmbedder:
         return tokens
 
     @staticmethod
-    def _tokenize_with_bigrams(text: str) -> List[str]:
-        """Tokenize text and append bigrams for better phrase-level semantics.
+    def _tokenize_with_bigrams(text: str) -> Tuple[List[str], List[str]]:
+        """Tokenize text and return (unigrams, bigrams) for phrase-level semantics.
 
         IMPROVE: Pure unigram tokenization loses the meaning of compound phrases
         like "machine learning", "deep learning", "học máy". Adding bigrams (pairs
@@ -219,6 +243,9 @@ class MiniEmbedder:
 
         Bigrams are weighted at 0.6× unigrams inside embed() to prevent them from
         dominating the vector while still improving phrase discrimination.
+
+        FIX: Return type corrected to Tuple[List[str], List[str]] — was incorrectly
+        annotated as List[str] despite returning a 2-tuple.
         """
         tokens = MiniEmbedder._tokenize(text)
         bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
@@ -232,11 +259,10 @@ class MiniEmbedder:
         self._df.clear()
         self._doc_count = 0
         for text in texts:
-            tokens = set(self._tokenize(text))
-            # IMPROVE: include bigrams in IDF so embed() can look them up
-            raw_tokens = self._tokenize(text)
-            bigrams = {f"{raw_tokens[i]}_{raw_tokens[i+1]}" for i in range(len(raw_tokens) - 1)}
-            all_terms = tokens | bigrams
+            # FIX: use _tokenize_with_bigrams to avoid calling _tokenize twice
+            # and to ensure unigrams + bigrams are both included in IDF from the start.
+            raw_tokens, bigrams = self._tokenize_with_bigrams(text)
+            all_terms = set(raw_tokens) | set(bigrams)
             self._doc_count += 1
             for tok in all_terms:
                 self._df[tok] = self._df.get(tok, 0) + 1
@@ -251,12 +277,21 @@ class MiniEmbedder:
         }
 
     def update_idf(self, texts: List[str]):
+        """FIX: Now includes bigrams in IDF update (was unigram-only).
+
+        Previously fit() added both unigrams and bigrams to _df, but update_idf()
+        only added unigrams. After any incremental call to update_idf(), bigram IDF
+        values became stale, degrading embedding quality for phrase-level queries.
+        Now consistent with fit(): both unigrams and bigrams are tracked.
+        """
         if self._frozen:
             return
         for text in texts:
-            tokens = set(self._tokenize(text))
+            # FIX: use _tokenize_with_bigrams so bigrams are included (same as fit())
+            raw_tokens, bigrams = self._tokenize_with_bigrams(text)
+            all_terms = set(raw_tokens) | set(bigrams)
             self._doc_count += 1
-            for tok in tokens:
+            for tok in all_terms:
                 self._df[tok] = self._df.get(tok, 0) + 1
         N = max(self._doc_count, 1)
         for tok in self.vocab:
@@ -281,10 +316,10 @@ class MiniEmbedder:
         FIX: Per-token entity boost — only tokens belonging to a matched entity
         are multiplied; other tokens keep their original weight.
         """
-        tokens = self._tokenize(text)
-        # IMPROVE: add bigrams to capture phrase-level semantics ("machine learning",
-        # "deep learning", "học máy", etc.). Bigrams are weighted at 0.6× unigrams.
-        _, bigrams = self._tokenize_with_bigrams(text)
+        # FIX: call _tokenize_with_bigrams once instead of _tokenize + _tokenize_with_bigrams
+        # (previously embed() called _tokenize separately and then _tokenize_with_bigrams
+        # which internally called _tokenize again — two redundant tokenizations per embed).
+        tokens, bigrams = self._tokenize_with_bigrams(text)
         vec    = np.zeros(self.dim, dtype=np.float32)
 
         # ── Entity boost: build per-token membership map ──────────────
@@ -358,16 +393,24 @@ class MiniEmbedder:
 
         # IMPROVE: bigram contributions (weight = 0.6× unigram weight)
         # Bigrams capture phrase co-occurrence without dominating the vector.
+        # FIX: check self.vocab first for bigrams that were seen during fit/update_idf;
+        # vocab bigrams use a fixed slot (sign=1) which is more stable than hashing
+        # and avoids hash collisions for high-frequency bigrams.
         BIGRAM_SCALE = 0.6
         tf_bi: Dict[str, int] = {}
         for bg in bigrams:
             tf_bi[bg] = tf_bi.get(bg, 0) + 1
         for bg, freq in tf_bi.items():
-            h_idx  = int(hashlib.md5((bg + "_idx").encode()).hexdigest(), 16) % self.dim
-            h_sign = int(hashlib.md5((bg + "_sign").encode()).hexdigest(), 16) % 2
-            sign   = 1 if h_sign == 0 else -1
+            idx = self.vocab.get(bg)
+            if idx is not None:
+                sign = 1
+            else:
+                h_idx  = int(hashlib.md5((bg + "_idx").encode()).hexdigest(), 16) % self.dim
+                h_sign = int(hashlib.md5((bg + "_sign").encode()).hexdigest(), 16) % 2
+                idx    = h_idx
+                sign   = 1 if h_sign == 0 else -1
             weight = BIGRAM_SCALE * (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(bigrams), 1))) * self.idf.get(bg, 1.0)
-            vec[h_idx] += sign * weight
+            vec[idx] += sign * weight
             sec_idx = int(hashlib.md5((bg + "_sec").encode()).hexdigest(), 16) % self.dim
             vec[sec_idx] += 0.5 * sign * weight
 
@@ -686,9 +729,26 @@ class LongTermMemoryV1:
         self._dirty = False
 
     def _ensure_arr(self):
+        """Rebuild the stacked float32 array from _vec_list when dirty or missing.
+
+        FIX: Re-normalizes all vectors during rebuild as a defensive measure against
+        any future code path that might store a non-unit-norm vector.  Normal
+        operation always stores normalized vectors (embed() normalizes), but this
+        guard costs O(n) and prevents silent accuracy degradation if that invariant
+        is ever broken.
+
+        FIX: _dirty is NOT cleared here — _dirty tracks whether vectors need to be
+        flushed to disk (_save_vectors clears it).  _ensure_arr only rebuilds the
+        in-memory numpy array; the two concerns are independent.
+        """
         if self._dirty or self._vecs_arr is None or self._vecs_arr.shape[0] != len(self._vec_list):
             if self._vec_list:
-                self._vecs_arr = np.stack(self._vec_list, axis=0).astype(np.float32)
+                arr = np.stack(self._vec_list, axis=0).astype(np.float32)
+                # FIX: defensive re-normalization — vectors should already be unit-norm
+                # but re-normalize to guard against any future drift.
+                norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                norms[norms < 1e-8] = 1.0
+                self._vecs_arr = arr / norms
             else:
                 self._vecs_arr = None
 
@@ -794,7 +854,13 @@ class LongTermMemoryV1:
         q_vec = self.embedder.embed(text)   # already normalized
         top_k = min(10, len(self._vec_list))
         indices, sims = self._vector_search(q_vec, top_k=top_k)
-        tokens_new = set(self.embedder._tokenize(text))
+        # FIX: use _tokenize_with_bigrams for Jaccard so the token space matches
+        # the embedding space (embed() uses both unigrams and bigrams).
+        # Previously _tokenize (unigrams-only) was used, causing Jaccard to disagree
+        # with the cosine similarity dimension, leading to false-positive or false-
+        # negative duplicate decisions on phrase-heavy texts.
+        unigrams_new, bigrams_new = self.embedder._tokenize_with_bigrams(text)
+        tokens_new = set(unigrams_new) | set(bigrams_new)
         for sim, idx in zip(sims, indices):
             idx = int(idx)
             if idx >= len(self._meta_list):
@@ -806,7 +872,8 @@ class LongTermMemoryV1:
             if self._has_negation(text) != self._has_negation(candidate_text):
                 continue
             # Jaccard guard: require meaningful token overlap, not just vector proximity
-            tokens_cand = set(self.embedder._tokenize(candidate_text))
+            unigrams_cand, bigrams_cand = self.embedder._tokenize_with_bigrams(candidate_text)
+            tokens_cand = set(unigrams_cand) | set(bigrams_cand)
             if tokens_new and tokens_cand:
                 union = tokens_new | tokens_cand
                 jaccard = len(tokens_new & tokens_cand) / len(union) if union else 0.0
@@ -1099,9 +1166,16 @@ class LongTermMemoryV1:
             # but different-type result (e.g. a DracoAI "fact" beating a relevant
             # Python "knowledge" when searching for "Python performance").
             # New formula: base_score is similarity-first; intent adds at most ±3%.
+            #
+            # FIX: freq_norm * importance (multiplicative) caused double-amplification:
+            # a memory with high frequency AND high importance (from positive feedback)
+            # could score far above its actual semantic relevance, burying better matches.
+            # Now uses (freq_norm + capped_importance) / 2 — additive combination with
+            # importance capped at 2.0 to prevent unbounded inflation.
+            capped_importance = min(2.0, max(0.1, importance))
             base_score = (0.5 * sim_norm
                           + 0.2 * recency
-                          + 0.3 * freq_norm * max(0.1, importance))
+                          + 0.3 * (freq_norm + capped_importance) / 2.0)
             score = base_score * (1.0 + 0.15 * (intent_w - 1.0))
 
             if entities and meta.get("type") in ("fact", "knowledge"):
@@ -1477,9 +1551,13 @@ class LongTermMemoryV1:
                     if self._has_negation(text_i) != self._has_negation(text_j):
                         continue
 
-                    # Jaccard on token level
-                    tokens_i = set(self.embedder._tokenize(text_i))
-                    tokens_j = set(self.embedder._tokenize(text_j))
+                    # Jaccard on unified token level (unigrams + bigrams)
+                    # FIX: use _tokenize_with_bigrams so Jaccard uses the same
+                    # token space as the embeddings (was unigram-only, inconsistent).
+                    uni_i, bi_i = self.embedder._tokenize_with_bigrams(text_i)
+                    uni_j, bi_j = self.embedder._tokenize_with_bigrams(text_j)
+                    tokens_i = set(uni_i) | set(bi_i)
+                    tokens_j = set(uni_j) | set(bi_j)
                     if tokens_i and tokens_j:
                         jaccard = len(tokens_i & tokens_j) / len(tokens_i | tokens_j)
                     else:
