@@ -1,44 +1,147 @@
 # Draco AI V1 🐉
 *The Next-Generation MoE Reasoning Framework — Built for Deep Engineering & Empathy*
 
-**Draco AI V1** is a fully localized, high-performance Large Language Model based on **Qwen 3.5 9B**.  
-It transforms a dense 9B checkpoint into an 8‑expert Mixture‑of‑Experts architecture, combined with a rich reasoning engine, advanced memory, and personalization.  
+**Draco AI V1** is a fully localized, high-performance Large Language Model based on **Qwen 3.5 9B**.  
+It transforms a dense 9B checkpoint into an 8‑expert Mixture‑of‑Experts architecture, combined with a rich reasoning engine, advanced memory, and personalization.  
 The project is a complete AI **framework** – not just a model – meticulously optimized for difficult tasks like deep bug fixing, automation, and complex technical chat, while staying lightweight and resource‑efficient.
 
 Developed with pride by **Draco Studio (Vietnam)**, led by **DUCNGUYEN-creator**.
+
+> ⚠️ **Under Active Development**  
+> Draco AI V1 is an ongoing technical research project. It is progressing well but remains a work‑in‑progress.  
+> We are focused on building **Native Reasoning** directly into the source code rather than relying solely on prompt engineering.
+>
+> **🚀 Current Roadmap:**
+> - [ ] Multi‑threading optimization (thread‑safety) for the Memory System.
+> - [ ] Finalizing the Bayesian Belief Updater.
+> - [ ] Tuning the 8‑Expert Multi‑agent Debate mechanism.
+> - [ ] Improving stability, performance, security, and RAM/VRAM efficiency.
+>
+> **🤝 Contributions:** All ideas and code contributions are invaluable. Let’s build together on the [Draco Studio Discord](https://discord.gg/JfStzfkTH).
+
+---
+
+## ❓ Why Draco AI?
+
+Unlike traditional agent frameworks that depend on continuous API calls and prompt‑chaining (e.g., LangChain, Llama‑Index), **Draco AI integrates reasoning logic directly into the model’s inference loop**. This design eliminates the latency and hallucinations introduced by external orchestrators.
+
+- **Native Reasoning Engine** – Tree‑of‑Thoughts, MCTS, Multi‑Agent Debate, and Counterfactual analysis run *inside* the model’s own pipeline, not as separate Python scripts.
+- **Unified Memory** – A single vector database serves both short‑term context and long‑term facts, all accessible at inference time.
+- **Single‑Execution Inference** – From intent detection to final answer, everything happens in one `process()` call. No complex multi‑step chains.
+- **Resource‑Aware** – Pure NumPy inference supports CPU deployment, while PyTorch LoRA fine‑tuning runs on consumer GPUs (RTX 3060/4060).
 
 ---
 
 ## ☕ Support the Project
 
-Draco AI V1 is an open‑source passion project.  
+Draco AI V1 is an open‑source passion project.  
 Training and running experiments on GPU cloud instances is expensive. If you find this work valuable, please consider **buying me a coffee** ☕ to help cover compute costs and keep development active.
 
 Every contribution, no matter how small, directly fuels model improvements, more training, and faster releases.
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/DUCNGUYEN.creator)  
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/DUCNGUYEN.creator)
 
 ---
 
 ## 🧠 How to Train Draco AI V1 (Your Own Instance)
 
-Draco AI is designed as a **MoE‑ified dense model** – it starts from a Qwen 3.5 9B checkpoint and restructures the FFN layers into 8 experts via weight averaging.  
+Draco AI is designed as a **MoE‑ified dense model** – it starts from a Qwen 3.5 9B checkpoint and restructures the FFN layers into 8 experts via weight averaging.  
 This means **you do not need to train from scratch**, saving enormous amounts of money and time.
+
+> 💡 **Hardware Note:** You can fine‑tune Draco’s LoRA adapters on a single consumer GPU with **12 GB VRAM or more** (e.g., NVIDIA RTX 3060, RTX 4060). Full model fine‑tuning requires more VRAM but is rarely needed thanks to the MoE design. Supports QLoRA fine-tuning on 12GB VRAM
 
 **To train your own Draco model:**
 
-1. **Map the Qwen 3.5 9B weights**  
-   Use the provided `load_external_weights()` method in `transformer_v1.py` to automatically distribute Qwen’s 36 dense FFN layers into the 8 experts (by layer index modulo 8, with averaging).  
-   This gives you a fully initialized MoE model instantly.
+1. **Map the Qwen 3.5 9B weights**  
+   Use the provided `load_external_weights()` method in `transformer_v1.py` to automatically distribute Qwen’s 36 dense FFN layers into the 8 experts (by layer index modulo 8, with averaging).  
+   This gives you a fully initialized MoE model instantly.
 
-2. **Continue training with pure text data**  
-   After weight mapping, fine‑tune the entire model (especially the router and experts) on your own text corpus. The router will learn to route tokens to the most appropriate expert.  
-   Draco already integrates **LoRA** (Low‑Rank Adaptation) for efficient fine‑tuning – just call `enable_lora()` on the PyTorch model to freeze base weights and train only small adapters.
+2. **Continue training with pure text data**  
+   After weight mapping, fine‑tune the entire model (especially the router and experts) on your own text corpus. The router will learn to route tokens to the most appropriate expert.  
+   Draco already integrates **LoRA** (Low‑Rank Adaptation) for efficient fine‑tuning – just call `enable_lora()` on the PyTorch model to freeze base weights and train only small adapters.
 
-3. **Sync back to inference**  
-   After training, `_full_sync()` copies all weights (including LoRA‑merged ones) to the NumPy inference engine for ultra‑fast, pure‑CPU (or NumPy‑accelerated) deployment.
+3. **Sync back to inference**  
+   After training, `_full_sync()` copies all weights (including LoRA‑merged ones) to the NumPy inference engine for ultra‑fast, pure‑CPU (or NumPy‑accelerated) deployment.
 
 Because Draco AI V1 is a **completely new AI framework**, not just a model, you are free to extend, modify, and train it for your own needs. It’s designed from the ground up to be modular, hackable, and efficient.
+
+---
+
+## ⚡ Quick Start (Conceptual Preview)
+
+*Note: The framework is under active development. This code illustrates the intended final API and high‑level usage pattern.*
+
+```python
+import json
+from engine_v1 import ThinkingEngineV1
+from memory_v1 import LongTermMemoryV1
+from transformer_v1 import DracoTransformerV1
+from tokenizer import BPETokenizer        # TÊN CLASS CHÍNH XÁC TRONG FILE
+
+# 1. Khởi tạo Tokenizer (Đã fix đúng tên BPETokenizer)
+# Class này xử lý BPE O(N log N) và chuẩn hóa Unicode NFC cho tiếng Việt
+tokenizer = BPETokenizer()
+# Lưu ý: Bạn cần load vocab nếu có file json, ví dụ: tokenizer.load_from_json("tokenizer.json")
+
+# 2. Khởi tạo Long Term Memory (LTM)
+memory = LongTermMemoryV1(db_path="storage/draco_memory.npz")
+
+# 3. Khởi tạo Thinking Engine (Điều phối MCTS và Reasoning)
+engine = ThinkingEngineV1(memory=memory)
+
+# 4. Nạp cấu hình và khởi tạo Model MoE
+with open("configs/qwen_9b_moe.json", "r") as f:
+    config = json.load(f)
+model = DracoTransformerV1(config)
+
+# 5. Luồng xử lý Native Reasoning
+query = "Phân tích hệ thống DracoAI..."
+
+# Bước A: Engine xử lý để tạo ra prompt cuối cùng
+engine_output = engine.process(query)
+
+# Bước B: Mã hóa bằng BPETokenizer
+# File của bạn có cơ chế xử lý Unicode NFC giúp "hòa" và "hoà" đồng nhất
+prompt_ids = tokenizer.encode(engine_output['final_prompt'])
+
+# Bước C: Model thực hiện suy luận
+response_ids = model.generate(
+    prompt_ids, 
+    **engine.to_generate_kwargs(engine_output)
+)
+
+# 6. Giải mã kết quả
+print(f"Draco AI Output: {tokenizer.decode(response_ids)}")
+```
+
+---
+
+## 🗺️ Architecture Overview
+The diagram below shows how the main modules interact during a single reasoning cycle.
+```
+flowchart TD
+    U[User Input] --> TI[Tokenizer]
+    TI --> ENG[Thinking Engine]
+    
+    subgraph Engine [Thinking EngineV1]
+        ID[Intent Detector] --> EXP[Expert Router]
+        EXP --> MCTS[Tree of Thoughts / MCTS]
+        MCTS --> DEBATE[Multi-Agent Debate]
+        DEBATE --> VERIFY[CoT Verifier]
+    end
+    
+    subgraph Memory [Memory System]
+        RAG[Retrieval Augmenter] --> RR[Memory Reranker]
+        RR --> LTM[(Long-Term Memory Vector DB)]
+        LTM --> WM[Working Memory]
+    end
+    
+    ENG <--> Memory
+    ENG --> PC[Prompt Compiler]
+    PC --> MODEL[Transformer Model]
+    MODEL --> TOOL[Tool Calling Framework]
+    TOOL --> OUT[Final Answer]
+```
 
 ---
 
