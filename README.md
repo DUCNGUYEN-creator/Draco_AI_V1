@@ -22,7 +22,17 @@ Developed with pride by **Draco Studio (Vietnam)**, led by **DUCNGUYEN-creator**
 > - [ ] Tuning the 8‑Expert Multi‑agent Debate mechanism.
 > - [ ] Improving stability, performance, security, and RAM/VRAM efficiency.
 >
-> **🤝 Contributions:** All ideas and code contributions are invaluable. Let’s build together on the [Draco Studio Discord](https://discord.gg/JfStzfkTH).
+> **🤝 Contributions:** All ideas and code contributions are invaluable. Let’s build together on the [Draco Studio Discord](https://discord.gg/N77gagfCkn).
+
+---
+
+## 🧭 Design Philosophy: The "Intelligence Trinity"
+
+Draco AI is built on the belief that true machine intelligence for engineering doesn't come from larger parameters, but from the synergy of:
+
+* **Structured Reasoning:** Using MCTS and Multi-Agent Debate to explore logic paths beyond next-token prediction.
+* **Persistent Memory:** A vector-based Long-Term Memory (LTM) that evolves with every interaction.
+* **Unified Control:** A single execution pipeline that manages intent, planning, and tool-use without external overhead.
 
 ---
 
@@ -30,21 +40,62 @@ Developed with pride by **Draco Studio (Vietnam)**, led by **DUCNGUYEN-creator**
 
 Unlike traditional agent frameworks that depend on continuous API calls and prompt‑chaining (e.g., LangChain, Llama‑Index), **Draco AI integrates reasoning logic directly into the model’s inference loop**. This design eliminates the latency and hallucinations introduced by external orchestrators.
 
-- **Native Reasoning Engine** – Tree‑of‑Thoughts, MCTS, Multi‑Agent Debate, and Counterfactual analysis run *inside* the model’s own pipeline, not as separate Python scripts.
+- **Native Reasoning Engine** – Tree‑of‑Thoughts, MCTS, Multi‑Agent Debate, and Counterfactual analysis run *inside* the model’s own pipeline, not as separate Python scripts. **Fully inspectable and debuggable.**
 - **Unified Memory** – A single vector database serves both short‑term context and long‑term facts, all accessible at inference time.
-- **Single‑Execution Inference** – From intent detection to final answer, everything happens in one `process()` call. No complex multi‑step chains.
+- **Unified Execution Pipeline** – From intent detection to final answer, the entire pipeline is exposed via a single `process()` call. No complex multi‑step chains.
 - **Resource‑Aware** – Pure NumPy inference supports CPU deployment, while PyTorch LoRA fine‑tuning runs on consumer GPUs (RTX 3060/4060).
 
 ---
 
-## ☕ Support the Project
+## ⚡ Showcase: Solving the "Hard" Stuff
 
-Draco AI V1 is an open‑source passion project.  
-Training and running experiments on GPU cloud instances is expensive. If you find this work valuable, please consider **buying me a coffee** ☕ to help cover compute costs and keep development active.
+### Case 1: Deep Concurrency Debugging (Deadlock)
 
-Every contribution, no matter how small, directly fuels model improvements, more training, and faster releases.
+**User Query:** > *"Explain the deadlock in this Go code where two goroutines wait for each other using unbuffered channels."*
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/DUCNGUYEN.creator)
+**Draco Engine Trace:**
+1.  **`[MCTS Path 1]`** Goroutine A blocks on `ch1 <- val`. Goroutine B blocks on `ch2 <- val`.
+2.  **`[Abduction]`** No consumer exists for `ch1` before `ch2` is sent.
+3.  **`[Critique]`** Consensus reached: Circular dependency on unbuffered channels.
+
+**Draco AI Output:**
+> "The deadlock is a **Circular Wait**. Goroutine A cannot proceed to read `ch2` because it's stuck sending to `ch1`, while Goroutine B is stuck sending to `ch2`.
+> 
+> **Fix:** Use a `select` statement or buffered channels to break the synchronous block."
+
+
+
+---
+
+### Case 2: System Architecture Trade-offs
+
+**User Query:** > *"Should I use PostgreSQL or MongoDB for a real-time analytics dashboard with 10k writes/sec?"*
+
+**Draco AI Output:**
+> "Based on your **`[Memory: Previous project context]`**, you prioritize ACID compliance for financial logs. However, for 10k writes/sec:
+> 
+> * **PostgreSQL:** Better for complex joins but requires partitioning (Citus) at this scale.
+> * **MongoDB:** Higher write throughput but watch for memory overhead on large indexes.
+> 
+> **Recommendation:** Given your existing stack, stick with **PostgreSQL + TimescaleDB** extension."
+```
+
+**Draco AI Response:**
+> **Issue detected:** Race condition on the shared counter variable.
+> 
+> **Root cause:** `counter += 1` is not atomic; multiple threads read-modify-write simultaneously without synchronization.
+> 
+> **Fix:** Use a `threading.Lock()` to protect the critical section.
+
+---
+
+## 💡 Use Cases
+
+- **🔧 Deep Bug Fixing** – Analyze multi‑threaded race conditions, memory leaks, and logic errors.
+- **🧠 Complex Reasoning** – Solve math, logic, and system design problems with step‑by‑step chains.
+- **⚙️ Automation** – Execute tool‑calling pipelines for code generation, web search, and computation.
+- **💬 Personalized Technical Chat** – Maintain long‑term memory, user profiles, and conversational context.
+- **🏗️ System Design** – Evaluate architectural trade‑offs using Knowledge Graph and analogical reasoning.
 
 ---
 
@@ -54,6 +105,7 @@ Draco AI is designed as a **MoE‑ified dense model** – it starts from a Qwen 
 This means **you do not need to train from scratch**, saving enormous amounts of money and time.
 
 > 💡 Hardware Note: You can fine-tune Draco’s LoRA adapters on a single consumer GPU with 12 GB VRAM or more (e.g., NVIDIA RTX 3060, RTX 4060) using QLoRA. Full model fine-tuning requires significantly more VRAM but is rarely necessary thanks to the efficient MoE architecture.
+
 **To train your own Draco model:**
 
 1. **Map the Qwen 3.5 9B weights**  
@@ -146,38 +198,18 @@ response_ids = model.generate(prompt_ids, **gen_kwargs)
 # ------------------------------------------------------------------
 print(f"Draco AI Output: {tokenizer.decode(response_ids)}")
 ```
-
----
-
 🧪 API Status: The interfaces above match the current v1 codebase. If you want to involve the Memory system, call memory.prepare_engine_input(query, intent) first and pass the returned dict to engine.process(…, memory_summary=…, …). The engine is designed to operate with or without memory.
-> 🧩 **Architectural Note:** Draco Engine follows a **loose coupling** design. It operates independently of the Memory System by default. Contextual data (summary, facts, candidates) are injected via the `process()` method only when needed, allowing the engine to remain lightweight and stateless.
+
+🧩 Architectural Note: Draco Engine follows a loose coupling design. It operates independently of the Memory System by default. Contextual data (summary, facts, candidates) are injected via the process() method only when needed, allowing the engine to remain lightweight and stateless.
+
 ---
-## 🗺️ Architecture Overview
+
+🗺️ Architecture Overview
 The diagram below shows how the main modules interact during a single reasoning cycle.
-```
-flowchart TD
-    U[User Input] --> TI[Tokenizer]
-    TI --> ENG[Thinking Engine]
-    
-    subgraph Engine [Thinking EngineV1]
-        ID[Intent Detector] --> EXP[Expert Router]
-        EXP --> MCTS[Tree of Thoughts / MCTS]
-        MCTS --> DEBATE[Multi-Agent Debate]
-        DEBATE --> VERIFY[CoT Verifier]
-    end
-    
-    subgraph Memory [Memory System]
-        RAG[Retrieval Augmenter] --> RR[Memory Reranker]
-        RR --> LTM[(Long-Term Memory Vector DB)]
-        LTM --> WM[Working Memory]
-    end
-    
-    ENG <--> Memory
-    ENG --> PC[Prompt Compiler]
-    PC --> MODEL[Transformer Model]
-    MODEL --> TOOL[Tool Calling Framework]
-    TOOL --> OUT[Final Answer]
-```
+(If the Mermaid diagram doesn’t render on your device, a static PNG version is available at
+<p align="center">
+  <img src="assets/architecture.png" alt="Draco Logo" width="800">
+</p>
 
 ---
 
@@ -305,7 +337,18 @@ pip install torch torchvision torchaudio
 We believe in the power of open-source and community-driven AI. **Draco AI V1** is a product of **Draco Studio (Vietnam)**. We welcome all developers, researchers, and AI enthusiasts to contribute!
 
 * **Lead Developer:** DUCNGUYEN-creator
-* **💬 Discord Community:** [Join Draco Studio Discord](https://discord.gg/JfStzfkTH)
+* **💬 Discord Community:** [Join Draco Studio Discord](https://discord.gg/N77gagfCkn)
+
+---
+
+## ☕ Support the Project
+
+Draco AI V1 is an open‑source passion project.  
+Training and running experiments on GPU cloud instances is expensive. If you find this work valuable, please consider **buying me a coffee** ☕ to help cover compute costs and keep development active.
+
+Every contribution, no matter how small, directly fuels model improvements, more training, and faster releases.
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/DUCNGUYEN.creator)
 
 ---
 
