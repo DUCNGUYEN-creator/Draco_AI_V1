@@ -47,6 +47,8 @@ Unlike traditional agent frameworks that depend on continuous API calls and prom
 
 ---
 
+---
+
 ## ⚡ Showcase: Solving the "Hard" Stuff
 
 ### Case 1: Deep Concurrency Debugging (Deadlock)
@@ -63,8 +65,6 @@ Unlike traditional agent frameworks that depend on continuous API calls and prom
 > 
 > **Fix:** Use a `select` statement or buffered channels to break the synchronous block."
 
-
-
 ---
 
 ### Case 2: System Architecture Trade-offs
@@ -78,15 +78,6 @@ Unlike traditional agent frameworks that depend on continuous API calls and prom
 > * **MongoDB:** Higher write throughput but watch for memory overhead on large indexes.
 > 
 > **Recommendation:** Given your existing stack, stick with **PostgreSQL + TimescaleDB** extension."
-
-```
-
-**Draco AI Response:**
-> **Issue detected:** Race condition on the shared counter variable.
-> 
-> **Root cause:** `counter += 1` is not atomic; multiple threads read-modify-write simultaneously without synchronization.
-> 
-> **Fix:** Use a `threading.Lock()` to protect the critical section.
 
 ---
 
@@ -105,23 +96,17 @@ Unlike traditional agent frameworks that depend on continuous API calls and prom
 Draco AI is designed as a **MoE‑ified dense model** – it starts from a Qwen 3.5 9B checkpoint and restructures the FFN layers into 8 experts via weight averaging.  
 This means **you do not need to train from scratch**, saving enormous amounts of money and time.
 
-> 💡 Hardware Note: You can fine-tune Draco’s LoRA adapters on a single consumer GPU with 12 GB VRAM or more (e.g., NVIDIA RTX 3060, RTX 4060) using QLoRA. Full model fine-tuning requires significantly more VRAM but is rarely necessary thanks to the efficient MoE architecture.
+> 💡 **Hardware Note:** You can fine-tune Draco’s LoRA adapters on a single consumer GPU with 12 GB VRAM or more (e.g., NVIDIA RTX 3060, RTX 4060) using QLoRA. Full model fine-tuning requires significantly more VRAM but is rarely necessary thanks to the efficient MoE architecture.
 
 **To train your own Draco model:**
 
-1. **Map the Qwen 3.5 9B weights**  
-   Use the provided `load_external_weights()` method in `transformer_v1.py` to automatically distribute Qwen’s 36 dense FFN layers into the 8 experts (by layer index modulo 8, with averaging).  
-   This gives you a fully initialized MoE model instantly.
+1.  **Map the Qwen 3.5 9B weights** Use the provided `load_external_weights()` method in `transformer_v1.py` to automatically distribute Qwen’s 36 dense FFN layers into the 8 experts (by layer index modulo 8, with averaging). This gives you a fully initialized MoE model instantly.
 
-2. **Continue training with pure text data**  
-   After weight mapping, fine‑tune the entire model (especially the router and experts) on your own text corpus. The router will learn to route tokens to the most appropriate expert.  
-   Draco already integrates **LoRA** (Low‑Rank Adaptation) for efficient fine‑tuning – just call `enable_lora()` on the PyTorch model to freeze base weights and train only small adapters.
+2.  **Continue training with pure text data** After weight mapping, fine‑tune the entire model (especially the router and experts) on your own text corpus. Draco already integrates **LoRA** (Low‑Rank Adaptation) for efficient fine‑tuning – chỉ cần gọi `enable_lora()` trên PyTorch model để đóng băng base weights và chỉ huấn luyện các adapter nhỏ.
 
-3. **Sync back to inference**  
-   After training, `_full_sync()` copies all weights (including LoRA‑merged ones) to the NumPy inference engine for ultra‑fast, pure‑CPU (or NumPy‑accelerated) deployment.
+3.  **Sync back to inference** Sau khi huấn luyện, `_full_sync()` sẽ sao chép toàn bộ trọng số (bao gồm cả LoRA đã được merge) sang NumPy inference engine để triển khai tốc độ cao trên CPU hoặc NumPy-accelerated.
 
-Because Draco AI V1 is a **completely new AI framework**, not just a model, you are free to extend, modify, and train it for your own needs. It’s designed from the ground up to be modular, hackable, and efficient.
-```
+---
 
 ---
 
