@@ -1,4 +1,4 @@
-![Draco Logo](path/to/Draco Studio.png)
+![Draco Logo](assets/Draco Studio.png)
 # Draco AI V1 🐉
 *The Next-Generation MoE Reasoning Framework — Built for Deep Engineering & Empathy*
 
