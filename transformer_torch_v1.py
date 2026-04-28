@@ -52,7 +52,17 @@ FIXES (V1 — final consolidated):
          torch.zeros zero-fills the entire buffer at init time (~2 GB/buffer for 9B model).
          torch.empty skips zero-fill; safe because update() always writes before get() reads.
          This eliminates startup lag and prevents OOM on low-VRAM / low-RAM machines.
-"""
+    ✅ FIX KVCACHE-LONGPREFILL-POS (🔴 CRITICAL): KVCacheTorch long-prefill path (seq > window)
+         left cache_pos=0. Then step(seq) pushed cache_pos >> window causing get() rec_start
+         to point to the middle of the tail buffer — wrong token order on first decode step
+         after a long prompt. Fix: long-prefill sets cache_pos=window; step() guards double-advance.
+    ✅ FIX KVCACHE-SNAPSHOT: KVCacheTorch gains snapshot()/restore() — parity with NumPy KVCache,
+         enabling transactional speculative decoding rollback in Torch inference.
+    ✅ FIX MTP-TRAIN-SIGNAL: train_step now adds auxiliary CE loss on l2 (next+1 prediction,
+         weight mtp_aux_coeff=0.1). Previously W1/W2 received no direct training signal.
+    ✅ FIX DDP-VOCAB: train_step uses model.module when DDP-wrapped (vocab_size access safe).
+    ✅ FIX TORCH-LOAD: torch.load() passes weights_only=False to suppress PyTorch 2.4+ warning.
+    ✅ FIX FREEZE-EXPERTS: Added freeze_experts()/unfreeze_experts() for router-only training."""
 
 from __future__ import annotations
 
@@ -186,7 +196,11 @@ if HAS_TORCH:
                 self.k_buf[layer, :, :, self.sink:self.window, :] = k[:, :, -tail_len:,  :].half()
                 self.v_buf[layer, :, :, self.sink:self.window, :] = v[:, :, -tail_len:,  :].half()
                 if layer == 0:
-                    self.filled = self.window
+                    self.filled    = self.window
+                    # FIX KVCACHE-LONGPREFILL-POS: pin cache_pos to window so get()
+                    # rec_start formula returns correct chronological order on first
+                    # decode step after a long prompt.  Mirrors NumPy KVCache fix.
+                    self.cache_pos = self.window
             else:
                 for s in range(seq):
                     abs_pos = self.cache_pos + s
@@ -218,7 +232,29 @@ if HAS_TORCH:
                     torch.cat([v_sink, v_rec], dim=2).float())
 
         def step(self, seq_len=1):
-            self.cache_pos += seq_len
+            """FIX KVCACHE-LONGPREFILL-POS: guard against double-advancing after
+            long-prefill already pinned cache_pos to window."""
+            if self.cache_pos == self.window and seq_len > self.window:
+                pass  # already pinned; skip re-increment
+            else:
+                self.cache_pos += seq_len
+
+        def snapshot(self) -> dict:
+            """FIX KVCACHE-SNAPSHOT: Transactional rollback support — mirrors NumPy KVCache.
+            Call before forwarding a speculative token; call restore(snap) if rejected."""
+            return {
+                "cache_pos": self.cache_pos,
+                "filled":    self.filled,
+                "k_buf":     self.k_buf.clone(),
+                "v_buf":     self.v_buf.clone(),
+            }
+
+        def restore(self, snap: dict):
+            """FIX KVCACHE-SNAPSHOT: Restore cache to state captured by snapshot()."""
+            self.cache_pos = snap["cache_pos"]
+            self.filled    = snap["filled"]
+            self.k_buf.copy_(snap["k_buf"])
+            self.v_buf.copy_(snap["v_buf"])
 
 # ─────────────────────────────────────────────────────────────────────
 # Attention
@@ -625,6 +661,27 @@ if HAS_TORCH:
                     if isinstance(mod, LoRALinear):
                         mod.merge()
 
+        def freeze_experts(self):
+            """Freeze all expert FFN weights — only router is trainable.
+            Use for router-only fine-tuning (improves load balance without
+            modifying learned expert representations).
+            Re-enable full training with unfreeze_experts()."""
+            for blk in self.blocks:
+                for exp in blk.moe.experts:
+                    for p in exp.parameters():
+                        p.requires_grad_(False)
+                for p in blk.moe.shared.parameters():
+                    p.requires_grad_(False)
+
+        def unfreeze_experts(self):
+            """Unfreeze all expert FFN weights (restore full training)."""
+            for blk in self.blocks:
+                for exp in blk.moe.experts:
+                    for p in exp.parameters():
+                        p.requires_grad_(True)
+                for p in blk.moe.shared.parameters():
+                    p.requires_grad_(True)
+
         def load_external_weights(self, state_dict: dict, from_checkpoint: bool = True):
             """FIX: Expert AVERAGING (same logic as NumPy version)."""
             import re as _re
@@ -732,7 +789,8 @@ if HAS_TORCH:
                 ckpts_with_mtime.sort(key=lambda x: x[1], reverse=True)
                 filename = ckpts_with_mtime[0][0]
 
-            data     = torch.load(os.path.join(path, filename), map_location="cpu")
+            data     = torch.load(os.path.join(path, filename), map_location="cpu",
+                                   weights_only=False)  # FIX: suppress PyTorch 2.4+ FutureWarning
             ckpt_cfg = data.get("config", {})
 
             # FIX 3.3: Validate critical shape-determining config fields
@@ -785,14 +843,29 @@ if HAS_TORCH:
 
         optimizer.zero_grad()
 
+        # FIX DDP-VOCAB: support both plain model and DDP-wrapped model
+        base_model = model.module if hasattr(model, "module") else model
+
         with amp_ctx:
             l1, l2, aux_total = model(input_ids, return_aux=True)
             ce_loss = F.cross_entropy(
-                l1[:, :-1].reshape(-1, model.vocab_size),
+                l1[:, :-1].reshape(-1, base_model.vocab_size),
                 labels[:, 1:].reshape(-1),
                 ignore_index=-100,
             )
-            loss = ce_loss + aux_coeff * aux_total
+            # FIX MTP-TRAIN-SIGNAL: add auxiliary cross-entropy on l2 (next+1 prediction)
+            # so MTPHead.W1/W2 receive proper gradients. Without this, W1 is only
+            # trained indirectly via W2 and the speculative decoding quality degrades.
+            mtp_coeff = getattr(base_model, "_mtp_aux_coeff", 0.1)
+            if mtp_coeff > 0 and l2.shape[1] > 1:
+                mtp_loss = F.cross_entropy(
+                    l2[:, :-1].reshape(-1, base_model.vocab_size),
+                    labels[:, 2:].reshape(-1) if labels.shape[1] > 2 else labels[:, 1:].reshape(-1),
+                    ignore_index=-100,
+                )
+                loss = ce_loss + aux_coeff * aux_total + mtp_coeff * mtp_loss
+            else:
+                loss = ce_loss + aux_coeff * aux_total
 
         # FIX NAN-GUARD: skip step if loss is NaN
         if not torch.isfinite(loss):

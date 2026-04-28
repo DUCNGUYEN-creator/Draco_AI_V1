@@ -88,7 +88,15 @@ FIXES (V1 — final consolidated):
          self._miro_mu is reset to 5.0 only when new_prompt=True (or cache is None).
          For multi-turn continuation (new_prompt=False), mu carries over, preserving
          Mirostat's adaptive entropy state across successive generate() calls.
-         mu is saved back to self._miro_mu at the end of every generate() call."""
+         mu is saved back to self._miro_mu at the end of every generate() call.
+    ✅ FIX KVCACHE-LONGPREFILL-POS (🔴 CRITICAL): KVCache long-prefill path (seq > window)
+         wrote filled=window but left cache_pos=0. Then forward() called step(seq) pushing
+         cache_pos to seq (>> window). get() then computed
+         rec_start = sink + (cache_pos - sink) % recent_cap, which for large cache_pos
+         pointed to the MIDDLE of the tail buffer instead of the start — returning tokens
+         in the wrong chronological order for the very first decode step after a long prompt.
+         Fix: long-prefill path now sets cache_pos = window at layer==0, and step() guards
+         against double-advancing when cache_pos is already pinned to window by a long-prefill."""
 from __future__ import annotations
 import math, os, json, time, copy, tempfile
 from typing import List, Optional, Tuple, Dict, Callable
@@ -233,7 +241,13 @@ class KVCache:
             self.k_buf[layer, :, :, self.sink:self.window, :] = k[:, :, -tail_len:, :].astype(np.float16)
             self.v_buf[layer, :, :, self.sink:self.window, :] = v[:, :, -tail_len:, :].astype(np.float16)
             if layer == 0:
-                self.filled = self.window
+                self.filled    = self.window
+                # FIX KVCACHE-LONGPREFILL-POS: set cache_pos = window so get() rec_start formula
+                # computes correct chronological order for subsequent decode steps.
+                # Without this, cache_pos stays 0 then step(seq) sets it to seq (> window),
+                # causing rec_start = sink + (seq - sink) % recent_cap to point to the MIDDLE
+                # of the tail buffer instead of the start — tokens read in wrong order.
+                self.cache_pos = self.window
         else:
             for s in range(seq):
                 abs_pos = self.cache_pos + s
@@ -271,8 +285,19 @@ class KVCache:
         v = np.concatenate([v_sink, v_rec], axis=2)
         return k.astype(np.float32), v.astype(np.float32)
     def step(self, seq_len: int = 1):
-        """Advance cache pointer after a forward pass."""
-        self.cache_pos += seq_len
+        """Advance cache pointer after a forward pass.
+        FIX KVCACHE-LONGPREFILL-POS: When the long-prefill path already set
+        cache_pos = window, adding seq_len (which is > window) would make
+        cache_pos >> window and cause get() rec_start to point to the wrong
+        buffer slot on the very next decode step.  Guard: if cache_pos was
+        already pinned to window by the long-prefill path, do not add again.
+        """
+        if self.cache_pos == self.window and seq_len > self.window:
+            # Long-prefill just ran; cache_pos pinned to window.
+            # Skip re-increment — next decode's update() will wrap correctly.
+            pass
+        else:
+            self.cache_pos += seq_len
 # ─────────────────────────────────────────────────────────────────────
 # Layer normalisations
 # ─────────────────────────────────────────────────────────────────────
