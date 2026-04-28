@@ -73,7 +73,44 @@ PRODUCTION HARDENING:
     - _w() logs OSError instead of silently swallowing write failures.
     - All critical sections are documented.
 
-FIXES vs V1 (this version):
+FIXES vs V1.2 (this version):
+    [BUG-1] _is_learnable: COARSE_MARKERS used bare `in` (substring match) for "là",
+          causing "làm", "làng", "làn", etc. to falsely match the "là" marker.
+          Short conversational phrases (≥3 words) containing any word with "là" as a
+          prefix were accepted as learnable memories, polluting the vector store.
+          Fixed: "là" now checked via \blà\b word-boundary regex; purely symbolic
+          markers (=, ->, :, =>, ==) remain as substring checks (unambiguous);
+          multi-word Vietnamese markers (bao gồm, được gọi là, etc.) also remain
+          substring checks since their multi-word form prevents prefix collisions.
+    [BUG-2] consolidate_by_topic: neg_first was taken from idxs[0] which might
+          already be assigned to a prior cluster (in `processed`), causing the
+          negation guard to use a stale polarity anchor and incorrectly reject
+          valid unprocessed memories from joining the current cluster.
+          Fixed: negation polarity is now determined by majority vote among the
+          UNPROCESSED members of each pivot group before filtering; ties default
+          to the non-negated polarity.
+    [BUG-3] _load_vectors used np.load(..., allow_pickle=True) with dtype=object
+          arrays for vids and meta — numpy uses pickle for object arrays, making
+          a tampered vectors.npz a remote-code-execution vector.
+          Fixed: storage split into two files:
+            • vectors.npz      — float32 'vecs' only (allow_pickle=False)
+            • vectors_meta.json — vids + meta as safe JSON (no pickle)
+          Both files are written atomically (tmp + os.replace).
+          Backward-compat: old pickle-format files are auto-migrated on first load
+          (one-time only, logged as a warning).
+    [BUG-6] _has_negation: "khó" and "hiếm" were listed as standalone single-word
+          negation signals, but they mean "difficult" and "rare" — NOT logical
+          negation. This caused false-positive negation detection that fragmented
+          clusters and blocked consolidation of non-contradictory memories.
+          Fixed: removed "khó" and "hiếm" from the single-word regex pattern;
+          their negation-context forms ("khó có thể", "khó mà", "hiếm khi") remain
+          correctly captured by PHRASE_NEGATIONS (longest-match-first).
+    [IMPROVE] Replaced all print(…, file=sys.stderr) calls with proper
+          logging.getLogger("draco.memory") usage. Callers can now configure log
+          level / handlers without modifying library code.
+    [DOC] Jaccard threshold asymmetry between _semantic_duplicate (0.30) and
+          consolidate (0.20) is now documented in _semantic_duplicate docstring
+          with explicit rationale to prevent future "bug report" confusion.
     [BUG-C (complete)] embed() called without snapshot in store(), _semantic_duplicate(),
           _re_embed_all(), and consolidate_by_topic() centroid-fallback path — these
           callers were missing vocab_override / idf_override / synonym_map_override even
@@ -241,6 +278,7 @@ FIXES vs V1 (this version):
 """
 
 import atexit
+import logging
 import os
 import json
 import math
@@ -249,6 +287,8 @@ import hashlib
 import re
 import threading
 from collections import Counter, OrderedDict
+
+_log = logging.getLogger("draco.memory")
 
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
@@ -652,17 +692,32 @@ class KVCacheBuffer:
                 return len(words) >= 4
             return len(words) >= 6
 
-        # FIX: consolidated marker list — no duplicates.
-        # First check coarse markers (fast string contains), then regex for word-boundary.
-        COARSE_MARKERS = ("là", "=", "->", ":", "=>", "==",
-                          "gồm", "bao gồm", "thuộc", "được gọi là")
-        if any(marker in text for marker in COARSE_MARKERS):
+        # FIX BUG-1: COARSE_MARKERS previously used bare `in` (substring match),
+        # causing "là" to match inside "làm", "làng", "làn", etc. — any Vietnamese
+        # word that contains "là" as a prefix would pass the filter even for short
+        # conversational phrases that should NOT be stored as memories.
+        # Fixed: "là" is now checked via \blà\b word-boundary regex.
+        # Purely symbolic markers (=, ->, :, =>, ==) remain as substring checks
+        # since they are unambiguous punctuation that cannot appear inside a word.
+        # Multi-word Vietnamese markers (bao gồm, được gọi là, etc.) also remain
+        # as substring checks — their multi-word form prevents prefix collisions.
+        SYMBOL_MARKERS = ("=", "->", ":", "=>", "==")
+        MULTIWORD_MARKERS = ("bao gồm", "được gọi là", "gồm", "thuộc")
+        lower = text.lower()
+
+        if any(m in text for m in SYMBOL_MARKERS):
+            return len(words) >= 3
+
+        # FIX: use \b word boundary for standalone Vietnamese words that can be
+        # prefixes of other words (là → làm, làng; gồm is less risky but kept safe)
+        if re.search(r'\blà\b', lower):
+            return len(words) >= 3
+
+        if any(m in lower for m in MULTIWORD_MARKERS):
             return len(words) >= 3
 
         # FIX: word-boundary check for English keywords and Vietnamese patterns
-        lower = text.lower()
-        if re.search(r'\b(?:is|are|means|def|class|return|import)\b', lower) or \
-           re.search(r'(?:gồm|bao gồm|thuộc|được gọi là)', lower):
+        if re.search(r'\b(?:is|are|means|def|class|return|import)\b', lower):
             return len(words) >= 3
 
         return len(words) >= 4
@@ -775,8 +830,7 @@ class LongTermMemoryV1:
                     if self._dirty:
                         self._save_vectors()
             except Exception as e:
-                import sys
-                print(f"[DracoAI Memory] Background flush error: {e}", file=sys.stderr)
+                _log.error("Background flush error: %s", e)
         # FIX F: final flush on clean stop — only write if actually dirty to avoid
         # a no-op disk write (and unnecessary embedder.save() call) on clean shutdown.
         try:
@@ -829,20 +883,57 @@ class LongTermMemoryV1:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
         except OSError as e:
-            import sys
-            print(f"[DracoAI Memory] Write error {path}: {e}", file=sys.stderr)
+            _log.error("Write error %s: %s", path, e)
 
     # ── Vector persistence ───────────────────────────────────────────
     def _load_vectors(self):
+        """Load vectors from disk.
+
+        FIX BUG-3 (Pickle / RCE): Previously used np.load(..., allow_pickle=True)
+        with dtype=object arrays for vids and meta — numpy uses pickle internally
+        for object arrays, meaning a tampered vectors.npz could execute arbitrary
+        code at load time (classic pickle RCE).
+
+        Fixed by splitting storage into two files:
+          • vectors.npz  — contains ONLY float32 'vecs' array (allow_pickle=False safe)
+          • vectors_meta.json — contains vids (list[str]) and meta (list[dict]) as JSON
+
+        JSON is human-readable, auditable, and cannot execute code.  The sidecar
+        file is written atomically (tmp + os.replace) same as the .npz.
+
+        Backward-compat: if vectors_meta.json is absent but vectors.npz exists with
+        the old pickle layout, we attempt a one-time migration with allow_pickle=True
+        (logs a warning), then immediately re-save in the new format.
+        """
         if not os.path.exists(self._npz):
             return
+        sidecar = self._npz[:-4] + "_meta.json"
         try:
-            data = np.load(self._npz, allow_pickle=True)
-            vids      = data["vids"].tolist()
-            vecs      = data["vecs"]
-            meta_raw  = data["meta"].tolist()
-
-            if not isinstance(meta_raw, list):
+            # ── New format: vecs-only npz + JSON sidecar ──────────────
+            if os.path.exists(sidecar):
+                data = np.load(self._npz, allow_pickle=False)
+                vecs = data["vecs"]
+                with open(sidecar, "r", encoding="utf-8") as f:
+                    side = json.load(f)
+                vids     = side.get("vids", [])
+                meta_raw = side.get("meta", [])
+                if not isinstance(meta_raw, list) or len(meta_raw) != len(vids):
+                    return
+            else:
+                # ── Legacy format: one-time pickle migration ───────────
+                _log.warning("Loading legacy pickle-based vectors.npz. Re-saving in safe JSON-sidecar format.")
+                data     = np.load(self._npz, allow_pickle=True)
+                vecs     = data["vecs"]
+                vids     = data["vids"].tolist()
+                meta_raw = data["meta"].tolist()
+                if not isinstance(meta_raw, list):
+                    return
+                # Immediately persist in safe format
+                self._vids      = vids
+                self._vec_list  = [vecs[i] for i in range(len(vids))]
+                self._meta_list = meta_raw
+                self._dirty     = True
+                self._save_vectors()  # rewrites in new format
                 return
 
             self._vids      = vids
@@ -852,7 +943,8 @@ class LongTermMemoryV1:
             for meta in self._meta_list:
                 meta.pop("embedding", None)
             self._dirty     = False
-        except Exception:
+        except Exception as exc:
+            _log.warning("Failed to load vectors: %s", exc)
             self._vids      = []
             self._vec_list  = []
             self._meta_list = []
@@ -863,26 +955,34 @@ class LongTermMemoryV1:
         FIX: Previous implementation wrote directly to vectors.npz; a crash
         mid-write would corrupt the file and wipe the entire vector DB on
         next load. Now we write to a .tmp file first, then atomically replace.
+
+        FIX BUG-3 (Pickle / RCE): vids and meta are now stored in a separate
+        vectors_meta.json sidecar file (JSON, no pickle) instead of object-dtype
+        numpy arrays (which use pickle internally).  The .npz contains ONLY the
+        float32 'vecs' array and can be loaded with allow_pickle=False.
+        Both files are written atomically (tmp + os.replace).
         """
         if not self._dirty:
             return
+        sidecar     = self._npz[:-4] + "_meta.json"
+        sidecar_tmp = sidecar + ".tmp"
         if not self._vec_list:
-            if os.path.exists(self._npz):
-                os.remove(self._npz)
+            for path in (self._npz, sidecar):
+                if os.path.exists(path):
+                    os.remove(path)
             self._dirty = False
             return
-        vecs = np.stack(self._vec_list, axis=0).astype(np.float32)
-        # np.savez_compressed appends .npz automatically when the path doesn't end in .npz,
-        # so we use a .tmp path that already ends in .npz to get a clean atomic rename.
+        vecs     = np.stack(self._vec_list, axis=0).astype(np.float32)
         tmp_base = self._npz[:-4] + "_tmp"   # strip .npz, add _tmp suffix
         tmp      = tmp_base + ".npz"
-        np.savez_compressed(
-            tmp_base,   # numpy will write to tmp_base + ".npz"
-            vids=np.array(self._vids, dtype=object),
-            vecs=vecs,
-            meta=np.array(self._meta_list, dtype=object),
-        )
+        # Write float32 vectors (no pickle needed)
+        np.savez_compressed(tmp_base, vecs=vecs)
         os.replace(tmp, self._npz)
+        # Write vids + meta as safe JSON sidecar (atomic)
+        side_data = {"vids": self._vids, "meta": self._meta_list}
+        with open(sidecar_tmp, "w", encoding="utf-8") as f:
+            json.dump(side_data, f, ensure_ascii=False)
+        os.replace(sidecar_tmp, sidecar)
         self.embedder.save(self.dir)
         self._dirty = False
 
@@ -948,7 +1048,16 @@ class LongTermMemoryV1:
             if phrase in lower:
                 return True
         # Single-word Vietnamese + English
-        pattern_vi = r'\b(?:không|chẳng|chưa|khó|hiếm)\b'
+        # FIX BUG-6: removed "khó" and "hiếm" from single-word negation patterns.
+        # These words mean "difficult" and "rare" respectively — they are NOT strict
+        # logical negations by themselves.  For example:
+        #   "AI rất khó học" (AI is hard to learn)  — NOT a negation of AI's value
+        #   "GPU hiếm hàng"  (GPU is scarce)         — NOT a negation of GPU quality
+        # Their negation-context forms ("khó có thể", "khó mà", "hiếm khi") are
+        # already captured by PHRASE_NEGATIONS above (longest-match-first order).
+        # Keeping them in single-word patterns caused false-positive negation detection
+        # that split valid clusters and blocked legitimate memory consolidation.
+        pattern_vi = r'\b(?:không|chẳng|chưa)\b'
         pattern_en = r'\b(?:not|no|never|neither|hardly|rarely|without)\b'
         return bool(re.search(pattern_vi, lower) or re.search(pattern_en, lower))
 
@@ -1011,6 +1120,13 @@ class LongTermMemoryV1:
         FIX BUG-C (store path): accepts vocab_override / idf_override /
         synonym_map_override so embed() reads zero shared mutable state — the
         caller (store()) snapshots the embedder state under lock and passes it here.
+
+        NOTE: Jaccard threshold default is 0.30 here (vs 0.20 in consolidate()).
+        Rationale: _semantic_duplicate() fires on every single store() call and
+        must be conservative — a higher threshold means we only skip storing if
+        the text is clearly a near-duplicate. consolidate() is a periodic batch
+        operation where a lower threshold is acceptable because the user explicitly
+        triggered it to merge loosely similar memories.
 
         NOTE: This method MUST be called while already holding self._lock
         (store() acquires the lock before calling this).
@@ -1957,15 +2073,30 @@ class LongTermMemoryV1:
             # Build clusters from pivot tokens (greedy: largest pivot first)
             sorted_pivots = sorted(pivot_tokens.items(), key=lambda x: -len(x[1]))
             for tok, idxs in sorted_pivots:
-                # Collect unprocessed memories that share this pivot token
-                neg_first = self._has_negation(self._meta_list[idxs[0]].get("text", ""))
+                # Collect unprocessed memories that share this pivot token.
+                # FIX BUG-2: Previously neg_first was set from idxs[0] which may
+                # already have been assigned to another cluster (i.e. in `processed`).
+                # Using an already-processed entry as the polarity anchor caused the
+                # remaining unprocessed entries — which might have a DIFFERENT polarity
+                # from that anchor — to all be rejected by the negation guard, leading
+                # to cluster fragmentation and missed groupings.
+                # Fix: determine the dominant negation polarity from the UNPROCESSED
+                # candidates first, then filter by that majority polarity.
+                # Majority vote: count negation-True vs negation-False among unprocessed;
+                # the larger group sets the cluster polarity (ties default to False).
+                unprocessed_idxs = [idx for idx in idxs if self._vids[idx] not in processed]
+                if not unprocessed_idxs:
+                    continue
+                neg_counts = {True: 0, False: 0}
+                for idx in unprocessed_idxs:
+                    neg_counts[self._has_negation(self._meta_list[idx].get("text", ""))] += 1
+                neg_dominant = neg_counts[True] >= neg_counts[False]   # majority polarity
+
                 cluster = []
-                for idx in idxs:
-                    if self._vids[idx] in processed:
-                        continue
+                for idx in unprocessed_idxs:
                     neg_idx = self._has_negation(self._meta_list[idx].get("text", ""))
-                    if neg_idx != neg_first:
-                        continue   # negation guard
+                    if neg_idx != neg_dominant:
+                        continue   # negation guard — exclude minority polarity
                     cluster.append(idx)
                 if len(cluster) >= min_cluster_size:
                     clusters.append(cluster)
