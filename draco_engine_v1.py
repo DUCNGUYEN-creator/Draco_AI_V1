@@ -26,7 +26,7 @@ Changelog V1 (fixes):
   [F] ltm.store: check duplicate trước khi lưu
   [G] _auto_learn: khôi phục HALLUCINATION_FLAGS guard
   [H] Thêm skill_read_file, skill_create_file, skill_write_report
-  Vẫn chx xong, cần góp ý, đây là file thêm skill cứng cho AI và là main engine của model.
+  Vẫn chưa xong, cần góp ý, đây là file thêm skill cứng cho AI và là main engine của model.
 """
 
 import os, re, time
