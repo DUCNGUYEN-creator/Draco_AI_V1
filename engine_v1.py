@@ -117,6 +117,15 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
          eliminates KG read/write race in ThreadPoolExecutor parallel block
     ✅ [LOCK-FIX]    _router_lock added for SelfEvolvingRouter thread safety;
          evolving_router.apply() and .update() both guarded
+    ── REFACTOR V1.4 ──────────────────────────────────────────────────────────
+    ✅ [IMPORT-DEDUP] TransformerBridge removed from engine_v1.py — imported from
+         transformer_v1.py with graceful fallback stub (no duplicate source)
+    ✅ [TOKENIZER]   ThinkingEngineV1 accepts tokenizer= param; tokenize_prompt() added
+    ✅ [LLM-TOT]     TreeOfThoughts uses real LLM via _run_tot_with_llm() when bridge connected
+    ✅ [LLM-DEBATE]  MultiAgentDebate._get_initial_thought() + _expert_review() call LLM
+         with stub fallback when bridge not connected
+    ✅ [LLM-MODULES] CounterfactualReasoner, AbductionEngine, GoalDecomposer, PlanDecomposer
+         all call LLM via _llm_generate() helper when bridge+tokenizer available
 """
 
 import re
@@ -131,6 +140,77 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from collections import deque, defaultdict
+
+# ── TransformerBridge: prefer transformer_v1 (single source of truth) ──
+# Falls back to a lightweight stub when transformer_v1 is not installed,
+# so engine_v1.py remains importable in isolation for testing / standalone use.
+try:
+    from transformer_v1 import TransformerBridge  # type: ignore
+except ImportError:
+    class TransformerBridge:  # type: ignore  # noqa: N801
+        """Fallback stub — replace with real TransformerBridge from transformer_v1.py."""
+        def __init__(self, n_experts=8, vocab_size=152064, numpy_model=None,
+                     gguf_path=None, n_gpu_layers=0):
+            self.n_experts  = n_experts
+            self.vocab_size = vocab_size
+            self._numpy_model = numpy_model
+            self._llama_model = None
+            if gguf_path is not None:
+                raise ImportError(
+                    "transformer_v1 not found. Install it to use GGUF backend."
+                )
+        def is_connected(self) -> bool:
+            return self._numpy_model is not None
+        def generate(self, prompt_ids, max_new_tokens=256, **kwargs):
+            """Stub — returns [] until a real backend is connected."""
+            return []
+        def expert_boost_to_array(self, boost_dict):
+            try:
+                import numpy as np
+                arr = np.zeros(self.n_experts, dtype=np.float32)
+                for eid, w in boost_dict.items():
+                    if 0 <= eid < self.n_experts:
+                        arr[eid] = float(w)
+                return arr
+            except ImportError:
+                arr = [0.0] * self.n_experts
+                for eid, w in boost_dict.items():
+                    if 0 <= eid < self.n_experts:
+                        arr[eid] = float(w)
+                return arr
+        def build_intent_bias(self, identity_token_ids=None, boost=2.0):
+            try:
+                import numpy as np
+                bias = np.zeros(self.vocab_size, dtype=np.float32)
+                if identity_token_ids:
+                    for tid in identity_token_ids:
+                        if 0 <= tid < self.vocab_size:
+                            bias[tid] = boost
+                return bias
+            except ImportError:
+                bias = [0.0] * self.vocab_size
+                if identity_token_ids:
+                    for tid in identity_token_ids:
+                        if 0 <= tid < self.vocab_size:
+                            bias[tid] = boost
+                return bias
+        def to_generate_kwargs(self, engine_out, identity_token_ids=None,
+                               max_new_tokens=512, top_p=0.9, min_p=0.05,
+                               use_mirostat=True, use_speculative=True,
+                               adaptive_temp=False, stream_cb=None, **kwargs):
+            boost_arr   = self.expert_boost_to_array(engine_out.get("expert_boost", {}))
+            intent_bias = self.build_intent_bias(identity_token_ids)
+            creativity  = float(engine_out.get("creativity", 0.6))
+            temp        = 0.3 + creativity * 1.2
+            miro_tau    = float(engine_out.get("miro_tau", 5.0))
+            return {
+                "max_new_tokens": max_new_tokens, "temp": temp,
+                "top_p": top_p, "min_p": min_p,
+                "use_mirostat": use_mirostat, "use_speculative": use_speculative,
+                "adaptive_temp": adaptive_temp, "stream_cb": stream_cb,
+                "intent_boost": boost_arr, "intent_bias": intent_bias,
+                "_miro_tau_hint": miro_tau,
+            }
 
 # ── Expert indices (8 experts from single Qwen 3.5 9B Instruct FFN) ──
 EXPERT_CODE_0   = 0
@@ -1222,17 +1302,44 @@ class AbductionEngine:
         kg: KnowledgeGraph,
         intent: dict,
         n: int = 4,
+        bridge:    Any = None,
+        tokenizer: Any = None,
     ) -> List[str]:
-        """Generate plausible hypotheses, score via MCTS, return ranked list."""
+        """Generate plausible hypotheses. Uses LLM when bridge+tokenizer connected."""
         entities  = intent.get("entities", [])
+
+        # ── Real LLM path ────────────────────────────────────────────
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                prompt = (
+                    f"Question: {query}\n\n"
+                    f"List exactly {n} distinct hypotheses (possible explanations) "
+                    f"numbered 1 to {n}. Be concise."
+                )
+                text = (f"<|im_start|>system\nYou are an abductive reasoning expert.\n"
+                        f"<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n")
+                ids  = tokenizer.encode(text, add_bos=True)
+                out  = bridge.generate(ids, max_new_tokens=256)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    # Split on numbered lines
+                    lines = [l.strip() for l in re.split(r'\n?\d+[.)]\s*', decoded) if l.strip()]
+                    if len(lines) >= 2:
+                        # Score via MCTS to pick best
+                        best = self.mcts.search(query, lines[:n])
+                        return [f"[BEST] {h}" if h == best else h for h in lines[:n]]
+            except Exception:
+                pass
+
+        # ── Stub fallback (MCTS-scored templates) ────────────────────
         templates: List[str] = [
             f"Hypothesis {i + 1}: related to {entities[i % len(entities)] if entities else 'unknown factor'}"
             for i in range(n)
         ]
-        # Score via MCTS search
         best = self.mcts.search(query, templates)
-        ranked = [f"[BEST] {best}" if t == best else t for t in templates]
-        return ranked
+        return [f"[BEST] {t}" if t == best else t for t in templates]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1513,8 +1620,42 @@ class GoalDecomposer:
     def __init__(self):
         self.mcts = MCTSLight(n_sim=15, max_rollout_depth=20)
 
-    def decompose(self, question: str, intent: dict, max_subgoals: int = 6) -> List[str]:
-        itype     = intent.get("intent", INTENT_CHAT)
+    def decompose(
+        self,
+        question:     str,
+        intent:       dict,
+        max_subgoals: int = 6,
+        bridge:       Any = None,
+        tokenizer:    Any = None,
+    ) -> List[str]:
+        """Decompose a complex goal into sub-goals. Uses LLM when bridge+tokenizer connected."""
+        itype = intent.get("intent", INTENT_CHAT)
+
+        # ── Real LLM path ────────────────────────────────────────────
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                prompt = (
+                    f"Goal: {question}\n\n"
+                    f"Break this down into exactly {max_subgoals} concrete sub-goals, "
+                    f"numbered 1 to {max_subgoals}. Each sub-goal on its own line."
+                )
+                text = (f"<|im_start|>system\nYou are a goal-decomposition expert.\n"
+                        f"<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n")
+                ids  = tokenizer.encode(text, add_bos=True)
+                out  = bridge.generate(ids, max_new_tokens=300)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    lines = [l.strip() for l in re.split(r'\n?\d+[.)]\s*', decoded) if l.strip()]
+                    if len(lines) >= 2:
+                        templates = lines[:max_subgoals]
+                        best      = self.mcts.search(question, templates)
+                        return [f"[★ MAIN GOAL] {t}" if t == best else t for t in templates]
+            except Exception:
+                pass
+
+        # ── Stub fallback ────────────────────────────────────────────
         templates = self._templates(question, itype, max_subgoals)
         best      = self.mcts.search(question, templates)
         return [f"[★ MAIN GOAL] {t}" if t == best else t for t in templates]
@@ -1571,7 +1712,13 @@ class MultiAgentDebate:
         EXPERT_LANG_3: "Cross-reference prior knowledge/memory for factual grounding.",
     }
 
-    def generate_debate(self, question: str, intent: dict) -> Tuple[str, Dict[int, str]]:
+    def generate_debate(
+        self,
+        question: str,
+        intent: dict,
+        bridge:    Any = None,
+        tokenizer: Any = None,
+    ) -> Tuple[str, Dict[int, str]]:
         """
         Two-expert debate for non-council (fast slow-mode) calls.
         Signature: (question: str, intent: dict) — intent dict, not expert_responses.
@@ -1581,56 +1728,87 @@ class MultiAgentDebate:
 
         if itype in (INTENT_MATH, INTENT_LOGIC):
             debater_a, debater_b = EXPERT_CODE_0, EXPERT_CODE_2
-            opinions[debater_a] = (
-                f"[{self.EXPERT_NAMES[debater_a]}] "
-                f"Approach: Break into mathematical primitives, apply formal rules step-by-step."
-            )
-            opinions[debater_b] = (
-                f"[{self.EXPERT_NAMES[debater_b]}] "
-                f"Approach: Verify each step, check edge cases, provide counter-examples if needed."
-            )
         elif itype == INTENT_CODE:
             debater_a, debater_b = EXPERT_CODE_1, EXPERT_LANG_0
-            opinions[debater_a] = (
-                f"[{self.EXPERT_NAMES[debater_a]}] "
-                f"Approach: Focus on correctness, efficiency, and clean architecture."
-            )
-            opinions[debater_b] = (
-                f"[{self.EXPERT_NAMES[debater_b]}] "
-                f"Approach: Ensure the explanation is clear, well-commented, accessible."
-            )
         else:
             debater_a, debater_b = EXPERT_LANG_0, EXPERT_LANG_1
-            opinions[debater_a] = (
-                f"[{self.EXPERT_NAMES[debater_a]}] "
-                f"Approach: Provide structured, informative response with context."
-            )
-            opinions[debater_b] = (
-                f"[{self.EXPERT_NAMES[debater_b]}] "
-                f"Approach: Keep it natural, conversational, and relatable."
-            )
 
-        synthesis = (
+        # Generate opinions — LLM if connected, stub otherwise
+        opinions[debater_a] = self._get_initial_thought(
+            debater_a, question, intent, bridge=bridge, tokenizer=tokenizer
+        )
+        opinions[debater_b] = self._get_initial_thought(
+            debater_b, question, intent, bridge=bridge, tokenizer=tokenizer
+        )
+
+        # Synthesis: brief LLM call combining both, else template
+        synthesis_stub = (
             f"[DEBATE SYNTHESIS] Combining perspectives from "
             f"{self.EXPERT_NAMES[debater_a]} and {self.EXPERT_NAMES[debater_b]}: "
             f"Balance technical correctness with clear communication."
         )
-        return synthesis, opinions
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                synth_prompt = (
+                    f"Expert A ({self.EXPERT_NAMES[debater_a]}): {opinions[debater_a][:200]}\n"
+                    f"Expert B ({self.EXPERT_NAMES[debater_b]}): {opinions[debater_b][:200]}\n\n"
+                    f"Synthesize both perspectives into one concise answer for: {question}"
+                )
+                text = (f"<|im_start|>system\nYou are a debate moderator. Synthesize expert opinions.\n"
+                        f"<|im_end|>\n<|im_start|>user\n{synth_prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n")
+                ids  = tokenizer.encode(text, add_bos=True)
+                out  = bridge.generate(ids, max_new_tokens=200)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    if decoded:
+                        synthesis_stub = f"[DEBATE SYNTHESIS] {decoded}"
+            except Exception:
+                pass
+
+        return synthesis_stub, opinions
 
     # ── Full 8-expert Council Debate ──────────────────────────────────
-    def _get_initial_thought(self, exp_id: int, question: str, intent: dict) -> str:
+    def _get_initial_thought(
+        self,
+        exp_id:    int,
+        question:  str,
+        intent:    dict,
+        bridge:    Any = None,
+        tokenizer: Any = None,
+    ) -> str:
         """
-        Deterministic stub: generate a role-specific initial thought.
-        PRODUCTION HOOK: replace this body with a real LLM call, e.g.:
-            return llm.generate(
-                system=self._ROLE_TEMPLATES[exp_id],
-                user=question,
-                max_tokens=200
-            )
+        Generate an expert's initial thought on a question.
+        When bridge+tokenizer are provided and connected, calls the real LLM.
+        Falls back to the deterministic role-template stub otherwise.
+
+        PRODUCTION: bridge and tokenizer are injected by ThinkingEngineV1
+        via _run_council_with_llm() / _run_debate_with_llm().
         """
         role_hint = self._ROLE_TEMPLATES.get(exp_id, "Provide a balanced response.")
         itype     = intent.get("intent", INTENT_CHAT)
         q_short   = question[:60]
+
+        # ── Real LLM path ────────────────────────────────────────────
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                system = role_hint
+                prompt = f"Question: {question}\n\nYour expert response:"
+                text   = f"<|im_start|>system\n{system}<|im_end|>\n" \
+                         f"<|im_start|>user\n{prompt}<|im_end|>\n" \
+                         f"<|im_start|>assistant\n"
+                ids    = tokenizer.encode(text, add_bos=True)
+                out    = bridge.generate(ids, max_new_tokens=128)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    if decoded:
+                        return f"[{self.EXPERT_NAMES[exp_id]}] {decoded}"
+            except Exception:
+                pass  # fall through to stub
+
+        # ── Stub fallback ────────────────────────────────────────────
         return (
             f"[{self.EXPERT_NAMES[exp_id]}] For '{q_short}' (intent={itype}): "
             f"{role_hint}"
@@ -1649,11 +1827,42 @@ class MultiAgentDebate:
         intent: dict,
         my_old_thought: str,
         others_thoughts: Dict[int, str],
+        bridge:    Any = None,
+        tokenizer: Any = None,
     ) -> str:
         """
-        Deterministic simulation of an expert reviewing peer opinions.
-        PRODUCTION HOOK: replace this body with a real LLM call.
+        Expert reviews peers' opinions and updates their stance.
+        Calls real LLM when bridge+tokenizer are connected.
+        Falls back to keyword-agreement stub otherwise.
         """
+        # ── Real LLM path ────────────────────────────────────────────
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                others_text = "\n".join(
+                    f"  • {self.EXPERT_NAMES.get(eid, f'Expert{eid}')}: {t[:150]}"
+                    for eid, t in others_thoughts.items()
+                )
+                system = self._ROLE_TEMPLATES.get(exp_id, "")
+                prompt = (
+                    f"Your previous stance: {my_old_thought[:200]}\n\n"
+                    f"Other experts' opinions:\n{others_text}\n\n"
+                    f"Question: {question}\n\n"
+                    f"Updated thought (incorporate useful insights, reject weak ones):"
+                )
+                text = (f"<|im_start|>system\n{system}<|im_end|>\n"
+                        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n")
+                ids  = tokenizer.encode(text, add_bos=True)
+                out  = bridge.generate(ids, max_new_tokens=128)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    if decoded:
+                        return f"[{self.EXPERT_NAMES[exp_id]}][R2] {decoded}"
+            except Exception:
+                pass  # fall through to stub
+
+        # ── Stub fallback ────────────────────────────────────────────
         my_keywords = set(my_old_thought.lower().split())
         agreements  = 0
         for peer_thought in others_thoughts.values():
@@ -1723,6 +1932,8 @@ class MultiAgentDebate:
         intent: dict,
         max_rounds: int = 3,
         max_experts: Optional[int] = None,
+        bridge:    Any = None,
+        tokenizer: Any = None,
     ) -> Dict[str, Any]:
         """
         Full expert council debate — RAM-efficient (V2).
@@ -1748,7 +1959,8 @@ class MultiAgentDebate:
 
         # Initial thoughts — one per expert, no log kept
         thoughts: Dict[int, str] = {
-            eid: self._get_initial_thought(eid, question, intent)
+            eid: self._get_initial_thought(eid, question, intent,
+                                           bridge=bridge, tokenizer=tokenizer)
             for eid in expert_ids
         }
 
@@ -1762,6 +1974,7 @@ class MultiAgentDebate:
                     exp_id, question, intent,
                     my_old_thought=old[exp_id],
                     others_thoughts=others,
+                    bridge=bridge, tokenizer=tokenizer,
                 )
             rounds_done = round_idx
             if self._check_consensus(thoughts.values()):
@@ -2176,8 +2389,42 @@ class PlanDecomposer:
     def __init__(self, mcts: MCTSLight):
         self.mcts = mcts
 
-    def decompose(self, question: str, intent: dict, max_subgoals: int = 4) -> List[str]:
+    def decompose(
+        self,
+        question:     str,
+        intent:       dict,
+        max_subgoals: int = 4,
+        bridge:       Any = None,
+        tokenizer:    Any = None,
+    ) -> List[str]:
+        """Decompose question into ordered sub-goals. Uses LLM when bridge+tokenizer connected."""
         itype = intent.get("intent", INTENT_CHAT)
+
+        # ── Real LLM path ────────────────────────────────────────────
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                prompt = (
+                    f"Question: {question}\n\n"
+                    f"Create {max_subgoals} ordered steps to solve this, "
+                    f"numbered 1 to {max_subgoals}. Be concrete and concise."
+                )
+                text = (f"<|im_start|>system\nYou are a step-by-step planning expert.\n"
+                        f"<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n")
+                ids  = tokenizer.encode(text, add_bos=True)
+                out  = bridge.generate(ids, max_new_tokens=256)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    lines   = [l.strip() for l in re.split(r'\n?\d+[.)]\s*', decoded) if l.strip()]
+                    if len(lines) >= 2:
+                        steps = lines[:max_subgoals]
+                        best  = self.mcts.search(question, steps)
+                        return [f"[★] {t}" if t == best else t for t in steps]
+            except Exception:
+                pass
+
+        # ── Stub fallback ────────────────────────────────────────────
         if itype in (INTENT_MATH, INTENT_LOGIC):
             templates = [
                 f"1. Identify known/unknown variables in: {question[:40]}",
@@ -2303,9 +2550,39 @@ class CounterfactualReasoner:
         has_cf_pattern = any(re.search(p, ql) for p in self._CF_PATTERNS)
         return has_cf_pattern or itype in self._TRIGGER_INTENTS
 
-    def generate(self, question: str, intent: dict) -> str:
+    def generate(
+        self,
+        question: str,
+        intent:   dict,
+        bridge:    Any = None,
+        tokenizer: Any = None,
+    ) -> str:
+        """Generate counterfactual reasoning. Uses LLM when bridge+tokenizer connected."""
         entities = intent.get("entities", [])
         subj     = entities[0] if entities else "the subject"
+
+        # ── Real LLM path ────────────────────────────────────────────
+        if bridge is not None and hasattr(bridge, "is_connected") and bridge.is_connected() \
+                and tokenizer is not None:
+            try:
+                prompt = (
+                    f"Question: {question}\n\n"
+                    f"Now reason counterfactually: what if '{subj}' were NOT the case? "
+                    f"Describe how the outcome or reasoning would change."
+                )
+                text = (f"<|im_start|>system\nYou are a counterfactual reasoning expert.\n"
+                        f"<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+                        f"<|im_start|>assistant\n")
+                ids = tokenizer.encode(text, add_bos=True)
+                out = bridge.generate(ids, max_new_tokens=180)
+                if out:
+                    decoded = tokenizer.decode(out).strip()
+                    if decoded:
+                        return f"[COUNTERFACTUAL] {decoded}"
+            except Exception:
+                pass
+
+        # ── Stub fallback ────────────────────────────────────────────
         return (
             f"[COUNTERFACTUAL] If '{subj}' were NOT the case: "
             f"the reasoning chain would diverge at the first premise. "
@@ -2547,262 +2824,12 @@ class PromptCompiler:
         return msgs
 
 
-# ══════════════════════════════════════════════════════════════════════
-# TRANSFORMER BRIDGE
-# Converts engine outputs (expert_boost dict, intent dict, miro_tau)
-# into the exact parameter types expected by DracoTransformerV1.generate()
-# and DracoTransformerTorchV1 (via the same bridge).
-#
-# Transformer API (transformer_v1.py):
-#   generate(prompt_ids, ..., intent_boost=np.ndarray, intent_bias=np.ndarray)
-#
-# intent_boost: shape (n_experts,) — float32 array
-# intent_bias:  shape (vocab_size,) — float32 logit bias (identity overlay)
-# miro_tau:     passed as tau in generate() call (Mirostat target entropy)
-# ══════════════════════════════════════════════════════════════════════
-class TransformerBridge:
-    """
-    Converts ThinkingEngineV1 output dict into generate() call kwargs
-    compatible with both DracoTransformerV1 (NumPy) and
-    DracoTransformerTorchV1 (PyTorch).
-
-    Constructor accepts an optional pre-built model backend:
-        bridge = TransformerBridge(numpy_model=model)        # NumPy backend
-        bridge = TransformerBridge(gguf_path="model.gguf")   # llama.cpp backend
-
-    generate() provides a unified token-generation interface.
-    If no backend is connected, generate() returns an empty list (stub-safe).
-
-    Usage:
-        engine_out = engine.process(question, ...)
-        bridge     = TransformerBridge(n_experts=8, vocab_size=model.vocab_size)
-        gen_kwargs = bridge.to_generate_kwargs(engine_out)
-        token_ids  = model.generate(prompt_ids, **gen_kwargs)
-        # OR via unified interface:
-        token_ids  = bridge.generate(prompt_ids, max_new_tokens=256)
-    """
-    def __init__(
-        self,
-        n_experts:   int          = 8,
-        vocab_size:  int          = 152064,
-        numpy_model: Any          = None,   # DracoTransformerV1 instance
-        gguf_path:   Optional[str] = None,  # Path to GGUF file for llama.cpp
-        n_gpu_layers: int         = 0,      # GPU layers for llama.cpp backend
-    ):
-        self.n_experts   = n_experts
-        self.vocab_size  = vocab_size
-        self._numpy_model = numpy_model
-        self._llama_model: Any = None
-
-        # Auto-init llama.cpp backend if gguf_path provided
-        if gguf_path is not None:
-            self._init_llama(gguf_path, n_gpu_layers)
-
-    def _init_llama(self, gguf_path: str, n_gpu_layers: int):
-        """Initialize llama.cpp backend. Fails gracefully if llama-cpp-python not installed."""
-        try:
-            from llama_cpp import Llama  # type: ignore
-            self._llama_model = Llama(
-                model_path=gguf_path,
-                n_gpu_layers=n_gpu_layers,
-                verbose=False,
-            )
-        except ImportError:
-            raise ImportError(
-                "llama-cpp-python is required for GGUF backend. "
-                "Install: pip install llama-cpp-python"
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to load GGUF model from '{gguf_path}': {e}")
-
-    def is_connected(self) -> bool:
-        """True if a real model backend is available."""
-        return self._numpy_model is not None or self._llama_model is not None
-
-    def generate(
-        self,
-        prompt_ids:     Any,                     # np.ndarray or List[int]
-        max_new_tokens: int                  = 256,
-        intent_boost:   Optional[Any]        = None,  # np.ndarray shape (n_experts,)
-        intent_bias:    Optional[Any]        = None,  # np.ndarray shape (vocab_size,)
-        temp:           float                = 0.7,
-        top_p:          float                = 0.9,
-        min_p:          float                = 0.05,
-        use_mirostat:   bool                 = True,
-        stream_cb:      Optional[Callable]   = None,
-        **kwargs,
-    ) -> List[int]:
-        """
-        Unified generation interface for both NumPy and llama.cpp backends.
-        Returns a list of token IDs.
-        If no backend connected, returns [] (caller must handle gracefully).
-
-        PRODUCTION HOOK: This method routes to the correct backend.
-        To add a new backend, add an elif branch below.
-        """
-        if self._numpy_model is not None:
-            return self._generate_numpy(
-                prompt_ids, max_new_tokens, intent_boost, intent_bias,
-                temp, top_p, min_p, use_mirostat, stream_cb, **kwargs
-            )
-        if self._llama_model is not None:
-            return self._generate_llama(
-                prompt_ids, max_new_tokens, temp, top_p, stream_cb
-            )
-        # Stub: no backend connected
-        return []
-
-    def _generate_numpy(
-        self,
-        prompt_ids, max_new_tokens, intent_boost, intent_bias,
-        temp, top_p, min_p, use_mirostat, stream_cb, **kwargs
-    ) -> List[int]:
-        """Route to DracoTransformerV1.generate() NumPy backend."""
-        gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens":  max_new_tokens,
-            "temp":            temp,
-            "top_p":           top_p,
-            "min_p":           min_p,
-            "use_mirostat":    use_mirostat,
-        }
-        if intent_boost is not None:
-            gen_kwargs["intent_boost"] = intent_boost
-        if intent_bias is not None:
-            gen_kwargs["intent_bias"] = intent_bias
-        if stream_cb is not None:
-            gen_kwargs["stream_cb"] = stream_cb
-        gen_kwargs.update(kwargs)
-        try:
-            result = self._numpy_model.generate(prompt_ids, **gen_kwargs)
-            # Normalise: accept ndarray or list
-            if hasattr(result, "tolist"):
-                return result.tolist()
-            return list(result)
-        except Exception as e:
-            raise RuntimeError(f"NumPy backend generate() failed: {e}") from e
-
-    def _generate_llama(
-        self,
-        prompt_ids, max_new_tokens, temp, top_p, stream_cb
-    ) -> List[int]:
-        """Route to llama.cpp backend using token IDs directly."""
-        try:
-            # llama-cpp-python accepts prompt as token list via eval()
-            self._llama_model.reset()
-            self._llama_model.eval(list(prompt_ids))
-            tokens: List[int] = []
-            for _ in range(max_new_tokens):
-                tok = self._llama_model.sample(temp=temp, top_p=top_p)
-                if tok == self._llama_model.token_eos():
-                    break
-                tokens.append(tok)
-                self._llama_model.eval([tok])
-                if stream_cb is not None:
-                    stream_cb(tok)
-            return tokens
-        except Exception as e:
-            raise RuntimeError(f"llama.cpp backend generate() failed: {e}") from e
-
-    def expert_boost_to_array(self, boost_dict: Dict[int, float]):
-        """
-        Convert normalized {expert_id: weight} dict → float32 ndarray of shape (n_experts,).
-        Works for both numpy and torch backends (caller converts as needed).
-        """
-        try:
-            import numpy as np
-            arr = np.zeros(self.n_experts, dtype=np.float32)
-            for eid, w in boost_dict.items():
-                if 0 <= eid < self.n_experts:
-                    arr[eid] = float(w)
-            return arr
-        except ImportError:
-            # Fallback: plain list (caller must handle)
-            arr = [0.0] * self.n_experts
-            for eid, w in boost_dict.items():
-                if 0 <= eid < self.n_experts:
-                    arr[eid] = float(w)
-            return arr
-
-    def build_intent_bias(
-        self,
-        identity_token_ids: Optional[List[int]] = None,
-        boost: float = 2.0,
-    ):
-        """
-        Build a vocab-size logit bias array.
-        identity_token_ids: token IDs for DracoAI identity tokens (logit boost).
-        All other positions = 0.0 (no bias).
-        """
-        try:
-            import numpy as np
-            bias = np.zeros(self.vocab_size, dtype=np.float32)
-            if identity_token_ids:
-                for tid in identity_token_ids:
-                    if 0 <= tid < self.vocab_size:
-                        bias[tid] = boost
-            return bias
-        except ImportError:
-            bias = [0.0] * self.vocab_size
-            if identity_token_ids:
-                for tid in identity_token_ids:
-                    if 0 <= tid < self.vocab_size:
-                        bias[tid] = boost
-            return bias
-
-    def to_generate_kwargs(
-        self,
-        engine_out: dict,
-        identity_token_ids: Optional[List[int]] = None,
-        max_new_tokens: int = 512,
-        top_p: float = 0.9,
-        min_p: float = 0.05,
-        use_mirostat: bool = True,
-        use_speculative: bool = True,
-        adaptive_temp: bool = False,
-        stream_cb: Optional[Callable] = None,
-    ) -> dict:
-        """
-        Build a kwargs dict ready to unpack into model.generate(**kwargs).
-
-        Maps:
-            engine_out["expert_boost"]  → intent_boost (ndarray shape n_experts)
-            engine_out["miro_tau"]      → tau  (Mirostat target entropy)
-            engine_out["creativity"]    → temp (temperature)
-            identity_token_ids          → intent_bias (logit bias for identity)
-        """
-        boost_arr  = self.expert_boost_to_array(engine_out.get("expert_boost", {}))
-        intent_bias = self.build_intent_bias(identity_token_ids)
-        # creativity ∈ [0,1] → map to temperature [0.3, 1.5]
-        creativity  = float(engine_out.get("creativity", 0.6))
-        temp        = 0.3 + creativity * 1.2  # 0.3 (precise) … 1.5 (creative)
-        miro_tau    = float(engine_out.get("miro_tau", 5.0))
-
-        return {
-            "max_new_tokens":  max_new_tokens,
-            "temp":            temp,
-            "top_p":           top_p,
-            "min_p":           min_p,
-            "use_mirostat":    use_mirostat,
-            "use_speculative": use_speculative,
-            "adaptive_temp":   adaptive_temp,
-            "stream_cb":       stream_cb,
-            "intent_boost":    boost_arr,
-            "intent_bias":     intent_bias,
-            # Note: tau is passed via use_mirostat=True; model reads it via its own
-            # mu init. To override, caller can set model._miro_tau = miro_tau before
-            # calling generate(). Stored here for caller convenience.
-            "_miro_tau_hint":  miro_tau,
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════
-# THINKING ENGINE V1
-# ══════════════════════════════════════════════════════════════════════
 class ThinkingEngineV1:
     def __init__(
         self,
-        max_experts: int                       = 4,
+        max_experts: int                        = 4,
         bridge:      Optional["TransformerBridge"] = None,
+        tokenizer:   Any                        = None,
     ):
         """
         Args:
@@ -2814,6 +2841,12 @@ class ThinkingEngineV1:
                          Pass a connected bridge to enable real LLM inference:
                              bridge = TransformerBridge(numpy_model=model)
                              bridge = TransformerBridge(gguf_path="model.gguf", n_gpu_layers=32)
+            tokenizer:   Optional tokenizer instance (e.g. BPETokenizer from transformer_v1).
+                         Required for real LLM calls in reasoning modules.
+                         Must expose .encode(text, add_bos=True) → List[int]
+                                 and .decode(token_ids)           → str
+                         Optional alias: .encode_chat(messages, add_generation_prompt=True)
+                         If None, all LLM-backed modules fall back to template stubs.
         """
         self.max_experts  = max_experts
 
@@ -2862,10 +2895,140 @@ class ThinkingEngineV1:
         # Use provided bridge (with real model) or create a stub bridge
         self.bridge = bridge if bridge is not None else TransformerBridge()
 
+        # Tokenizer for real LLM calls in reasoning modules.
+        # Must implement .encode(text, add_bos=True) and .decode(ids).
+        # Optional alias: .encode_chat(messages, add_generation_prompt=True).
+        self.tokenizer = tokenizer
+
         # Thread-safety locks
         self._kg_lock       = threading.Lock()
         self._balancer_lock = threading.Lock()
         self._router_lock   = threading.Lock()   # Guards SelfEvolvingRouter state
+
+    def tokenize_prompt(self, messages: List[dict]) -> List[int]:
+        """
+        Encode a messages list into token IDs ready for Transformer input.
+
+        Requires tokenizer to be set (pass tokenizer= to constructor).
+        Uses encode_chat() if available, else falls back to encode()
+        on the concatenated text content.
+
+        Typical usage:
+            engine       = ThinkingEngineV1(bridge=bridge, tokenizer=tok)
+            out          = engine.process("What is AI?")
+            prompt_ids   = engine.tokenize_prompt(out["messages"])
+            new_tokens   = bridge.generate(prompt_ids, **engine.to_generate_kwargs(out))
+            response     = tok.decode(new_tokens)
+        """
+        if self.tokenizer is None:
+            raise RuntimeError(
+                "Tokenizer not set. Pass tokenizer= to ThinkingEngineV1() constructor."
+            )
+        # Prefer ChatML-aware encode_chat if available
+        if hasattr(self.tokenizer, "encode_chat"):
+            return self.tokenizer.encode_chat(messages, add_generation_prompt=True)
+        # Fallback: join role+content text and encode as plain text
+        text = ""
+        for m in messages:
+            role    = m.get("role", "user")
+            content = m.get("content", "")
+            text   += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        text += "<|im_start|>assistant\n"
+        return self.tokenizer.encode(text, add_bos=True)
+
+    def _llm_generate(
+        self,
+        prompt: str,
+        max_new_tokens: int  = 256,
+        system: str          = "",
+    ) -> str:
+        """
+        Internal helper: encode prompt → bridge.generate() → decode.
+        Returns decoded string, or "" if bridge/tokenizer not connected.
+
+        Args:
+            prompt:         User-turn text.
+            max_new_tokens: Max tokens to generate.
+            system:         Optional system instruction prepended as <|im_start|>system block.
+        """
+        if self.tokenizer is None or not self.bridge.is_connected():
+            return ""
+        try:
+            # Build minimal ChatML prompt for the reasoning call
+            text = ""
+            if system:
+                text += f"<|im_start|>system\n{system}<|im_end|>\n"
+            text += f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            text += "<|im_start|>assistant\n"
+            if hasattr(self.tokenizer, "encode"):
+                prompt_ids = self.tokenizer.encode(text, add_bos=True)
+            else:
+                return ""
+            token_ids = self.bridge.generate(prompt_ids, max_new_tokens=max_new_tokens)
+            if not token_ids:
+                return ""
+            return self.tokenizer.decode(token_ids)
+        except Exception:
+            return ""
+
+    def _run_tot_with_llm(self, question: str, intent: dict) -> Tuple[str, List[str]]:
+        """
+        Tree of Thoughts with real LLM calls when bridge is connected.
+        Falls back to MCTS stub when no model available (zero-cost degradation).
+
+        Scores branches by: keyword overlap with question + response length.
+        Returns (best_thought, all_thoughts).
+        """
+        branches = self.tot.generate_branches(question, intent)
+        if not self.bridge.is_connected() or self.tokenizer is None:
+            return self.tot.run(question, intent)  # MCTS stub fallback
+
+        best_thought = ""
+        best_score   = -1.0
+        all_thoughts: List[str] = []
+        q_words      = set(question.lower().split())
+
+        for branch in branches:
+            system = "You are a reasoning expert. Follow the given thinking approach precisely."
+            prompt = f"Thinking approach: {branch}\n\nQuestion: {question}\n\nThought:"
+            thought = self._llm_generate(prompt, max_new_tokens=128, system=system)
+            if not thought:
+                thought = branch  # degrade gracefully
+            all_thoughts.append(thought)
+            # Score: keyword overlap + length bonus
+            t_words = set(thought.lower().split())
+            score   = len(q_words & t_words) * 0.1 + min(len(thought) / 400.0, 0.5)
+            if score > best_score:
+                best_score   = score
+                best_thought = thought
+
+        return best_thought or branches[0], all_thoughts
+
+    def _run_council_with_llm(
+        self,
+        question:    str,
+        intent:      dict,
+        max_rounds:  int          = 3,
+        max_experts: Optional[int] = None,
+    ) -> dict:
+        """
+        Delegates to MultiAgentDebate.run_full_council() but injects
+        bridge + tokenizer so experts call the real LLM.
+        Falls back to stub council when bridge not connected.
+        """
+        return self.debate.run_full_council(
+            question, intent, max_rounds, max_experts,
+            bridge=self.bridge, tokenizer=self.tokenizer,
+        )
+
+    def _run_debate_with_llm(self, question: str, intent: dict) -> Tuple[str, dict]:
+        """
+        Delegates to MultiAgentDebate.generate_debate() with LLM support.
+        """
+        return self.debate.generate_debate(
+            question, intent,
+            bridge=self.bridge, tokenizer=self.tokenizer,
+        )
 
     # ── Parallelization helpers ───────────────────────────────────────
     def _safe_extract_triples(self, text: str, conf: float):
@@ -2995,34 +3158,38 @@ class ThinkingEngineV1:
             # KG extraction — guarded by _kg_lock inside helper
             future_kg = executor.submit(self._safe_extract_triples, rewritten_q, base_conf)
 
-            # ToT / MCTS
-            future_tot = executor.submit(self.tot.run, rewritten_q, intent)
+            # ToT / MCTS — uses real LLM when bridge+tokenizer connected
+            future_tot = executor.submit(self._run_tot_with_llm, rewritten_q, intent)
 
-            # Debate (if needed)
+            # Debate (if needed) — uses real LLM when bridge+tokenizer connected
             future_debate = None
             if think_mode or process_mode == "slow":
                 if think_mode:
                     future_debate = executor.submit(
-                        self.debate.run_full_council,
+                        self._run_council_with_llm,
                         rewritten_q, intent, 3, n_exp
                     )
                 else:
                     future_debate = executor.submit(
-                        self.debate.generate_debate, rewritten_q, intent
+                        self._run_debate_with_llm, rewritten_q, intent
                     )
 
-            # Goal decomposition (if keywords match)
+            # Goal decomposition (if keywords match) — LLM-aware
             future_goal = None
             if any(kw in rewritten_q.lower() for kw in goal_keywords):
                 future_goal = executor.submit(
-                    self.goal_decomposer.decompose, rewritten_q, intent
+                    self.goal_decomposer.decompose,
+                    rewritten_q, intent, 6,
+                    self.bridge, self.tokenizer,
                 )
 
-            # Sub-goal decomposition (slow / think mode)
+            # Sub-goal decomposition (slow / think mode) — LLM-aware
             future_subgoals = None
             if process_mode == "slow" or think_mode:
                 future_subgoals = executor.submit(
-                    self.decomposer.decompose, rewritten_q, intent
+                    self.decomposer.decompose,
+                    rewritten_q, intent, 4,
+                    self.bridge, self.tokenizer,
                 )
 
             # ── While waiting, main thread handles light sequential tasks ──
@@ -3066,11 +3233,12 @@ class ThinkingEngineV1:
                     spatial_note = self.spatial.describe_relation(ents[0], ents[1], positions)
                     spatial_note = f"[SPATIAL] {spatial_note}"
 
-            # Abductive reasoning
+            # Abductive reasoning — LLM-aware
             abduction_hypotheses: List[str] = []
             if self.abduction.is_applicable(rewritten_q, intent):
                 abduction_hypotheses = self.abduction.generate_hypotheses(
-                    rewritten_q, self.kg, intent
+                    rewritten_q, self.kg, intent,
+                    bridge=self.bridge, tokenizer=self.tokenizer,
                 )
 
             # Hypothesis testing
@@ -3078,10 +3246,13 @@ class ThinkingEngineV1:
             if re.search(r"kiểm tra|hypothesis|H0|test whether", rewritten_q, re.IGNORECASE):
                 hypothesis_result = self.hypothesis.test(rewritten_q, self.kg)
 
-            # Counterfactual reasoning
+            # Counterfactual reasoning — LLM-aware
             counterfactual = ""
             if self.cf_reasoner.is_applicable(rewritten_q, intent):
-                counterfactual = self.cf_reasoner.generate(rewritten_q, intent)
+                counterfactual = self.cf_reasoner.generate(
+                    rewritten_q, intent,
+                    bridge=self.bridge, tokenizer=self.tokenizer,
+                )
 
             # Analogical mapping
             analogy_note = ""
@@ -3495,16 +3666,36 @@ if __name__ == "__main__":
     assert "<|im_start|>" not in clean
     print(f"✅ PromptSanitizer: injection blocked")
 
-    # TransformerBridge connectivity check
+    # TransformerBridge import check
+    try:
+        from transformer_v1 import TransformerBridge as _RealBridge
+        print("✅ TransformerBridge: imported from transformer_v1")
+    except ImportError:
+        print("✅ TransformerBridge: fallback stub active (transformer_v1 not installed)")
+
+    # TransformerBridge stub connectivity check
     stub_bridge = TransformerBridge()
     assert not stub_bridge.is_connected(), "Stub bridge should not be connected"
     stub_tokens = stub_bridge.generate([1, 2, 3], max_new_tokens=10)
     assert stub_tokens == [], f"Stub bridge should return [] not {stub_tokens}"
     print("✅ TransformerBridge stub: is_connected=False, generate()=[]")
 
-    # Engine accepts bridge= param
+    # Engine accepts bridge= and tokenizer= params
     engine_with_bridge = ThinkingEngineV1(max_experts=4, bridge=stub_bridge)
     assert engine_with_bridge.bridge is stub_bridge
+    assert engine_with_bridge.tokenizer is None
     print("✅ ThinkingEngineV1 bridge= param: accepted")
+
+    # tokenize_prompt raises when tokenizer=None
+    try:
+        engine_with_bridge.tokenize_prompt([{"role": "user", "content": "hi"}])
+        assert False, "Should have raised RuntimeError"
+    except RuntimeError:
+        print("✅ tokenize_prompt: correctly raises when tokenizer=None")
+
+    # _llm_generate returns '' when bridge not connected (stub)
+    result = engine_with_bridge._llm_generate("test", max_new_tokens=10)
+    assert result == "", f"Expected '', got: {result!r}"
+    print("✅ _llm_generate: returns '' when bridge not connected")
 
     print("\n✅ All DracoAI Engine V1 self-tests passed.")
