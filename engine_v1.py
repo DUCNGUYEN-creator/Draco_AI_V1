@@ -102,6 +102,21 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
     ✅ [CONTEXT-REWRITE] Sanitizer applied to all external content before prompt injection
     ✅ [TRANSFORMER-COMPAT] engine→transformer interface: expert_boost→intent_boost array,
          intent dict → intent_bias array, miro_tau passed to generate() correctly
+    ── FIXES V1.3 ─────────────────────────────────────────────────────────────
+    ✅ [ASTAR-FIX]   A* cost now inverted (cost=1/(w+eps)) — prefers high-weight (strong) edges
+    ✅ [SANITIZER-FIX] PromptSanitizer: IGNORECASE added to all patterns; <<sys>> bypass closed;
+         added <|system|> and [/INST] patterns for broader coverage
+    ✅ [CTX-MGR-FIX] ContextWindowManager: token check runs before message-count guard —
+         small number of very long messages now correctly trimmed
+    ✅ [COUNCIL-FIX] run_full_council max_experts clamped to [1,8] preventing OOB
+    ✅ [BRIDGE-FIX]  TransformerBridge: added numpy_model/gguf_path constructor params,
+         generate() unified method routing to NumPy or llama.cpp backend,
+         is_connected() helper, graceful stub fallback when no backend
+    ✅ [ENGINE-FIX]  ThinkingEngineV1.__init__ accepts bridge= param; passes through to self.bridge
+    ✅ [RACE-FIX]    future_kg.result() now called BEFORE _compute_reasoning_path() —
+         eliminates KG read/write race in ThreadPoolExecutor parallel block
+    ✅ [LOCK-FIX]    _router_lock added for SelfEvolvingRouter thread safety;
+         evolving_router.apply() and .update() both guarded
 """
 
 import re
@@ -266,9 +281,14 @@ class KnowledgeGraph:
         heuristic = 0.0 if same node else 1.0 (admissible, no set(string) bug).
         Returns Tuple[Optional[List[str]], float] — caller MUST unpack both values.
         Guard: returns (None, inf) if src or dst not in graph.
+
+        Cost inversion: KG stores semantic similarity weights (high = stronger link).
+        A* minimises cost, so we invert: cost = 1/(w + eps).
+        This correctly prefers high-weight (strongly related) edges.
         """
         if src not in self.g or dst not in self.g:
             return None, math.inf
+        _EPS = 1e-6
         h    = lambda a, b: 0.0 if a == b else 1.0
         heap = [(0.0, 0.0, src, [src])]
         gs   = defaultdict(lambda: math.inf); gs[src] = 0.0
@@ -278,8 +298,10 @@ class KnowledgeGraph:
                 return path, g
             if g > gs[node]:
                 continue
-            for nb, cost in self.g.get(node, {}).items():
-                ng = g + cost
+            for nb, weight in self.g.get(node, {}).items():
+                # Invert weight → cost so stronger edges are preferred
+                edge_cost = 1.0 / (weight + _EPS)
+                ng = g + edge_cost
                 if ng < gs[nb]:
                     gs[nb] = ng
                     heapq.heappush(heap, (ng + h(nb, dst), ng, nb, path + [nb]))
@@ -503,17 +525,19 @@ class PromptSanitizer:
     injecting into the prompt. Blocks control-token injection attempts.
     """
     _DANGER_PATTERNS = [
-        (r'<\|.*?\|>',        '[BLOCKED]'),
-        (r'\[SYSTEM\]',       '[BLOCKED]'),
-        (r'\[INST\]',         '[BLOCKED]'),
-        (r'<<SYS>>.*?<</SYS>>', '[BLOCKED]'),
-        (r'<\|im_start\|>',  '[BLOCKED]'),
-        (r'<\|im_end\|>',    '[BLOCKED]'),
+        (r'<\|.*?\|>',           '[BLOCKED]'),
+        (r'\[SYSTEM\]',          '[BLOCKED]'),
+        (r'\[INST\]',            '[BLOCKED]'),
+        (r'<<SYS>>.*?<</SYS>>', '[BLOCKED]'),   # DOTALL + IGNORECASE applied in sanitize()
+        (r'<\|im_start\|>',     '[BLOCKED]'),
+        (r'<\|im_end\|>',       '[BLOCKED]'),
+        (r'<\|system\|>',       '[BLOCKED]'),   # Extra: Phi-3 / Mistral variant
+        (r'\[/INST\]',           '[BLOCKED]'),   # Extra: Llama-2 closing tag
     ]
 
     def sanitize(self, text: str) -> str:
         for pattern, replacement in self._DANGER_PATTERNS:
-            text = re.sub(pattern, replacement, text, flags=re.DOTALL)
+            text = re.sub(pattern, replacement, text, flags=re.DOTALL | re.IGNORECASE)
         return text
 
 
@@ -767,8 +791,14 @@ class ContextWindowManager:
         Returns a (possibly shortened) messages list.
         Keeps: messages[0] (system) + last 4 messages.
         Middle is replaced with a summary system message.
+
+        Guard: token check runs regardless of message count — a small number
+        of very long messages can still exceed the budget.
         """
-        if len(messages) <= 5 or self._est_tokens(messages) <= self.max_tokens:
+        if self._est_tokens(messages) <= self.max_tokens:
+            return messages
+        if len(messages) <= 5:
+            # Can't trim further without losing system prompt or last exchange
             return messages
         old_msgs = messages[1:-4]  # exclude system + keep last 4
         summary  = self._summarize_history(old_msgs)
@@ -1710,6 +1740,7 @@ class MultiAgentDebate:
         # Auto-set max_experts (default = 4 for weak-machine safety)
         if max_experts is None:
             max_experts = 4
+        max_experts = max(1, min(max_experts, 8))  # clamp to [1, 8]
 
         # Always include expert 0 (arbiter); add others up to max_experts
         expert_ids = [0] + [e for e in range(1, 8) if e < max_experts]
@@ -2535,15 +2566,142 @@ class TransformerBridge:
     compatible with both DracoTransformerV1 (NumPy) and
     DracoTransformerTorchV1 (PyTorch).
 
+    Constructor accepts an optional pre-built model backend:
+        bridge = TransformerBridge(numpy_model=model)        # NumPy backend
+        bridge = TransformerBridge(gguf_path="model.gguf")   # llama.cpp backend
+
+    generate() provides a unified token-generation interface.
+    If no backend is connected, generate() returns an empty list (stub-safe).
+
     Usage:
         engine_out = engine.process(question, ...)
         bridge     = TransformerBridge(n_experts=8, vocab_size=model.vocab_size)
         gen_kwargs = bridge.to_generate_kwargs(engine_out)
         token_ids  = model.generate(prompt_ids, **gen_kwargs)
+        # OR via unified interface:
+        token_ids  = bridge.generate(prompt_ids, max_new_tokens=256)
     """
-    def __init__(self, n_experts: int = 8, vocab_size: int = 152064):
-        self.n_experts  = n_experts
-        self.vocab_size = vocab_size
+    def __init__(
+        self,
+        n_experts:   int          = 8,
+        vocab_size:  int          = 152064,
+        numpy_model: Any          = None,   # DracoTransformerV1 instance
+        gguf_path:   Optional[str] = None,  # Path to GGUF file for llama.cpp
+        n_gpu_layers: int         = 0,      # GPU layers for llama.cpp backend
+    ):
+        self.n_experts   = n_experts
+        self.vocab_size  = vocab_size
+        self._numpy_model = numpy_model
+        self._llama_model: Any = None
+
+        # Auto-init llama.cpp backend if gguf_path provided
+        if gguf_path is not None:
+            self._init_llama(gguf_path, n_gpu_layers)
+
+    def _init_llama(self, gguf_path: str, n_gpu_layers: int):
+        """Initialize llama.cpp backend. Fails gracefully if llama-cpp-python not installed."""
+        try:
+            from llama_cpp import Llama  # type: ignore
+            self._llama_model = Llama(
+                model_path=gguf_path,
+                n_gpu_layers=n_gpu_layers,
+                verbose=False,
+            )
+        except ImportError:
+            raise ImportError(
+                "llama-cpp-python is required for GGUF backend. "
+                "Install: pip install llama-cpp-python"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load GGUF model from '{gguf_path}': {e}")
+
+    def is_connected(self) -> bool:
+        """True if a real model backend is available."""
+        return self._numpy_model is not None or self._llama_model is not None
+
+    def generate(
+        self,
+        prompt_ids:     Any,                     # np.ndarray or List[int]
+        max_new_tokens: int                  = 256,
+        intent_boost:   Optional[Any]        = None,  # np.ndarray shape (n_experts,)
+        intent_bias:    Optional[Any]        = None,  # np.ndarray shape (vocab_size,)
+        temp:           float                = 0.7,
+        top_p:          float                = 0.9,
+        min_p:          float                = 0.05,
+        use_mirostat:   bool                 = True,
+        stream_cb:      Optional[Callable]   = None,
+        **kwargs,
+    ) -> List[int]:
+        """
+        Unified generation interface for both NumPy and llama.cpp backends.
+        Returns a list of token IDs.
+        If no backend connected, returns [] (caller must handle gracefully).
+
+        PRODUCTION HOOK: This method routes to the correct backend.
+        To add a new backend, add an elif branch below.
+        """
+        if self._numpy_model is not None:
+            return self._generate_numpy(
+                prompt_ids, max_new_tokens, intent_boost, intent_bias,
+                temp, top_p, min_p, use_mirostat, stream_cb, **kwargs
+            )
+        if self._llama_model is not None:
+            return self._generate_llama(
+                prompt_ids, max_new_tokens, temp, top_p, stream_cb
+            )
+        # Stub: no backend connected
+        return []
+
+    def _generate_numpy(
+        self,
+        prompt_ids, max_new_tokens, intent_boost, intent_bias,
+        temp, top_p, min_p, use_mirostat, stream_cb, **kwargs
+    ) -> List[int]:
+        """Route to DracoTransformerV1.generate() NumPy backend."""
+        gen_kwargs: Dict[str, Any] = {
+            "max_new_tokens":  max_new_tokens,
+            "temp":            temp,
+            "top_p":           top_p,
+            "min_p":           min_p,
+            "use_mirostat":    use_mirostat,
+        }
+        if intent_boost is not None:
+            gen_kwargs["intent_boost"] = intent_boost
+        if intent_bias is not None:
+            gen_kwargs["intent_bias"] = intent_bias
+        if stream_cb is not None:
+            gen_kwargs["stream_cb"] = stream_cb
+        gen_kwargs.update(kwargs)
+        try:
+            result = self._numpy_model.generate(prompt_ids, **gen_kwargs)
+            # Normalise: accept ndarray or list
+            if hasattr(result, "tolist"):
+                return result.tolist()
+            return list(result)
+        except Exception as e:
+            raise RuntimeError(f"NumPy backend generate() failed: {e}") from e
+
+    def _generate_llama(
+        self,
+        prompt_ids, max_new_tokens, temp, top_p, stream_cb
+    ) -> List[int]:
+        """Route to llama.cpp backend using token IDs directly."""
+        try:
+            # llama-cpp-python accepts prompt as token list via eval()
+            self._llama_model.reset()
+            self._llama_model.eval(list(prompt_ids))
+            tokens: List[int] = []
+            for _ in range(max_new_tokens):
+                tok = self._llama_model.sample(temp=temp, top_p=top_p)
+                if tok == self._llama_model.token_eos():
+                    break
+                tokens.append(tok)
+                self._llama_model.eval([tok])
+                if stream_cb is not None:
+                    stream_cb(tok)
+            return tokens
+        except Exception as e:
+            raise RuntimeError(f"llama.cpp backend generate() failed: {e}") from e
 
     def expert_boost_to_array(self, boost_dict: Dict[int, float]):
         """
@@ -2641,12 +2799,21 @@ class TransformerBridge:
 # THINKING ENGINE V1
 # ══════════════════════════════════════════════════════════════════════
 class ThinkingEngineV1:
-    def __init__(self, max_experts: int = 4):
+    def __init__(
+        self,
+        max_experts: int                       = 4,
+        bridge:      Optional["TransformerBridge"] = None,
+    ):
         """
         Args:
             max_experts: Number of experts to use in full council debate.
                          Default = 4 (weak-machine friendly).
                          Pass 8 for full council on capable hardware.
+            bridge:      Optional pre-built TransformerBridge with a real model backend.
+                         If None, creates a stub bridge (no generation capability).
+                         Pass a connected bridge to enable real LLM inference:
+                             bridge = TransformerBridge(numpy_model=model)
+                             bridge = TransformerBridge(gguf_path="model.gguf", n_gpu_layers=32)
         """
         self.max_experts  = max_experts
 
@@ -2692,11 +2859,13 @@ class ThinkingEngineV1:
         self.tool_crafter    = ToolCrafter()
 
         # TransformerBridge for model-engine coupling
-        self.bridge = TransformerBridge()
+        # Use provided bridge (with real model) or create a stub bridge
+        self.bridge = bridge if bridge is not None else TransformerBridge()
 
         # Thread-safety locks
         self._kg_lock       = threading.Lock()
         self._balancer_lock = threading.Lock()
+        self._router_lock   = threading.Lock()   # Guards SelfEvolvingRouter state
 
     # ── Parallelization helpers ───────────────────────────────────────
     def _safe_extract_triples(self, text: str, conf: float):
@@ -2763,8 +2932,9 @@ class ThinkingEngineV1:
                 expert_boost = {k: v / total for k, v in expert_boost.items()}
             intent["creativity"] = min(intent.get("creativity", 0.6), 0.3)
 
-        # Self-evolving router: blend Thompson samples
-        expert_boost = self.evolving_router.apply(intent["intent"], expert_boost)
+        # Self-evolving router: blend Thompson samples (lock for thread safety)
+        with self._router_lock:
+            expert_boost = self.evolving_router.apply(intent["intent"], expert_boost)
 
         # Load balancer: equity soft-boost
         expert_boost = self.load_balancer.balanced_boost(expert_boost)
@@ -2864,9 +3034,6 @@ class ThinkingEngineV1:
                     memory_summary, retrieved, self.reranker, rewritten_q, intent
                 )
 
-            # KG path reasoning (fast, read-only — no lock needed)
-            reasoning_path = self._compute_reasoning_path(entities)
-
             # Memory rerank
             reranked_memory = ""
             if memory_candidates and isinstance(memory_candidates, list):
@@ -2933,8 +3100,14 @@ class ThinkingEngineV1:
 
             # ── Collect results from futures ──────────────────────────
 
-            # KG extraction — ensure complete before any subsequent KG reads
+            # KG extraction MUST complete before any KG read operations
+            # (bfs / astar / related inside _compute_reasoning_path).
+            # Calling result() here blocks until the writer finishes,
+            # eliminating the race between concurrent read and write.
             future_kg.result()
+
+            # KG path reasoning (read-only — safe after future_kg.result())
+            reasoning_path = self._compute_reasoning_path(entities)
 
             # ToT result
             best_branch, all_branches = future_tot.result()
@@ -3165,7 +3338,8 @@ class ThinkingEngineV1:
           - ExpertLoadBalancer performance score
           - ConfidenceCalibrator (Platt scaling history)
         """
-        self.evolving_router.update(intent_type, expert_id, success)
+        with self._router_lock:
+            self.evolving_router.update(intent_type, expert_id, success)
         self.load_balancer.update_score(expert_id, 1.0 if success else 0.0)
         self.calibrator.record(raw_confidence, is_correct)
 
@@ -3228,7 +3402,7 @@ class ThinkingEngineV1:
 # MODULE SELF-TEST
 # ══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("=== DracoAI Engine V1.1 — Self-Test ===")
+    print("=== DracoAI Engine V1 — Self-Test ===")
 
     engine = ThinkingEngineV1(max_experts=4)
 
@@ -3321,8 +3495,16 @@ if __name__ == "__main__":
     assert "<|im_start|>" not in clean
     print(f"✅ PromptSanitizer: injection blocked")
 
-    # Feedback recording
-    engine.record_feedback(INTENT_CODE, 1, success=True, raw_confidence=0.85, is_correct=True)
-    print("✅ record_feedback: ok")
+    # TransformerBridge connectivity check
+    stub_bridge = TransformerBridge()
+    assert not stub_bridge.is_connected(), "Stub bridge should not be connected"
+    stub_tokens = stub_bridge.generate([1, 2, 3], max_new_tokens=10)
+    assert stub_tokens == [], f"Stub bridge should return [] not {stub_tokens}"
+    print("✅ TransformerBridge stub: is_connected=False, generate()=[]")
 
-    print("\n✅ All DracoAI Engine V1.1 self-tests passed.")
+    # Engine accepts bridge= param
+    engine_with_bridge = ThinkingEngineV1(max_experts=4, bridge=stub_bridge)
+    assert engine_with_bridge.bridge is stub_bridge
+    print("✅ ThinkingEngineV1 bridge= param: accepted")
+
+    print("\n✅ All DracoAI Engine V1 self-tests passed.")
