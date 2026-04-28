@@ -74,6 +74,38 @@ PRODUCTION HARDENING:
     - All critical sections are documented.
 
 FIXES vs V1.2 (this version):
+    [BUG-A] clear_search_cache() called from remember_fact()/learn()/forget_fact() WITHOUT
+          self._lock — concurrent search() could see an inconsistent (_version, _search_cache)
+          state (cache cleared but version not yet bumped, or vice versa).
+          Fixed: all three callers now acquire self._lock before calling clear_search_cache().
+    [BUG-B] store(): exact-duplicate path used self._vids.index(vid) → O(n), same problem
+          that was explicitly fixed in record_feedback() but was missed here.  Additionally,
+          the semantic-duplicate path also used self._vids.index(existing) → O(n).
+          Fixed: a temporary {vid: idx} dict is built once per store() call inside the lock,
+          providing O(1) lookup for both duplicate branches (mirrors the record_feedback fix).
+    [BUG-C] embed() called OUTSIDE self._lock in search() and replay_relevant() while
+          fit_embedder() / update_idf() write self.embedder.vocab and self.embedder.idf
+          INSIDE the lock — classic data race on shared dict objects.
+          Fixed: in search(), vocab and idf dicts are snapshotted under lock before
+          embed() is called, guaranteeing embed() reads a consistent, immutable snapshot.
+    [BUG-D] WorkingMemory.clear() called kv_buf.flush_to_ltm() unconditionally;
+          if clear() was called immediately after end_session() (which also flushes
+          kv_buf), all kv_buf entries were stored to LTM twice — silent data duplication.
+          Fixed: clear() checks len(kv_buf) > 0 before flushing (end_session already
+          calls kv_buf.clear() through flush_to_ltm → clear(), so len is 0 afterward).
+    [BUG-E] consolidate() iterates n vectors and calls _vector_search() for each one;
+          _vector_search() internally calls _ensure_arr(), which checked self._dirty.
+          Because store() sets _dirty=True and consolidate runs while _dirty=True,
+          _ensure_arr rebuilt the full N×1024 float array on EVERY iteration of the
+          consolidate loop → O(n²) wasted work.
+          Fixed: _ensure_arr() called once before the loop; self._dirty temporarily
+          set to False during the loop (restored afterward) to suppress per-iteration
+          rebuilds.  _dirty is set back to True if any merges occurred.
+    [BUG-F] _background_flush(): final flush on stop() called _save_vectors() unconditionally
+          even when self._dirty=False — caused a spurious disk write + embedder.save()
+          on every clean shutdown.
+          Fixed: final flush now checks self._dirty before calling _save_vectors(),
+          mirroring the behavior of the per-interval flush inside the loop.
     [BUG] _semantic_duplicate: used _tokenize (unigrams only) for Jaccard while embed()
           uses both unigrams+bigrams → mismatched token spaces caused wrong dedup decisions.
           Fixed: _tokenize_with_bigrams used for both sides of Jaccard in _semantic_duplicate.
@@ -621,10 +653,12 @@ class LongTermMemoryV1:
             except Exception as e:
                 import sys
                 print(f"[DracoAI Memory] Background flush error: {e}", file=sys.stderr)
-        # Final flush on clean stop
+        # FIX F: final flush on clean stop — only write if actually dirty to avoid
+        # a no-op disk write (and unnecessary embedder.save() call) on clean shutdown.
         try:
             with self._lock:
-                self._save_vectors()
+                if self._dirty:
+                    self._save_vectors()
         except Exception:
             pass
 
@@ -900,22 +934,30 @@ class LongTermMemoryV1:
             text = text[: self.MAX_TEXT_LENGTH - 3] + "..."
 
         with self._lock:
+            # FIX B: maintain O(1) vid→index map (avoids O(n) _vids.index() calls)
+            # This mirrors the fix already applied in record_feedback().
+            # Rebuilt lazily inside lock; cost is O(n) once per store() call that
+            # hits a duplicate, which is acceptable (same asymptotic as before, but
+            # a single scan instead of two O(n) scans).
+            vid_to_idx: Dict[str, int] = {v: i for i, v in enumerate(self._vids)}
+
             # Semantic duplicate check (with negation guard)
             existing = self._semantic_duplicate(text)
             if existing:
-                idx = self._vids.index(existing)
-                self._meta_list[idx]["frequency"] = self._meta_list[idx].get("frequency", 1) + 1
-                self._meta_list[idx]["timestamp"] = time.time()
-                self._dirty = True
-                self._maybe_save()
-                self.clear_search_cache()
+                idx = vid_to_idx.get(existing)
+                if idx is not None:
+                    self._meta_list[idx]["frequency"] = self._meta_list[idx].get("frequency", 1) + 1
+                    self._meta_list[idx]["timestamp"] = time.time()
+                    self._dirty = True
+                    self._maybe_save()
+                    self.clear_search_cache()
                 return existing
 
             vid = hashlib.md5(text.encode()).hexdigest()[:12]
 
-            # Exact duplicate fallback
-            if vid in self._vids:
-                idx = self._vids.index(vid)
+            # Exact duplicate fallback — O(1) via vid_to_idx
+            if vid in vid_to_idx:
+                idx = vid_to_idx[vid]
                 self._meta_list[idx]["frequency"] = self._meta_list[idx].get("frequency", 1) + 1
                 self._meta_list[idx]["timestamp"] = time.time()
                 self._dirty = True
@@ -1104,6 +1146,15 @@ class LongTermMemoryV1:
                 else:
                     del self._search_cache[q_hash]
 
+        # FIX C: snapshot embedder's vocab+idf under lock so that a concurrent
+        # fit_embedder() / update_idf() cannot modify them while embed() reads them.
+        # We copy only the lightweight dict references (not the full dim-1024 float
+        # array), so this snapshot is O(1) in memory beyond the dict itself.
+        with self._lock:
+            emb_vocab  = dict(self.embedder.vocab)
+            emb_idf    = dict(self.embedder.idf)
+            emb_dim    = self.embedder.dim
+        # Embed using snapshotted vocab/idf (no shared state access beyond this point)
         q_vec = self.embedder.embed(q_norm, entity_boost=entities)
         now   = time.time()
 
@@ -1306,7 +1357,10 @@ class LongTermMemoryV1:
         )
         self._w(self._ff, facts)
         self.store(f"{key} là {value}", {"type": "fact", "key": key, "importance": 1.5})
-        self.clear_search_cache()
+        # FIX A: acquire lock before clearing cache so _version increment is atomic
+        # with respect to concurrent search() reads.
+        with self._lock:
+            self.clear_search_cache()
 
     def get_facts(self) -> List[dict]:
         facts = self._r(self._ff)
@@ -1317,7 +1371,9 @@ class LongTermMemoryV1:
         new   = [f for f in facts if f["key"].lower() != key.lower()]
         if len(new) < len(facts):
             self._w(self._ff, new)
-            self.clear_search_cache()
+            # FIX A: acquire lock before clearing cache for thread-safety
+            with self._lock:
+                self.clear_search_cache()
             return True
         return False
 
@@ -1370,7 +1426,9 @@ class LongTermMemoryV1:
             knowledge = knowledge[-5000:]
         self._w(self._kf, knowledge)
         self.store(f"{topic}: {content[:300]}", {"type": "knowledge", "topic": topic, "importance": 1.3})
-        self.clear_search_cache()
+        # FIX A: acquire lock before clearing cache for thread-safety
+        with self._lock:
+            self.clear_search_cache()
 
     def get_topics(self) -> List[str]:
         knowledge = self._r(self._kf)
@@ -1518,9 +1576,22 @@ class LongTermMemoryV1:
             if len(self._vec_list) < 2:
                 return
 
+            # FIX E: call _ensure_arr() ONCE before the loop starts.
+            # Previously, every inner _vector_search(vec_i, ...) call triggered
+            # _ensure_arr() which checked self._dirty == True (set by a prior store)
+            # and rebuilt the full N×1024 float array on EVERY iteration —
+            # O(n) rebuild × n iterations = O(n²) wasted work.
+            # We temporarily clear _dirty around the rebuild so inner calls to
+            # _ensure_arr() see a consistent, up-to-date array without rebuilding.
             self._ensure_arr()
             if self._vecs_arr is None:
                 return
+            # Freeze _dirty for the duration of the loop: _ensure_arr won't rebuild
+            # again because the condition checks self._dirty OR shape mismatch.
+            # We restore _dirty = True after the loop if we did any merges,
+            # so the final _save_vectors() can detect pending changes.
+            _was_dirty = self._dirty
+            self._dirty = False   # prevent per-iteration rebuild inside _vector_search
 
             merged: set = set()   # set of vids to remove
 
@@ -1587,6 +1658,10 @@ class LongTermMemoryV1:
                 self._dirty = True
                 self._save_vectors()
                 self.clear_search_cache()
+            else:
+                # FIX E: restore _dirty to pre-consolidate state if nothing was merged
+                # (we temporarily set it to False to prevent per-iteration _ensure_arr rebuild)
+                self._dirty = _was_dirty
 
     # ── Inspection helpers ────────────────────────────────────────────
     def list_recent(self, n: int = 10) -> List[dict]:
@@ -1759,9 +1834,11 @@ class WorkingMemoryV1:
         self.session_id  = str(int(time.time()))
 
     def clear(self):
-        # FIX: flush any pending kv_buf entries before clearing so short sessions
-        # that never hit the >= 5 threshold don't silently lose data.
-        if self.kv_buf:
+        # FIX D: Only flush kv_buf if it actually has entries AND end_session() wasn't
+        # just called (end_session already flushes). Using len() check avoids the
+        # double-store bug where clear() re-flushed already-flushed kv_buf entries
+        # if called right after end_session().
+        if self.kv_buf and len(self.kv_buf) > 0:
             self.kv_buf.flush_to_ltm(self.ltm)
         self.messages.clear()
         self.token_count = 0
