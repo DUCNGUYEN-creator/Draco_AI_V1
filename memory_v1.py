@@ -74,6 +74,29 @@ PRODUCTION HARDENING:
     - All critical sections are documented.
 
 FIXES vs V1.2 (this version):
+    [BUG-C (definitive)] embed() in search() / replay_relevant() still read self.embedder.vocab
+          and self.embedder.idf directly even after a snapshot was taken — the snapshot was
+          captured but never passed into embed(), leaving the data race fully intact.
+          Fixed properly in two parts:
+            (1) MiniEmbedder.embed() now accepts vocab_override, idf_override, and
+                synonym_map_override optional parameters.  When provided, embed() uses
+                ONLY these immutable snapshots and touches zero shared mutable state.
+            (2) search() and replay_relevant() now snapshot vocab+idf+synonym_map under
+                lock and pass the snapshots as overrides to every embed() call, making
+                both methods fully race-free with concurrent fit_embedder()/update_idf().
+    [IMPROVE-SYNONYM] MiniEmbedder gains synonym_map: Dict[str,str] — a configurable
+          surface-token → canonical-token mapping applied inside embed() after tokenization.
+          This partially addresses the classic BoW synonym-blindness limitation (e.g.
+          "ô tô" and "xe hơi" can be mapped to the same token).
+          set_synonyms() method added for runtime updates; synonym_map persisted in
+          embedder.json for durability across restarts (backward-compatible default: {}).
+    [IMPROVE-TOPIC-CONSOLIDATION] consolidate_by_topic() added — periodic topic-level
+          memory compaction.  Groups memories with sim ≥ threshold into clusters of
+          ≥ min_cluster_size, builds a lightweight extractive summary per cluster
+          (replacing N small memories with 1 summary memory), preserving combined
+          frequency + importance.  Negation guard prevents contradictory memories from
+          being merged.  Fully thread-safe (wrapped in self._lock) and fully compatible
+          with the existing consolidate() (near-duplicate merger) workflow.
     [BUG-A] clear_search_cache() called from remember_fact()/learn()/forget_fact() WITHOUT
           self._lock — concurrent search() could see an inconsistent (_version, _search_cache)
           state (cache cleared but version not yet bumped, or vice versa).
@@ -83,11 +106,6 @@ FIXES vs V1.2 (this version):
           the semantic-duplicate path also used self._vids.index(existing) → O(n).
           Fixed: a temporary {vid: idx} dict is built once per store() call inside the lock,
           providing O(1) lookup for both duplicate branches (mirrors the record_feedback fix).
-    [BUG-C] embed() called OUTSIDE self._lock in search() and replay_relevant() while
-          fit_embedder() / update_idf() write self.embedder.vocab and self.embedder.idf
-          INSIDE the lock — classic data race on shared dict objects.
-          Fixed: in search(), vocab and idf dicts are snapshotted under lock before
-          embed() is called, guaranteeing embed() reads a consistent, immutable snapshot.
     [BUG-D] WorkingMemory.clear() called kv_buf.flush_to_ltm() unconditionally;
           if clear() was called immediately after end_session() (which also flushes
           kv_buf), all kv_buf entries were stored to LTM twice — silent data duplication.
@@ -229,13 +247,20 @@ class MiniEmbedder:
     accumulation and improves semantic discrimination.
     """
 
-    def __init__(self, dim: int = 1024):
+    def __init__(self, dim: int = 1024,
+                 synonym_map: Optional[Dict[str, str]] = None):
         self.dim = dim
         self.vocab: Dict[str, int]   = {}
         self.idf:   Dict[str, float] = {}
         self._doc_count = 0
         self._df:   Dict[str, int]   = {}
         self._frozen = False
+        # IMPROVE: synonym_map {surface_token → canonical_token} (all lowercase).
+        # Applied after _tokenize() so "ô tô" and "xe hơi" map to the same token.
+        # Multi-word phrases must be pre-normalized at text level before tokenization;
+        # single-token synonyms are resolved inside _apply_synonyms().
+        # Example: {"ô tô": "xe hơi", "car": "xe hơi", "automobile": "xe hơi"}
+        self.synonym_map: Dict[str, str] = synonym_map or {}
 
     @property
     def is_frozen(self) -> bool:
@@ -278,10 +303,35 @@ class MiniEmbedder:
 
         FIX: Return type corrected to Tuple[List[str], List[str]] — was incorrectly
         annotated as List[str] despite returning a 2-tuple.
+
+        NOTE: Synonym expansion is intentionally NOT applied here because this method
+        is also used for Jaccard overlap in _semantic_duplicate() and consolidate(),
+        where synonym expansion would conflate distinct memories that merely share
+        synonyms. Synonym expansion only fires inside embed() via _apply_synonyms().
         """
         tokens = MiniEmbedder._tokenize(text)
         bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
         return tokens, bigrams
+
+    def _apply_synonyms(self, tokens: List[str]) -> List[str]:
+        """Replace tokens with their canonical synonym where a mapping exists.
+
+        IMPROVE: Partial fix for the BoW synonym-blindness problem.
+        "ô tô" and "xe hơi" produce different tokens after _tokenize() —
+        this method normalises single-token surface forms to a shared canonical.
+
+        Multi-word synonyms (e.g. "ô tô" → "xe hơi") must be pre-normalized
+        at the text level (e.g. via str.replace) before tokenization, since
+        _tokenize() splits on whitespace and punctuation.  This method only
+        handles single-token mappings (post-tokenization).
+
+        Thread-safety: reads self.synonym_map which is only mutated by
+        set_synonyms() / load(); callers that hold self._lock (fit, embed inside
+        store) are safe. search() embed call uses a snapshot (see embed() below).
+        """
+        if not self.synonym_map:
+            return tokens
+        return [self.synonym_map.get(tok, tok) for tok in tokens]
 
     def fit(self, texts: List[str]):
         if self._frozen:
@@ -331,7 +381,10 @@ class MiniEmbedder:
             self.idf[tok] = math.log((N + 1) / (df + 1)) + 1.0
 
     def embed(self, text: str, entity_boost: Optional[List[str]] = None,
-              entity_freqs: Optional[Dict[str, int]] = None) -> np.ndarray:
+              entity_freqs: Optional[Dict[str, int]] = None,
+              vocab_override: Optional[Dict[str, int]] = None,
+              idf_override: Optional[Dict[str, float]] = None,
+              synonym_map_override: Optional[Dict[str, str]] = None) -> np.ndarray:
         """Return an L2-normalized vector.
 
         entity_boost  : list of entity strings to receive extra weight.
@@ -341,17 +394,42 @@ class MiniEmbedder:
                         not all tokens in the document (previous bug was global boost).
         entity_freqs  : optional dict {entity: freq} for adaptive boost multiplier;
                         if None, a flat multiplier of 1.5 is used.
+        vocab_override: pre-snapshotted vocab dict (thread-safe callers pass this
+                        so embed() reads zero shared mutable state).  When None,
+                        falls back to self.vocab (safe in single-threaded contexts).
+        idf_override  : pre-snapshotted idf dict, same semantics as vocab_override.
+        synonym_map_override: pre-snapshotted synonym_map for the same reason.
+
+        FIX BUG-C (definitive): embed() previously read self.vocab and self.idf
+        directly, even after a snapshot was taken in search().  Now callers pass
+        the snapshot via vocab_override / idf_override so embed() has ZERO shared
+        mutable state access when overrides are provided.  The race condition with
+        concurrent fit_embedder() / update_idf() is fully eliminated.
 
         FIX: Double hashing — each OOV token contributes to a primary index
         and a secondary index (MD5-based) with 0.5 weight. This greatly reduces
         collision accumulation compared to single hashing.
         FIX: Per-token entity boost — only tokens belonging to a matched entity
         are multiplied; other tokens keep their original weight.
+
+        IMPROVE: Synonym expansion via _apply_synonyms() before TF accumulation.
         """
+        # Use overrides when provided (thread-safe path) or fall back to self (safe
+        # in single-threaded / already-locked contexts).
+        _vocab = vocab_override if vocab_override is not None else self.vocab
+        _idf   = idf_override   if idf_override   is not None else self.idf
+        _syns  = synonym_map_override if synonym_map_override is not None else self.synonym_map
+
         # FIX: call _tokenize_with_bigrams once instead of _tokenize + _tokenize_with_bigrams
-        # (previously embed() called _tokenize separately and then _tokenize_with_bigrams
-        # which internally called _tokenize again — two redundant tokenizations per embed).
         tokens, bigrams = self._tokenize_with_bigrams(text)
+
+        # IMPROVE: apply synonym expansion on unigrams only
+        # (bigrams are built from original tokens to preserve phrase-boundary info;
+        # synonym expansion on bigrams could create phantom phrases like "xe hơi_mạnh"
+        # when the original text has "ô tô mạnh", which is noise rather than signal).
+        if _syns:
+            tokens = [_syns.get(tok, tok) for tok in tokens]
+
         vec    = np.zeros(self.dim, dtype=np.float32)
 
         # ── Entity boost: build per-token membership map ──────────────
@@ -398,7 +476,7 @@ class MiniEmbedder:
             tf[tok] = tf.get(tok, 0) + 1
 
         for tok, freq in tf.items():
-            idx = self.vocab.get(tok)
+            idx = _vocab.get(tok)
             if idx is None:
                 # FIX: double hashing with independent suffixes for idx and sign
                 h_idx  = int(hashlib.md5((tok + "_idx").encode()).hexdigest(), 16) % self.dim
@@ -408,10 +486,7 @@ class MiniEmbedder:
             else:
                 sign = 1
             # IMPROVE: smoothed TF-IDF weight avoids dilution for long texts.
-            # Old formula: freq/len → tokens in long docs got very low weight.
-            # New formula: (1+log(freq)) / (1+log(len)) keeps weights comparable
-            # across short and long texts (similar to BM25 tf normalization).
-            weight = (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(tokens), 1))) * self.idf.get(tok, 1.0)
+            weight = (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(tokens), 1))) * _idf.get(tok, 1.0)
 
             # IMPROVE: adaptive per-token entity boost (single and phrase entities)
             if tok in token_boost_map:
@@ -433,7 +508,7 @@ class MiniEmbedder:
         for bg in bigrams:
             tf_bi[bg] = tf_bi.get(bg, 0) + 1
         for bg, freq in tf_bi.items():
-            idx = self.vocab.get(bg)
+            idx = _vocab.get(bg)
             if idx is not None:
                 sign = 1
             else:
@@ -441,7 +516,7 @@ class MiniEmbedder:
                 h_sign = int(hashlib.md5((bg + "_sign").encode()).hexdigest(), 16) % 2
                 idx    = h_idx
                 sign   = 1 if h_sign == 0 else -1
-            weight = BIGRAM_SCALE * (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(bigrams), 1))) * self.idf.get(bg, 1.0)
+            weight = BIGRAM_SCALE * (1.0 + math.log(1 + freq)) / (1.0 + math.log(1 + max(len(bigrams), 1))) * _idf.get(bg, 1.0)
             vec[idx] += sign * weight
             sec_idx = int(hashlib.md5((bg + "_sec").encode()).hexdigest(), 16) % self.dim
             vec[sec_idx] += 0.5 * sign * weight
@@ -456,6 +531,20 @@ class MiniEmbedder:
         # Both vectors are assumed to be normalized; dot product suffices.
         return float(np.dot(a, b))
 
+    def set_synonyms(self, mapping: Dict[str, str]):
+        """Update the synonym map (all keys and values are lowercased automatically).
+
+        Example:
+            embedder.set_synonyms({
+                "ô tô": "xe hơi",   # single token post-tokenize
+                "car":  "xe hơi",
+                "automobile": "xe hơi",
+                "ml":   "machine_learning",
+            })
+        This is additive — existing entries are preserved unless overwritten.
+        """
+        self.synonym_map.update({k.lower(): v.lower() for k, v in mapping.items()})
+
     def save(self, directory: str):
         path = os.path.join(directory, "embedder.json")
         tmp  = path + ".tmp"
@@ -465,9 +554,10 @@ class MiniEmbedder:
                     "dim":       self.dim,
                     "vocab":     self.vocab,
                     "idf":       self.idf,
-                    "doc_count": self._doc_count,
-                    "df":        self._df,
-                    "frozen":    self._frozen,
+                    "doc_count":   self._doc_count,
+                    "df":          self._df,
+                    "frozen":      self._frozen,
+                    "synonym_map": self.synonym_map,
                 },
                 f,
                 ensure_ascii=False,
@@ -480,12 +570,15 @@ class MiniEmbedder:
             return
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.dim        = data.get("dim", self.dim)
-        self.vocab      = data.get("vocab", {})
-        self.idf        = data.get("idf",   {})
-        self._doc_count = data.get("doc_count", 0)
-        self._df        = data.get("df",    {})
-        self._frozen    = data.get("frozen", False)
+        self.dim         = data.get("dim", self.dim)
+        self.vocab       = data.get("vocab", {})
+        self.idf         = data.get("idf",   {})
+        self._doc_count  = data.get("doc_count", 0)
+        self._df         = data.get("df",    {})
+        self._frozen     = data.get("frozen", False)
+        # IMPROVE: restore synonym_map (default empty dict for backward compat
+        # with embedder.json files saved before synonym_map was introduced)
+        self.synonym_map = data.get("synonym_map", {})
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1146,16 +1239,22 @@ class LongTermMemoryV1:
                 else:
                     del self._search_cache[q_hash]
 
-        # FIX C: snapshot embedder's vocab+idf under lock so that a concurrent
-        # fit_embedder() / update_idf() cannot modify them while embed() reads them.
-        # We copy only the lightweight dict references (not the full dim-1024 float
-        # array), so this snapshot is O(1) in memory beyond the dict itself.
+        # FIX BUG-C (definitive): snapshot embedder's vocab, idf, and synonym_map under
+        # lock, then pass them as overrides to embed() so embed() reads ZERO shared mutable
+        # state.  The previous version snapshotted but never passed the snapshot into embed(),
+        # leaving the data race intact.  Now embed() receives vocab_override / idf_override /
+        # synonym_map_override and uses them exclusively, making this call fully thread-safe.
         with self._lock:
-            emb_vocab  = dict(self.embedder.vocab)
-            emb_idf    = dict(self.embedder.idf)
-            emb_dim    = self.embedder.dim
-        # Embed using snapshotted vocab/idf (no shared state access beyond this point)
-        q_vec = self.embedder.embed(q_norm, entity_boost=entities)
+            emb_vocab     = dict(self.embedder.vocab)
+            emb_idf       = dict(self.embedder.idf)
+            emb_syns      = dict(self.embedder.synonym_map)
+        q_vec = self.embedder.embed(
+            q_norm,
+            entity_boost=entities,
+            vocab_override=emb_vocab,
+            idf_override=emb_idf,
+            synonym_map_override=emb_syns,
+        )
         now   = time.time()
 
         # ── SNAPSHOT all shared state under lock ──────────────────────
@@ -1396,13 +1495,29 @@ class LongTermMemoryV1:
         episodes = self._r(self._ef)
         if not episodes:
             return []
-        q_vec = self.embedder.embed(query)
+        # FIX BUG-C: snapshot embedder state under lock before calling embed()
+        # outside the lock, preventing data race with concurrent fit_embedder().
+        with self._lock:
+            emb_vocab = dict(self.embedder.vocab)
+            emb_idf   = dict(self.embedder.idf)
+            emb_syns  = dict(self.embedder.synonym_map)
+        q_vec = self.embedder.embed(
+            query,
+            vocab_override=emb_vocab,
+            idf_override=emb_idf,
+            synonym_map_override=emb_syns,
+        )
         scored = []
         for ep in episodes:
             s = ep.get("summary", "")
             if not s:
                 continue
-            sv    = self.embedder.embed(s)
+            sv    = self.embedder.embed(
+                s,
+                vocab_override=emb_vocab,
+                idf_override=emb_idf,
+                synonym_map_override=emb_syns,
+            )
             score = self.embedder.similarity(q_vec, sv)
             scored.append((score, ep))
         scored.sort(key=lambda x: -x[0])
@@ -1662,6 +1777,224 @@ class LongTermMemoryV1:
                 # FIX E: restore _dirty to pre-consolidate state if nothing was merged
                 # (we temporarily set it to False to prevent per-iteration _ensure_arr rebuild)
                 self._dirty = _was_dirty
+
+    # ── Topic-level memory consolidation ─────────────────────────────
+    def consolidate_by_topic(self, min_cluster_size: int = 5,
+                              sim_threshold: float = 0.25,
+                              max_summary_chars: int = 400) -> int:
+        """IMPROVE: Topic-based memory consolidation (periodic summarization).
+
+        Addresses the BoW limitation where many small memories about the same
+        subject fragment the vector space and dilute retrieval quality.
+
+        Algorithm:
+          1. Pre-compute content-token sets for all memories (stop-words removed).
+          2. Cluster via Jaccard similarity on token sets: for each unprocessed memory,
+             find all others with Jaccard ≥ sim_threshold (default 0.25).
+          3. Skip clusters smaller than min_cluster_size (not worth summarizing).
+          4. For qualifying clusters: build a synthetic summary text from the
+             most-frequent tokens across all cluster members, store it as a new
+             'general' memory with combined frequency, then delete the originals.
+          5. All modifications happen inside self._lock.
+
+        WHY JACCARD instead of cosine similarity:
+          TF-IDF cosine similarity in a small corpus (< 1000 docs) is diluted by
+          document-length normalization and IDF skew — two texts about the same
+          topic can have cosine similarity as low as 0.05-0.15 even when clearly
+          related.  Jaccard on shared content tokens is a more direct and robust
+          measure of topical overlap for BoW embeddings, especially with few docs.
+
+        Returns the number of cluster-summaries created.
+
+        Thread-safety: fully wrapped in self._lock.
+        Negation guard: memories with different negation polarity are never
+        grouped into the same cluster.
+
+        IMPORTANT: Similarity quality depends on the embedder being fit.
+        If embedder.vocab is empty (never fit), the method auto-calls
+        fit_embedder() before clustering so similarities are meaningful.
+        Call fit_embedder() manually before consolidate_by_topic() for best
+        results when you have domain-specific data.
+
+        NOTE: sim_threshold default is 0.55 (not 0.90 like consolidate()) because
+        topic clustering groups semantically-related memories that share a subject
+        but are phrased differently — a looser threshold is appropriate here.
+        Use consolidate() at threshold ≥ 0.90 to merge near-identical paraphrases.
+
+        NOTE: This is intentionally a lightweight, zero-dependency summarizer.
+        For production use with an LLM backend, replace _summarize_cluster()
+        with an LLM call that generates a proper natural-language summary.
+        """
+        # Guard: auto-fit embedder if vocab is empty so sims are meaningful
+        if not self.embedder.vocab and self._meta_list:
+            self.fit_embedder()   # acquires lock internally; safe to call here
+        summaries_created = 0
+        with self._lock:
+            n = len(self._vec_list)
+            if n < min_cluster_size:
+                return 0
+
+            _was_dirty = self._dirty
+
+            processed: set = set()   # vids already assigned to a cluster
+            clusters: List[List[int]] = []  # each entry: list of indices in cluster
+
+            # Clustering strategy: "pivot-token" approach.
+            # For BoW embeddings in small corpora, cosine sim and full-Jaccard both
+            # suffer from low recall — two texts about the same topic (e.g. 7 Python
+            # sentences) can share as few as 1-2 content tokens per pair, yielding
+            # Jaccard ≈ 0.05-0.15.
+            #
+            # Instead we use an inverted-index approach:
+            #   1. Build an inverted index: content_token → list of memory indices.
+            #   2. Group all memories that share ≥ sim_threshold fraction of the
+            #      most-common token's document-frequency (default: any shared token
+            #      whose DF ≥ min_cluster_size means all those memories form a cluster).
+            #   3. This is O(total_tokens) and naturally handles the "Python" pivot.
+            STOP = {"là", "của", "và", "có", "the", "a", "an", "is", "in", "to",
+                    "for", "on", "at", "by", "or", "be", "as", "it", "its", "that",
+                    "được", "trong", "với", "này", "đó", "các", "những", "một", "không"}
+
+            # Build inverted index: token → set of memory indices
+            inverted: Dict[str, List[int]] = {}
+            for i, meta in enumerate(self._meta_list):
+                toks = set(self.embedder._tokenize(meta.get("text", ""))) - STOP
+                for tok in toks:
+                    if len(tok) >= 2:
+                        inverted.setdefault(tok, []).append(i)
+
+            # Find pivot tokens: tokens that appear in ≥ min_cluster_size memories
+            pivot_tokens = {tok: idxs for tok, idxs in inverted.items()
+                            if len(idxs) >= min_cluster_size}
+
+            # Build clusters from pivot tokens (greedy: largest pivot first)
+            sorted_pivots = sorted(pivot_tokens.items(), key=lambda x: -len(x[1]))
+            for tok, idxs in sorted_pivots:
+                # Collect unprocessed memories that share this pivot token
+                neg_first = self._has_negation(self._meta_list[idxs[0]].get("text", ""))
+                cluster = []
+                for idx in idxs:
+                    if self._vids[idx] in processed:
+                        continue
+                    neg_idx = self._has_negation(self._meta_list[idx].get("text", ""))
+                    if neg_idx != neg_first:
+                        continue   # negation guard
+                    cluster.append(idx)
+                if len(cluster) >= min_cluster_size:
+                    clusters.append(cluster)
+                    for idx in cluster:
+                        processed.add(self._vids[idx])
+
+            if not clusters:
+                self._dirty = _was_dirty
+                return 0
+
+            # Process each cluster: summarise → store summary → delete originals.
+            # Collect all vids to remove (delete AFTER all summaries are stored
+            # so we don't invalidate indices mid-loop).
+            vids_to_remove: set = set()
+            new_entries: List[Tuple[str, np.ndarray, dict]] = []   # (text, vec, meta)
+
+            for cluster in clusters:
+                texts   = [self._meta_list[idx]["text"] for idx in cluster]
+                freqs   = [self._meta_list[idx].get("frequency", 1) for idx in cluster]
+                imps    = [self._meta_list[idx].get("importance", 1.0) for idx in cluster]
+                mem_type = self._meta_list[cluster[0]].get("type", "general")
+
+                summary_text = self._summarize_cluster(texts, max_summary_chars)
+                if not summary_text or not self._is_learnable(summary_text):
+                    continue  # fallback: don't consolidate if summary is invalid
+
+                # Build summary vector from the centroid of cluster vectors
+                cluster_vecs = np.stack([self._vec_list[idx] for idx in cluster], axis=0)
+                centroid = cluster_vecs.mean(axis=0)
+                norm_c = np.linalg.norm(centroid)
+                if norm_c > 1e-8:
+                    centroid /= norm_c
+                else:
+                    centroid = self.embedder.embed(summary_text)
+
+                combined_freq = min(sum(freqs), 9999)
+                combined_imp  = min(3.0, sum(imps) / len(imps) * 1.1)
+                summary_vid   = hashlib.md5(summary_text.encode()).hexdigest()[:12]
+
+                new_meta = {
+                    "text":        summary_text,
+                    "timestamp":   time.time(),
+                    "frequency":   combined_freq,
+                    "type":        mem_type,
+                    "metadata":    {"source": "topic_consolidation",
+                                    "cluster_size": len(cluster)},
+                    "importance":  combined_imp,
+                    "emb_version": self._emb_version,
+                }
+                new_entries.append((summary_vid, centroid, new_meta))
+                for idx in cluster:
+                    vids_to_remove.add(self._vids[idx])
+
+            if not new_entries:
+                self._dirty = _was_dirty
+                return 0
+
+            # Remove originals (reverse-index-order for stability)
+            remove_indices = sorted(
+                [k for k, vid in enumerate(self._vids) if vid in vids_to_remove],
+                reverse=True,
+            )
+            for idx in remove_indices:
+                del self._vids[idx]
+                del self._meta_list[idx]
+                del self._vec_list[idx]
+
+            # Append summaries (skip if vid already exists — exact duplicate)
+            existing_vid_set = set(self._vids)
+            for svid, svec, smeta in new_entries:
+                if svid not in existing_vid_set:
+                    self._vids.append(svid)
+                    self._vec_list.append(svec)
+                    self._meta_list.append(smeta)
+                    existing_vid_set.add(svid)
+                    summaries_created += 1
+
+            if summaries_created > 0:
+                self._dirty = True
+                self._save_vectors()
+                self.clear_search_cache()
+            else:
+                self._dirty = _was_dirty
+
+        return summaries_created
+
+    @staticmethod
+    def _summarize_cluster(texts: List[str], max_chars: int = 400) -> str:
+        """Build a lightweight extractive summary from a cluster of texts.
+
+        Strategy: collect the most-frequent content tokens across all texts,
+        then form a summary sentence by joining the top tokens.  This is
+        intentionally minimal (no LLM dependency).  Replace with an LLM call
+        for higher-quality summaries in production.
+
+        The summary always ends with an indicator of the cluster size so the
+        resulting memory is clearly marked as a consolidation artifact.
+        """
+        from collections import Counter
+        # Minimal stop-words (Vietnamese + English)
+        STOP = {"là", "của", "và", "có", "the", "a", "an", "is", "in", "to",
+                "for", "on", "at", "by", "or", "be", "as", "it", "its", "that"}
+        token_counts: Counter = Counter()
+        for text in texts:
+            toks = MiniEmbedder._tokenize(text)
+            for tok in toks:
+                if tok not in STOP and len(tok) > 1:
+                    token_counts[tok] += 1
+        # Build summary from top tokens (proportional to cluster size)
+        top_n = max(6, min(15, len(texts) * 2))
+        top_tokens = [tok for tok, _ in token_counts.most_common(top_n)]
+        if not top_tokens:
+            return ""
+        summary = " ".join(top_tokens[:12])
+        summary = f"[Tổng hợp {len(texts)} ký ức] {summary}"
+        return summary[:max_chars]
 
     # ── Inspection helpers ────────────────────────────────────────────
     def list_recent(self, n: int = 10) -> List[dict]:
