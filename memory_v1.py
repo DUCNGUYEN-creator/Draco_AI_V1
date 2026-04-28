@@ -74,6 +74,34 @@ PRODUCTION HARDENING:
     - All critical sections are documented.
 
 FIXES vs V1.2 (this version):
+    [CRASH-ORDER] _save_vectors() previously wrote vectors.npz BEFORE the JSON sidecar.
+          If the process crashed after writing the new .npz (vecs-only) but before
+          writing the sidecar, the next load would find no sidecar → enter legacy
+          branch → attempt data["vids"] on the vecs-only .npz → KeyError →
+          except resets all lists to [] → total data loss.
+          Fixed: sidecar is now written and os.replace-committed FIRST; the .npz
+          is replaced second.  If crash occurs between sidecar-commit and npz-commit,
+          the sidecar is already safe and the old .npz is still intact — no data loss.
+    [IMPROVE] _count_tokens: len(content)//4 was a coarse char-only estimate that
+          under-counted Vietnamese syllables and over-counted English words.
+          Replaced with a hybrid formula: max(word_count*1.3, char_count//4).
+          Word-count*1.3 approximates BPE tokenisation for both VI and EN;
+          taking the max acts as a conservative upper bound to avoid silent budget
+          overruns. Tokenizer integration (SentencePiece / BPE) remains the
+          recommended production upgrade.
+    [IMPROVE] consolidate() _dirty=False freeze section now carries a detailed
+          INVARIANT comment explaining exactly why the pattern is safe, when it
+          is NOT safe (if lock strategy changes), and what must be re-evaluated
+          in that case — preventing future maintainers from misreading it as a bug.
+    [IMPROVE] _load_vectors: added explicit vecs/vids/meta shape-consistency
+          validation in both the new-format and legacy-migration paths.
+          A partial crash write (sidecar row count ≠ npz row count) now logs a
+          warning and discards the corrupted data rather than silently loading
+          mismatched arrays that would cause IndexError at query time.
+    [FIX-TIE] consolidate_by_topic neg_dominant tie-break changed from >= (ties→True)
+          to > (ties→False). In a 50/50 negation split, defaulting to non-negated
+          polarity is correct because negated memories are rarer in practice and
+          should not be allowed to exclude the larger non-negated group.
     [BUG-1] _is_learnable: COARSE_MARKERS used bare `in` (substring match) for "là",
           causing "làm", "làng", "làn", etc. to falsely match the "là" marker.
           Short conversational phrases (≥3 words) containing any word with "là" as a
@@ -917,7 +945,21 @@ class LongTermMemoryV1:
                     side = json.load(f)
                 vids     = side.get("vids", [])
                 meta_raw = side.get("meta", [])
+                # Validate mutual consistency: mismatch means a partial crash write
                 if not isinstance(meta_raw, list) or len(meta_raw) != len(vids):
+                    _log.warning(
+                        "vectors_meta.json is inconsistent (vids=%d, meta=%d) — "
+                        "discarding corrupted data.",
+                        len(vids) if isinstance(vids, list) else -1,
+                        len(meta_raw) if isinstance(meta_raw, list) else -1,
+                    )
+                    return
+                if len(vids) > 0 and vecs.shape[0] != len(vids):
+                    _log.warning(
+                        "vectors.npz row count (%d) != sidecar vids count (%d) — "
+                        "discarding to avoid index corruption.",
+                        vecs.shape[0], len(vids),
+                    )
                     return
             else:
                 # ── Legacy format: one-time pickle migration ───────────
@@ -928,12 +970,24 @@ class LongTermMemoryV1:
                 meta_raw = data["meta"].tolist()
                 if not isinstance(meta_raw, list):
                     return
-                # Immediately persist in safe format
+                # Validate that vecs/vids/meta are mutually consistent before migration
+                if len(vids) != len(meta_raw) or (len(vids) > 0 and vecs.shape[0] != len(vids)):
+                    _log.warning(
+                        "Legacy vectors.npz has inconsistent shapes "
+                        "(vids=%d, meta=%d, vecs_rows=%d) — skipping migration.",
+                        len(vids), len(meta_raw), vecs.shape[0] if hasattr(vecs, "shape") else -1,
+                    )
+                    return
+                # Immediately persist in safe format.
+                # _save_vectors() writes sidecar FIRST then .npz (crash-safe order),
+                # so even a crash mid-migration leaves a recoverable state.
                 self._vids      = vids
                 self._vec_list  = [vecs[i] for i in range(len(vids))]
                 self._meta_list = meta_raw
+                for meta in self._meta_list:
+                    meta.pop("embedding", None)
                 self._dirty     = True
-                self._save_vectors()  # rewrites in new format
+                self._save_vectors()  # rewrites in safe JSON-sidecar format
                 return
 
             self._vids      = vids
@@ -961,6 +1015,22 @@ class LongTermMemoryV1:
         numpy arrays (which use pickle internally).  The .npz contains ONLY the
         float32 'vecs' array and can be loaded with allow_pickle=False.
         Both files are written atomically (tmp + os.replace).
+
+        FIX CRASH-ORDER: The JSON sidecar MUST be written and atomically committed
+        BEFORE the .npz is replaced.  Rationale:
+          If we write .npz first then crash before writing the sidecar:
+            • .npz now contains ONLY 'vecs' (no 'vids'/'meta' keys).
+            • sidecar does not exist → _load_vectors enters the legacy branch.
+            • legacy branch calls data["vids"] on the new .npz → KeyError.
+            • except block resets all lists to [] → total data loss.
+          If we write sidecar first then crash before writing .npz:
+            • sidecar is safe and up-to-date.
+            • .npz is still the old file (either new-format or legacy-format).
+            • If .npz is new-format: sidecar exists → safe load, at worst 1 write behind.
+            • If .npz is legacy-format (migration path): sidecar exists, so
+              _load_vectors will use the new-format path and load vecs from the
+              old .npz — may mismatch, but except block catches shape errors safely.
+          Conclusion: sidecar-first ordering is strictly safer than npz-first.
         """
         if not self._dirty:
             return
@@ -975,14 +1045,14 @@ class LongTermMemoryV1:
         vecs     = np.stack(self._vec_list, axis=0).astype(np.float32)
         tmp_base = self._npz[:-4] + "_tmp"   # strip .npz, add _tmp suffix
         tmp      = tmp_base + ".npz"
-        # Write float32 vectors (no pickle needed)
-        np.savez_compressed(tmp_base, vecs=vecs)
-        os.replace(tmp, self._npz)
-        # Write vids + meta as safe JSON sidecar (atomic)
+        # STEP 1: Write JSON sidecar FIRST (crash-safe ordering — see docstring)
         side_data = {"vids": self._vids, "meta": self._meta_list}
         with open(sidecar_tmp, "w", encoding="utf-8") as f:
             json.dump(side_data, f, ensure_ascii=False)
         os.replace(sidecar_tmp, sidecar)
+        # STEP 2: Write float32 vectors (no pickle needed) — after sidecar is safe
+        np.savez_compressed(tmp_base, vecs=vecs)
+        os.replace(tmp, self._npz)
         self.embedder.save(self.dir)
         self._dirty = False
 
@@ -1897,12 +1967,23 @@ class LongTermMemoryV1:
             self._ensure_arr()
             if self._vecs_arr is None:
                 return
-            # Freeze _dirty for the duration of the loop: _ensure_arr won't rebuild
-            # again because the condition checks self._dirty OR shape mismatch.
-            # We restore _dirty = True after the loop if we did any merges,
-            # so the final _save_vectors() can detect pending changes.
+            # INVARIANT: _dirty is temporarily set to False for the duration of the
+            # consolidate loop.  This is intentional and safe ONLY because:
+            #   1. consolidate() holds self._lock for its entire execution.
+            #   2. No other thread can modify _vec_list/_vids/_meta_list while we hold
+            #      the lock, so the frozen _vecs_arr built by _ensure_arr() above stays
+            #      consistent for the whole loop.
+            #   3. _ensure_arr() condition is `_dirty OR shape-mismatch`; setting
+            #      _dirty=False prevents O(n) per-iteration array rebuilds inside
+            #      _vector_search while still allowing shape-mismatch to trigger a
+            #      rebuild if the array were ever invalidated (defensive guard).
+            #   4. _was_dirty is restored at the end so _save_vectors() can correctly
+            #      detect whether a disk flush is needed after the loop.
+            # WARNING: If the lock strategy changes in future (e.g. lock downgrade or
+            # async re-embed), this section MUST be re-evaluated — setting _dirty=False
+            # without holding the lock for the full duration would be a race condition.
             _was_dirty = self._dirty
-            self._dirty = False   # prevent per-iteration rebuild inside _vector_search
+            self._dirty = False   # prevent per-iteration rebuild — see INVARIANT above
 
             merged: set = set()   # set of vids to remove
 
@@ -2090,7 +2171,11 @@ class LongTermMemoryV1:
                 neg_counts = {True: 0, False: 0}
                 for idx in unprocessed_idxs:
                     neg_counts[self._has_negation(self._meta_list[idx].get("text", ""))] += 1
-                neg_dominant = neg_counts[True] >= neg_counts[False]   # majority polarity
+                # FIX: ties (50/50) default to False (non-negated polarity).
+                # Negated memories are rarer in practice; letting a tie resolve to
+                # True (negated) would exclude the larger non-negated group from
+                # the cluster, which is the wrong outcome in the typical case.
+                neg_dominant = neg_counts[True] > neg_counts[False]   # ties → False
 
                 cluster = []
                 for idx in unprocessed_idxs:
@@ -2316,9 +2401,24 @@ class WorkingMemoryV1:
                 return len(self.tokenizer.encode(content, add_bos=False, add_eos=False))
             except Exception:
                 pass
-        # FIX: Vietnamese words are not space-separated like English;
-        # character-based estimate (len/4) is more accurate than word-split * 1.3
-        return max(1, len(content) // 4)
+        # IMPROVE: hybrid token estimator for mixed Vietnamese/English text.
+        # Previous len(content)//4 treated every 4 chars as 1 token regardless
+        # of language, which under-counted Vietnamese (avg syllable ~3 chars) and
+        # over-counted English (avg word ~5 chars).
+        #
+        # Better approximation:
+        #   • Vietnamese: each whitespace-delimited syllable ≈ 1 BPE sub-token.
+        #     word_count * 1.3 accounts for punctuation and multi-syllable terms.
+        #   • English: each whitespace word ≈ 1.3 BPE tokens on average.
+        #   • Mixed text: the formula self-corrects because VI has more words per
+        #     sentence than EN for the same semantic content.
+        #
+        # Formula: max(char_estimate, word_estimate) acts as a conservative upper
+        # bound — it prefers to trim slightly earlier rather than let the buffer
+        # grow silently beyond budget.
+        word_est = max(1, int(len(content.split()) * 1.3))
+        char_est = max(1, len(content) // 4)
+        return max(word_est, char_est)
 
     def add(self, role: str, content: str, meta: dict = None,
             is_thinking: bool = False):
