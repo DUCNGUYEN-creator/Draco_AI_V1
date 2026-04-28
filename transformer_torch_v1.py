@@ -62,7 +62,14 @@ FIXES (V1 — final consolidated):
          weight mtp_aux_coeff=0.1). Previously W1/W2 received no direct training signal.
     ✅ FIX DDP-VOCAB: train_step uses model.module when DDP-wrapped (vocab_size access safe).
     ✅ FIX TORCH-LOAD: torch.load() passes weights_only=False to suppress PyTorch 2.4+ warning.
-    ✅ FIX FREEZE-EXPERTS: Added freeze_experts()/unfreeze_experts() for router-only training."""
+    ✅ FIX FREEZE-EXPERTS: Added freeze_experts()/unfreeze_experts() for router-only training.
+    ✅ QLORA: enable_qlora(rank, alpha) replaces attention projections with bitsandbytes NF4
+         4-bit quantised base + float16 LoRA adapters. Enables full-model fine-tuning on a
+         single 24 GB GPU for a 9B model. merge_qlora() dequantises and absorbs adapters
+         before _full_sync() to the NumPy inference model.
+    ✅ EXPORT GGUF: export_gguf(path) creates a temporary NumPy model, syncs weights, then
+         calls GGUFExporter.write_gguf(). After export, quantise with llama.cpp:
+         llama-quantize out_fp16.gguf out_q4km.gguf Q4_K_M"""
 
 from __future__ import annotations
 
@@ -681,6 +688,152 @@ if HAS_TORCH:
                         p.requires_grad_(True)
                 for p in blk.moe.shared.parameters():
                     p.requires_grad_(True)
+
+        def enable_qlora(self, rank: int = 8, alpha: float = 16.0,
+                         target_modules: Optional[List[str]] = None,
+                         compute_dtype: "torch.dtype" = None):
+            """
+            QLoRA: 4-bit quantised base weights + trainable LoRA adapters.
+            Requires: pip install bitsandbytes
+
+            How it works:
+              1. Base linear weights are quantised to NF4 (4-bit) via bitsandbytes.
+              2. LoRA low-rank adapters (rank × in + out × rank float16 params) are
+                 added on top — only these are trained.
+              3. Effective memory: ~0.5 bytes/param for base + small LoRA overhead.
+              4. After training, call merge_qlora() to absorb LoRA into dequantised
+                 weights, then _full_sync() to copy to NumPy inference model.
+
+            target_modules: list of attn projection names to apply QLoRA on.
+                            Default: ["W_q", "W_v"]  (standard PEFT practice)
+            compute_dtype:  dtype for LoRA computation. Default: torch.float16.
+                            Use torch.bfloat16 on Ampere+ GPUs.
+
+            Usage:
+                model = DracoTransformerTorchV1(config).cuda()
+                model.enable_qlora(rank=16, alpha=32)
+                optimizer = torch.optim.AdamW(
+                    filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4)
+                # Train normally with train_step(model, optimizer, ...)
+                model.merge_qlora()
+                model._full_sync(numpy_model)
+            """
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "bitsandbytes not installed. Install with:\n"
+                    "  pip install bitsandbytes\n"
+                    "bitsandbytes requires CUDA — CPU-only machines cannot use QLoRA.\n"
+                    "Alternative for CPU: use enable_lora() with standard float16."
+                )
+
+            if compute_dtype is None:
+                compute_dtype = torch.float16
+            if target_modules is None:
+                target_modules = ["W_q", "W_v"]
+
+            # Freeze everything first
+            for p in self.parameters():
+                p.requires_grad_(False)
+
+            for blk in self.blocks:
+                attn = blk.attn
+                for attr in target_modules:
+                    lin = getattr(attn, attr, None)
+                    if lin is None:
+                        continue
+                    # Unwrap LoRALinear if already applied
+                    if isinstance(lin, LoRALinear):
+                        lin = lin.linear
+                    if not isinstance(lin, nn.Linear):
+                        continue
+                    in_f  = lin.in_features
+                    out_f = lin.out_features
+                    # Create 4-bit quantised base layer
+                    q_lin = bnb.nn.Linear4bit(
+                        in_f, out_f,
+                        bias=False,
+                        compute_dtype=compute_dtype,
+                        compress_statistics=True,
+                        quant_type="nf4",
+                    )
+                    # Copy existing weights; bnb will quantise them on first forward()
+                    q_lin.weight = bnb.nn.Params4bit(
+                        lin.weight.data.to(compute_dtype),
+                        requires_grad=False,
+                        quant_type="nf4",
+                    )
+                    # LoRA adapters on top (float16, trainable)
+                    lora = LoRALinear(in_f, out_f, rank=rank, alpha=alpha, bias=False)
+                    lora.linear = q_lin          # swap base to 4-bit
+                    lora.lora_A.data = lora.lora_A.data.to(compute_dtype)
+                    lora.lora_B.data = lora.lora_B.data.to(compute_dtype)
+                    lora.lora_A.requires_grad_(True)
+                    lora.lora_B.requires_grad_(True)
+                    setattr(attn, attr, lora)
+
+        def merge_qlora(self):
+            """Merge QLoRA adapters — dequantises 4-bit base then adds LoRA delta.
+            After this call, the layer is a standard float16 nn.Linear.
+            Required before _full_sync() so NumPy model gets full-precision weights.
+            """
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError("bitsandbytes not installed.")
+
+            for blk in self.blocks:
+                for attr in ["W_q", "W_k", "W_v", "W_o"]:
+                    mod = getattr(blk.attn, attr, None)
+                    if not isinstance(mod, LoRALinear):
+                        continue
+                    if not isinstance(mod.linear, bnb.nn.Linear4bit):
+                        # Standard LoRA — use existing merge()
+                        mod.merge()
+                        continue
+                    # Dequantise 4-bit base weight
+                    with torch.no_grad():
+                        w_fp = bnb.functional.dequantize_4bit(
+                            mod.linear.weight.data,
+                            mod.linear.weight.quant_state,
+                        ).to(torch.float32)
+                        if not mod.merged:
+                            delta = (mod.lora_B @ mod.lora_A) * mod.scaling
+                            w_fp  = w_fp + delta.to(torch.float32)
+                    # Replace with standard float16 nn.Linear
+                    new_lin = nn.Linear(mod.linear.in_features,
+                                        mod.linear.out_features, bias=False)
+                    new_lin.weight.data.copy_(w_fp.to(torch.float16))
+                    # Replace LoRALinear with plain merged linear
+                    setattr(blk.attn, attr, new_lin)
+
+        def export_gguf(self, output_path: str,
+                        numpy_model_config: Optional[dict] = None) -> str:
+            """
+            Export this PyTorch model to GGUF FP16 via the NumPy GGUFExporter.
+            Steps:
+              1. Creates a temporary DracoTransformerV1 (NumPy) from this model's config.
+              2. Calls _full_sync() to copy weights to it.
+              3. Calls GGUFExporter.write_gguf() on the NumPy model.
+
+            After export, quantise with llama.cpp:
+                llama-quantize <output_path> out_q4km.gguf Q4_K_M
+
+            Requires: transformer_v1.py importable (same directory or PYTHONPATH).
+            """
+            try:
+                from transformer_v1 import DracoTransformerV1, GGUFExporter
+            except ImportError:
+                raise ImportError(
+                    "transformer_v1.py must be importable to use export_gguf().\n"
+                    "Ensure both files are in the same directory."
+                )
+            cfg = numpy_model_config or self.config
+            np_model = DracoTransformerV1(cfg)
+            self._full_sync(np_model)
+            GGUFExporter(np_model).write_gguf(output_path)
+            return output_path
 
         def load_external_weights(self, state_dict: dict, from_checkpoint: bool = True):
             """FIX: Expert AVERAGING (same logic as NumPy version)."""
