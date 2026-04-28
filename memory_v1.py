@@ -73,8 +73,32 @@ PRODUCTION HARDENING:
     - _w() logs OSError instead of silently swallowing write failures.
     - All critical sections are documented.
 
-FIXES vs V1.2 (this version):
-    [BUG-C (definitive)] embed() in search() / replay_relevant() still read self.embedder.vocab
+FIXES vs V1 (this version):
+    [BUG-C (complete)] embed() called without snapshot in store(), _semantic_duplicate(),
+          _re_embed_all(), and consolidate_by_topic() centroid-fallback path — these
+          callers were missing vocab_override / idf_override / synonym_map_override even
+          though search() and replay_relevant() had already been fixed.
+          Fixed: ALL embed() call sites inside LongTermMemoryV1 now receive explicit
+          snapshots, making embed() touch ZERO shared mutable state from any caller.
+          _semantic_duplicate() signature extended with the three override params and
+          store() snapshots embedder state once per call (inside lock) then passes them
+          to both _semantic_duplicate() and the final embed() call.
+          _re_embed_all() snapshots vocab/idf/syns once before the loop.
+          consolidate_by_topic() centroid-fallback embed() passes a local snapshot.
+    [BUG] _maybe_save(): _store_count % BATCH_SAVE == 0 evaluated True when
+          _store_count == 0 (immediately after __init__ or after a full clear), causing
+          a spurious _save_vectors() call on the very first flush check.
+          Fixed: added _store_count > 0 guard before the modulo check.
+    [IMPROVE] _apply_synonyms() extended to accept an explicit synonym_map parameter
+          so callers with a pre-snapshotted dict can avoid shared-state access.
+          The method is now a proper public utility (embed() still inlines the expansion
+          for performance, but subclasses / external callers can use _apply_synonyms()).
+    [IMPROVE] Counter import moved to module level (was inside _summarize_cluster()
+          which caused a repeated import on every consolidate_by_topic() call).
+    [NOTE] consolidate_by_topic() pre-lock TOCTOU on embedder.vocab / _meta_list is
+          documented as benign: fit_embedder() is idempotent and lock-guarded; the
+          worst case is a redundant call, never a crash or data corruption.
+    [BUG-C (definitive, original)] embed() in search() / replay_relevant() still read self.embedder.vocab
           and self.embedder.idf directly even after a snapshot was taken — the snapshot was
           captured but never passed into embed(), leaving the data race fully intact.
           Fixed properly in two parts:
@@ -224,7 +248,7 @@ import time
 import hashlib
 import re
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
@@ -313,7 +337,8 @@ class MiniEmbedder:
         bigrams = [f"{tokens[i]}_{tokens[i+1]}" for i in range(len(tokens) - 1)]
         return tokens, bigrams
 
-    def _apply_synonyms(self, tokens: List[str]) -> List[str]:
+    def _apply_synonyms(self, tokens: List[str],
+                        synonym_map: Optional[Dict[str, str]] = None) -> List[str]:
         """Replace tokens with their canonical synonym where a mapping exists.
 
         IMPROVE: Partial fix for the BoW synonym-blindness problem.
@@ -325,13 +350,19 @@ class MiniEmbedder:
         _tokenize() splits on whitespace and punctuation.  This method only
         handles single-token mappings (post-tokenization).
 
-        Thread-safety: reads self.synonym_map which is only mutated by
-        set_synonyms() / load(); callers that hold self._lock (fit, embed inside
-        store) are safe. search() embed call uses a snapshot (see embed() below).
+        NOTE: embed() inlines the synonym expansion directly (for performance
+        and snapshot-safety). This method is kept as a public utility for
+        subclasses or external callers that need standalone synonym expansion.
+        Pass synonym_map explicitly to avoid shared-state access in threaded code.
+
+        Thread-safety: if synonym_map is not supplied, reads self.synonym_map
+        which is only mutated by set_synonyms() / load(); callers that hold
+        self._lock are safe. For lock-free callers, pass a pre-snapshotted dict.
         """
-        if not self.synonym_map:
+        _syns = synonym_map if synonym_map is not None else self.synonym_map
+        if not _syns:
             return tokens
-        return [self.synonym_map.get(tok, tok) for tok in tokens]
+        return [_syns.get(tok, tok) for tok in tokens]
 
     def fit(self, texts: List[str]):
         if self._frozen:
@@ -959,7 +990,11 @@ class LongTermMemoryV1:
 
     # ── Semantic duplicate check ─────────────────────────────────────
     def _semantic_duplicate(self, text: str, sim_threshold: float = 0.90,
-                             jaccard_threshold: float = 0.30) -> Optional[str]:
+                             jaccard_threshold: float = 0.30,
+                             vocab_override: Optional[Dict[str, int]] = None,
+                             idf_override: Optional[Dict[str, float]] = None,
+                             synonym_map_override: Optional[Dict[str, str]] = None,
+                             ) -> Optional[str]:
         """Check top-N candidates for semantic duplicate with negation guard.
 
         FIX: Threshold lowered from 0.95 → 0.90 so near-paraphrases like
@@ -973,12 +1008,20 @@ class LongTermMemoryV1:
         FIX: Increased top_k from 3 to min(10, n) to avoid missing duplicates
         when the vector space is dense (thousands of entries).
 
+        FIX BUG-C (store path): accepts vocab_override / idf_override /
+        synonym_map_override so embed() reads zero shared mutable state — the
+        caller (store()) snapshots the embedder state under lock and passes it here.
+
         NOTE: This method MUST be called while already holding self._lock
         (store() acquires the lock before calling this).
         """
         if not self._vec_list:
             return None
-        q_vec = self.embedder.embed(text)   # already normalized
+        # FIX BUG-C: pass snapshot overrides so embed() is free of shared-state access
+        q_vec = self.embedder.embed(text,
+                                    vocab_override=vocab_override,
+                                    idf_override=idf_override,
+                                    synonym_map_override=synonym_map_override)  # already normalized
         top_k = min(10, len(self._vec_list))
         indices, sims = self._vector_search(q_vec, top_k=top_k)
         # FIX: use _tokenize_with_bigrams for Jaccard so the token space matches
@@ -1034,8 +1077,21 @@ class LongTermMemoryV1:
             # a single scan instead of two O(n) scans).
             vid_to_idx: Dict[str, int] = {v: i for i, v in enumerate(self._vids)}
 
+            # FIX BUG-C (store path): snapshot embedder state inside lock so that
+            # embed() in _semantic_duplicate() and the final vec = embed(text) call
+            # both touch ZERO shared mutable state — consistent with the fix already
+            # applied in search() and replay_relevant().
+            # Although store() holds self._lock, passing snapshots makes embed()
+            # fully side-effect-free and simplifies future refactoring / testing.
+            _emb_vocab = dict(self.embedder.vocab)
+            _emb_idf   = dict(self.embedder.idf)
+            _emb_syns  = dict(self.embedder.synonym_map)
+
             # Semantic duplicate check (with negation guard)
-            existing = self._semantic_duplicate(text)
+            existing = self._semantic_duplicate(text,
+                                                vocab_override=_emb_vocab,
+                                                idf_override=_emb_idf,
+                                                synonym_map_override=_emb_syns)
             if existing:
                 idx = vid_to_idx.get(existing)
                 if idx is not None:
@@ -1058,7 +1114,11 @@ class LongTermMemoryV1:
                 self.clear_search_cache()
                 return vid
 
-            vec  = self.embedder.embed(text)    # already normalized
+            # FIX BUG-C: pass snapshot overrides so embed() reads zero shared state
+            vec  = self.embedder.embed(text,
+                                       vocab_override=_emb_vocab,
+                                       idf_override=_emb_idf,
+                                       synonym_map_override=_emb_syns)   # already normalized
             meta = {
                 "text":        text,
                 "timestamp":   time.time(),
@@ -1086,8 +1146,12 @@ class LongTermMemoryV1:
             return vid
 
     def _maybe_save(self):
-        """Persist vectors every BATCH_SAVE stores or when dirty."""
-        if self._store_count % self.BATCH_SAVE == 0 and self._dirty:
+        """Persist vectors every BATCH_SAVE stores or when dirty.
+
+        FIX: Added self._store_count > 0 guard so the modulo check does not
+        fire spuriously when store_count is 0 (e.g. immediately after __init__).
+        """
+        if self._store_count > 0 and self._store_count % self.BATCH_SAVE == 0 and self._dirty:
             self._save_vectors()
 
     def flush_vectors(self):
@@ -1123,10 +1187,26 @@ class LongTermMemoryV1:
         IMPROVE: Bumps _emb_version after re-embedding so callers can detect
         embedding drift.  Each vector's metadata gets 'emb_version' updated so
         stale entries can be identified without a full scan.
+
+        FIX BUG-C (_re_embed_all path): snapshot vocab/idf/synonym_map once
+        before the loop so every embed() call inside the loop reads from an
+        immutable snapshot rather than the live (potentially mutating) dicts.
+        Although this method is always called under self._lock, taking the
+        snapshot makes the code consistent with all other embed() call sites
+        and guards against any future refactoring that removes the lock.
         """
         self._emb_version += 1
+        # Snapshot embedder state once — all embed() calls below use this snapshot
+        _vocab = dict(self.embedder.vocab)
+        _idf   = dict(self.embedder.idf)
+        _syns  = dict(self.embedder.synonym_map)
         for i, meta in enumerate(self._meta_list):
-            self._vec_list[i] = self.embedder.embed(meta["text"])  # normalized
+            self._vec_list[i] = self.embedder.embed(
+                meta["text"],
+                vocab_override=_vocab,
+                idf_override=_idf,
+                synonym_map_override=_syns,
+            )  # normalized
             meta["emb_version"] = self._emb_version
         self._dirty = True
         self._save_vectors()
@@ -1825,7 +1905,14 @@ class LongTermMemoryV1:
         For production use with an LLM backend, replace _summarize_cluster()
         with an LLM call that generates a proper natural-language summary.
         """
-        # Guard: auto-fit embedder if vocab is empty so sims are meaningful
+        # Guard: auto-fit embedder if vocab is empty so sims are meaningful.
+        # FIX: both self.embedder.vocab and self._meta_list are read here without
+        # the lock — this is a benign TOCTOU (worst case: we call fit_embedder()
+        # once unnecessarily, or skip it when vocab becomes empty concurrently).
+        # fit_embedder() itself is fully lock-guarded and idempotent, so the
+        # redundant call is safe.  We keep this outside the lock intentionally
+        # because fit_embedder() acquires self._lock internally — calling it
+        # from inside the with-self._lock block below would deadlock.
         if not self.embedder.vocab and self._meta_list:
             self.fit_embedder()   # acquires lock internally; safe to call here
         summaries_created = 0
@@ -1912,7 +1999,18 @@ class LongTermMemoryV1:
                 if norm_c > 1e-8:
                     centroid /= norm_c
                 else:
-                    centroid = self.embedder.embed(summary_text)
+                    # FIX BUG-C: pass snapshot overrides — we are inside self._lock
+                    # and _emb_vocab/_emb_idf/_emb_syns must be captured here.
+                    # Build snapshot at this point (inside the with self._lock block).
+                    _cbt_vocab = dict(self.embedder.vocab)
+                    _cbt_idf   = dict(self.embedder.idf)
+                    _cbt_syns  = dict(self.embedder.synonym_map)
+                    centroid = self.embedder.embed(
+                        summary_text,
+                        vocab_override=_cbt_vocab,
+                        idf_override=_cbt_idf,
+                        synonym_map_override=_cbt_syns,
+                    )
 
                 combined_freq = min(sum(freqs), 9999)
                 combined_imp  = min(3.0, sum(imps) / len(imps) * 1.1)
@@ -1977,8 +2075,8 @@ class LongTermMemoryV1:
         The summary always ends with an indicator of the cluster size so the
         resulting memory is clearly marked as a consolidation artifact.
         """
-        from collections import Counter
         # Minimal stop-words (Vietnamese + English)
+        # NOTE: Counter is imported at module level (no local import needed)
         STOP = {"là", "của", "và", "có", "the", "a", "an", "is", "in", "to",
                 "for", "on", "at", "by", "or", "be", "as", "it", "its", "that"}
         token_counts: Counter = Counter()
