@@ -16,7 +16,6 @@ DracoAI V1 — Main Engine (Production‑ready)
 ===========================================
 Tích hợp đầy đủ ThinkingEngineV1, Memory, Transformer thông qua TransformerBridge.
 Tương thích với: engine_v1.py, transformer_v1.py, tokenizer.py, memory_v1.py
-chưa xong hẳn thông cảm nha.
 
 Changelog V1 (fixes):
   [A] _register_query_hash: FIFO eviction + threading.Lock chống race condition
@@ -159,6 +158,23 @@ Changelog V1 (patch-9 – architecture & correctness):
           thỏa mãn: generate hoàn thành (_generate_completed[0]) VÀ toàn bộ token đã
           deliver cho client (yield_done); tránh lưu khi generator bị drop giữa stream.
 
+Changelog V1 (patch-11 – hybrid tool-calling implementation & hardening):
+  [hybrid-1] _parse_tool_call(text): trích (action, input) từ [ACTION: input] bằng
+          _TOOL_CALL_PATTERN; chỉ chấp nhận action trong ALLOWED_TOOLS_FOR_LLM
+          (calc, recall, read_file) – an toàn, không để LLM gọi side-effect skill.
+  [hybrid-2] _TOOL_INPUT_PREFIX + _execute_tool: skill read_file/recall dùng regex
+          bắt câu lệnh đầy đủ; khi LLM truyền input thuần ("report.txt", "Python")
+          cần ghép tiền tố tương ứng ("đọc file ", "bạn có nhớ ") để regex khớp –
+          fix bug trả None thay vì kết quả thực sự.
+  [hybrid-3] tool_hint: hướng dẫn LLM chỉ xuất đúng một cú pháp tool trên một dòng
+          riêng, không kèm văn bản; ngăn _parse_tool_call bỏ sót tool call thứ hai
+          khi LLM viết text + [CALC:...] + text trong cùng một lượt.
+  [hybrid-4] Loop dùng base_conversation + tool_results_this_turn tách biệt;
+          trim chỉ áp dụng lên base – tool results không bao giờ bị cắt giữa chừng;
+          loại bỏ context overflow khi tool loop kéo dài nhiều rounds.
+  [hybrid-note] stream_chat() giữ nguyên pipeline cũ (buffered stream) –
+          tool loop không áp dụng cho stream; documented rõ trong docstring.
+
 Changelog V1 (patch-10 – bug fixes & hardening):
   [fix-p10-1] _LEARN_BAD_OPINION_WORDS: khai báo frozenset module-level (tiếng Việt + tiếng Anh);
           fix NameError crash trong _auto_learn khi gặp desc chứa từ tiêu cực.
@@ -246,6 +262,18 @@ _LEARN_ALLOW_SINGLE = frozenset({
 
 # ── [E] Context window limit ───────────────────────────────────────────────────
 MAX_HISTORY_TURNS = 20  # 1 lượt = user + assistant
+
+# ── [Hybrid Tool Calling] ──────────────────────────────────────────────────────
+# Số lần LLM được phép gọi tool trong một lượt chat() (tránh vòng lặp vô tận)
+MAX_TOOL_ROUNDS = 3
+
+# Chỉ những skill DETERMINISTIC, không side-effect mới được LLM tự động gọi.
+# Không bao giờ để LLM tự gọi remember / create_file / save_code.
+ALLOWED_TOOLS_FOR_LLM: frozenset = frozenset({"calc", "recall", "read_file"})
+
+# Regex bắt cú pháp [ACTION: input] mà LLM sinh ra
+# Ví dụ: [CALC: 2+3*4]  [RECALL: Python]  [READ_FILE: notes.txt]
+_TOOL_CALL_PATTERN = re.compile(r"\[(\w+):\s*(.*?)\]", re.IGNORECASE)
 
 # ── [K][Q] Skill file sandbox – dùng __file__ thay getcwd() để stable dù chạy từ bất kỳ cwd
 # [fix-base] os.getcwd() thay đổi theo working dir → tạo folder lung tung
@@ -898,6 +926,51 @@ class DracoEngineV1:
         return True, detected_lang
 
     # ══════════════════════════════════════════════════════════════════
+    # [Hybrid] Tool-call helpers
+    # ══════════════════════════════════════════════════════════════════
+    def _parse_tool_call(self, text: str) -> Optional[Tuple[str, str]]:
+        """Trích xuất (action, input) từ cú pháp [ACTION: input] mà LLM sinh ra.
+        Chỉ chấp nhận action nằm trong ALLOWED_TOOLS_FOR_LLM – không để LLM
+        tự gọi remember/create_file/save_code.
+        """
+        m = _TOOL_CALL_PATTERN.search(text)
+        if m:
+            action = m.group(1).strip().lower()
+            inp    = m.group(2).strip()
+            if action in ALLOWED_TOOLS_FOR_LLM:
+                return action, inp
+        return None
+
+    # Map action → tiền tố cần ghép để regex của skill khớp khi LLM truyền tên file/từ khoá thuần
+    _TOOL_INPUT_PREFIX: Dict[str, str] = {
+        "read_file": "đọc file ",   # skill_read_file regex cần "đọc|mở|xem|read|open|load ..."
+        "recall":    "bạn có nhớ ", # skill_recall trigger: "bạn có nhớ", "recall", v.v.
+    }
+
+    def _execute_tool(self, action: str, inp: str) -> str:
+        """Chạy skill được LLM yêu cầu và trả kết quả dạng chuỗi.
+
+        Một số skill (read_file, recall) dùng regex bắt câu lệnh đầy đủ.
+        Khi LLM gọi [READ_FILE: report.txt] chỉ truyền tên file thuần →
+        cần ghép tiền tố tương ứng từ _TOOL_INPUT_PREFIX để regex khớp.
+
+        Chỉ gọi skill trong ALLOWED_TOOLS_FOR_LLM – không trigger side-effect.
+        Nếu skill trả None hoặc raise Exception → trả thông báo rõ ràng.
+        """
+        entry = self._skills.get(action)
+        if entry is None:
+            return f"[{action}] không tìm thấy skill."
+        fn, _, _ = entry
+        # Ghép tiền tố nếu cần để regex của skill khớp
+        prefix = self._TOOL_INPUT_PREFIX.get(action, "")
+        effective_inp = f"{prefix}{inp}" if prefix else inp
+        try:
+            r = fn(effective_inp, {}, {})
+            return str(r) if r is not None else f"[{action}] không trả về kết quả."
+        except Exception as e:
+            return f"Lỗi khi chạy {action}: {e}"
+
+    # ══════════════════════════════════════════════════════════════════
     # [E][N] Context trimming helper
     # ══════════════════════════════════════════════════════════════════
     @staticmethod
@@ -1050,26 +1123,82 @@ class DracoEngineV1:
             "intent_bias":    intent_bias_arr,
         }
 
-        # 6. Generate – [L] try/except chống crash
-        try:
-            new_tokens = self.bridge.generate(prompt_ids, **gen_kwargs)
-        except Exception as e:
-            _log.error("Generate failed: %s", e)
-            return {
-                "reply":          f"❌ Lỗi sinh văn bản: {e}",
-                "intent":         intent,
-                "thought_plan":   {},
-                "skill":          "transformer",
-                "time_ms":        int((time.time() - t0) * 1000),
-                "critique":       {},
-                "confidence_avg": 0.0,
-                # [err] Structured error surface để client xử lý
-                "error_code":     "GENERATE_FAILED",
-                "retry_hint":     "Thử lại sau vài giây hoặc giảm max_tokens.",
-            }
+        # 6. Hybrid reasoning loop – [L] LLM được phép gọi tool tối đa MAX_TOOL_ROUNDS lần
+        # Cú pháp: [CALC: ...] / [RECALL: ...] / [READ_FILE: ...]
+        # Kết quả tool được inject lại vào conversation (role "tool") trước khi generate tiếp.
+        # Nếu không có tool call → lấy ngay làm final reply.
+        # stream_chat() vẫn dùng pipeline cũ (buffered stream, không hỗ trợ tool loop).
+        conversation = list(engine_out["messages"])
 
-        # 7. Decode
-        reply    = self.tokenizer.decode(new_tokens).strip() or "..."
+        # Gắn system hint hướng dẫn tool nếu chưa có trong conversation
+        _tool_syntax_marker = "công cụ bằng cú pháp"
+        if not any(_tool_syntax_marker in m.get("content", "") for m in conversation):
+            tool_hint = (
+                "Bạn có thể gọi công cụ bằng cú pháp:\n"
+                "  [CALC: biểu thức]       — tính toán số học\n"
+                "  [RECALL: từ khóa]       — nhớ lại kiến thức đã lưu\n"
+                "  [READ_FILE: tên_file]   — đọc file trong ai_workspace/\n"
+                "Khi cần dùng tool, hãy chỉ xuất ra đúng một cú pháp đó trên một dòng riêng, "
+                "không viết thêm văn bản nào khác trong cùng lượt đó. "
+                "Sau khi nhận kết quả tool, mới tiếp tục trả lời bình thường."
+            )
+            conversation.append({"role": "system", "content": tool_hint})
+
+        # Snapshot conversation gốc (trước khi tool loop bắt đầu).
+        # Chiến lược trim an toàn: chỉ trim phần base (history + system hints),
+        # KHÔNG bao giờ cắt tool_results_this_turn (LLM cần thấy kết quả tool
+        # của vòng hiện tại để tiếp tục suy nghĩ; cắt mất → logic sai hoàn toàn).
+        base_conversation = list(conversation)
+
+        rounds = 0
+        tool_results_this_turn: List[dict] = []  # tool results tích lũy trong lượt này
+        final_reply = ""
+
+        while rounds < MAX_TOOL_ROUNDS:
+            # Trim history gốc để tránh context overflow qua nhiều tool rounds.
+            # Tool results luôn được ghép NGUYÊN VẸN sau base đã trim.
+            trimmed_base = self._trim_history(base_conversation, max_turns=MAX_HISTORY_TURNS)
+            current_conversation = trimmed_base + tool_results_this_turn
+
+            current_prompt_ids = self.thinking.tokenize_prompt(current_conversation)
+            try:
+                new_tokens = self.bridge.generate(current_prompt_ids, **gen_kwargs)
+            except Exception as e:
+                _log.error("Generate failed (round %d): %s", rounds, e)
+                return {
+                    "reply":          f"❌ Lỗi sinh văn bản: {e}",
+                    "intent":         intent,
+                    "thought_plan":   {},
+                    "skill":          "transformer",
+                    "time_ms":        int((time.time() - t0) * 1000),
+                    "critique":       {},
+                    "confidence_avg": 0.0,
+                    "error_code":     "GENERATE_FAILED",
+                    "retry_hint":     "Thử lại sau vài giây hoặc giảm max_tokens.",
+                }
+
+            raw_output = self.tokenizer.decode(new_tokens).strip()
+            tool_call  = self._parse_tool_call(raw_output)
+
+            if tool_call:
+                action, inp = tool_call
+                tool_result = self._execute_tool(action, inp)
+                _log.debug("Tool call [%s: %s] → %s", action, inp, tool_result[:80])
+                tool_results_this_turn.append({
+                    "role":    "tool",
+                    "content": f"[RESULT:{action}] {tool_result}",
+                })
+                rounds += 1
+                continue  # LLM suy nghĩ tiếp với kết quả tool
+            else:
+                final_reply = raw_output
+                break
+
+        # Nếu vẫn chưa có reply sau MAX_TOOL_ROUNDS (tool gọi liên tục không kết thúc)
+        if not final_reply:
+            final_reply = "Tôi cần thêm thời gian suy nghĩ về câu hỏi này..."
+
+        reply    = final_reply
         avg_conf = engine_out.get("calibrated_confidence", 0.8)
 
         # 8. Update memory
