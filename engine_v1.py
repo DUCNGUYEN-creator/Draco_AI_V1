@@ -73,6 +73,9 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
          handled on main thread while waiting → up to 30–50% latency reduction
     ✅ [THREAD-SAFE] _kg_lock (threading.Lock) guards KG/TemporalKG writes
     ✅ [THREAD-SAFE] _balancer_lock guards load_balancer.record_usage()
+    ✅ [THREAD-SAFE] _LockedBridge proxy serializes ALL bridge.generate() calls globally —
+         covers GoalDecomposer, PlanDecomposer, MultiAgentDebate, AbductionEngine,
+         CounterfactualReasoner and any future module that receives bridge= param
     ✅ [HELPERS] _safe_extract_triples(), _compute_reasoning_path() extracted
     ✅ [TEST-FIX] LoadBalancer self-test uses fresh instance (no process() bleed)
     ✅ [TEST-FIX] ContextWindowManager self-test uses 600-char msgs to exceed limit
@@ -102,7 +105,19 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
     ✅ [CONTEXT-REWRITE] Sanitizer applied to all external content before prompt injection
     ✅ [TRANSFORMER-COMPAT] engine→transformer interface: expert_boost→intent_boost array,
          intent dict → intent_bias array, miro_tau passed to generate() correctly
-    ── FIXES V1.3 ─────────────────────────────────────────────────────────────
+    ── FIXES V1.5 ─────────────────────────────────────────────────────────────
+    ✅ [RACE-FIX-LLM]  _LockedBridge proxy class added — wraps TransformerBridge and
+         serializes ALL bridge.generate() calls through a single threading.Lock.
+         ThinkingEngineV1.__init__ wraps self.bridge in _LockedBridge immediately
+         after construction; this locked proxy is passed to ALL sub-modules that
+         accept bridge= (GoalDecomposer, PlanDecomposer, MultiAgentDebate,
+         AbductionEngine, CounterfactualReasoner, _run_tot_with_llm, etc.).
+         Every generate() call — regardless of which thread or module makes it —
+         is serialized without modifying any individual module. Eliminates
+         KVCache corruption and RoPE-offset races in the NumPy backend.
+    ✅ [SANITIZER-V2]  PromptSanitizer.sanitize() now calls html.unescape() before
+         regex matching — blocks HTML-entity bypass variants such as
+         &lt;|im_start|&gt; that would survive the previous pattern check
     ✅ [ASTAR-FIX]   A* cost now inverted (cost=1/(w+eps)) — prefers high-weight (strong) edges
     ✅ [SANITIZER-FIX] PromptSanitizer: IGNORECASE added to all patterns; <<sys>> bypass closed;
          added <|system|> and [/INST] patterns for broader coverage
@@ -130,6 +145,7 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
 
 import re
 import ast
+import html
 import json
 import math
 import time
@@ -211,6 +227,51 @@ except ImportError:
                 "intent_boost": boost_arr, "intent_bias": intent_bias,
                 "_miro_tau_hint": miro_tau,
             }
+
+# ══════════════════════════════════════════════════════════════════════
+# LOCKED BRIDGE PROXY — thread-safe wrapper for TransformerBridge
+# ══════════════════════════════════════════════════════════════════════
+class _LockedBridge:
+    """
+    Transparent proxy that serializes all bridge.generate() calls via a
+    shared threading.Lock.
+
+    WHY: NumPy-backend DracoTransformerV1 mutates KVCache in-place during
+    generate(). When ThreadPoolExecutor runs multiple LLM-calling tasks
+    concurrently (ToT, Council, GoalDecomposer, PlanDecomposer, etc.) they
+    all receive the same bridge instance and race on the same cache.
+
+    SOLUTION: ThinkingEngineV1 wraps self.bridge in a _LockedBridge and
+    passes this proxy (not the raw bridge) to every sub-module that accepts
+    a bridge= parameter. The proxy forwards every attribute/call unchanged,
+    except generate() which acquires the lock first — serializing inference
+    globally without requiring any change inside the modules themselves.
+
+    All other bridge methods (is_connected, expert_boost_to_array, etc.)
+    are forwarded instantly without acquiring the lock because they are
+    read-only or stateless.
+    """
+    def __init__(self, bridge: Any, lock: threading.Lock):
+        # Store privately to avoid shadowing forwarded attributes
+        object.__setattr__(self, '_bridge', bridge)
+        object.__setattr__(self, '_lock',   lock)
+
+    # ── Serialize only generate() ─────────────────────────────────────
+    def generate(self, prompt_ids, max_new_tokens: int = 256, **kwargs):
+        lock   = object.__getattribute__(self, '_lock')
+        bridge = object.__getattribute__(self, '_bridge')
+        with lock:
+            return bridge.generate(prompt_ids, max_new_tokens=max_new_tokens, **kwargs)
+
+    # ── Forward every other attribute/method transparently ───────────
+    def __getattr__(self, name: str):
+        bridge = object.__getattribute__(self, '_bridge')
+        return getattr(bridge, name)
+
+    def __repr__(self) -> str:
+        bridge = object.__getattribute__(self, '_bridge')
+        return f"_LockedBridge({bridge!r})"
+
 
 # ── Expert indices (8 experts from single Qwen 3.5 9B Instruct FFN) ──
 EXPERT_CODE_0   = 0
@@ -616,6 +677,9 @@ class PromptSanitizer:
     ]
 
     def sanitize(self, text: str) -> str:
+        # Decode HTML entities first (e.g. &lt;|im_start|&gt; → <|im_start|>)
+        # so patterns below catch encoded bypass variants before regex runs.
+        text = html.unescape(text)
         for pattern, replacement in self._DANGER_PATTERNS:
             text = re.sub(pattern, replacement, text, flags=re.DOTALL | re.IGNORECASE)
         return text
@@ -2892,18 +2956,29 @@ class ThinkingEngineV1:
         self.tool_crafter    = ToolCrafter()
 
         # TransformerBridge for model-engine coupling
-        # Use provided bridge (with real model) or create a stub bridge
-        self.bridge = bridge if bridge is not None else TransformerBridge()
-
-        # Tokenizer for real LLM calls in reasoning modules.
-        # Must implement .encode(text, add_bos=True) and .decode(ids).
-        # Optional alias: .encode_chat(messages, add_generation_prompt=True).
-        self.tokenizer = tokenizer
+        # Use provided bridge (with real model) or create a stub bridge.
+        # Immediately wrap in _LockedBridge so that EVERY bridge.generate()
+        # call — whether from _llm_generate(), GoalDecomposer, MultiAgentDebate,
+        # AbductionEngine, PlanDecomposer, CounterfactualReasoner, or any other
+        # module that receives bridge= — is serialized through a single lock.
+        # This eliminates KVCache / RoPE-offset races in the NumPy backend
+        # without requiring any change inside the individual modules.
+        _raw_bridge = bridge if bridge is not None else TransformerBridge()
 
         # Thread-safety locks
         self._kg_lock       = threading.Lock()
         self._balancer_lock = threading.Lock()
         self._router_lock   = threading.Lock()   # Guards SelfEvolvingRouter state
+        self._bridge_lock   = threading.Lock()   # Shared lock for _LockedBridge proxy
+
+        # Expose the locked proxy as self.bridge — all internal and external
+        # callers receive this object; generate() is always serialized.
+        self.bridge = _LockedBridge(_raw_bridge, self._bridge_lock)
+
+        # Tokenizer for real LLM calls in reasoning modules.
+        # Must implement .encode(text, add_bos=True) and .decode(ids).
+        # Optional alias: .encode_chat(messages, add_generation_prompt=True).
+        self.tokenizer = tokenizer
 
     def tokenize_prompt(self, messages: List[dict]) -> List[int]:
         """
@@ -3038,7 +3113,15 @@ class ThinkingEngineV1:
             self.temporal_kg.extract_and_add_triples(text, conf)
 
     def _compute_reasoning_path(self, entities: List[str]) -> List[str]:
-        """KG path reasoning — fast sequential; acquires no lock (read-only)."""
+        """KG path reasoning — fast sequential; acquires no lock (read-only).
+
+        Concurrency note: always called after future_kg.result() on the main
+        thread, so the KG writer has fully completed before any read here.
+        Python's GIL protects individual dict lookups, making concurrent reads
+        safe under the single-process() usage pattern. If process() is ever
+        called simultaneously from multiple threads, consider upgrading to a
+        reader-writer lock for full correctness guarantees.
+        """
         if len(entities) >= 2:
             path, _ = self.kg.astar(entities[0], entities[1])
             if not path:
