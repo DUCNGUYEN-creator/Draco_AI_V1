@@ -40,14 +40,14 @@ Tất cả các chế độ huấn luyện cho DracoTransformerTorchV1.
   • Explicit attention_mask causal: truyền thẳng vào forward
   • Validation split tại EOS boundary (không split giữa document)
   • tok_per_s công thức đúng: tính batch_size × accumulation
-  • DistributedSampler cho DDP/FSDP (tránh rank thấy cùng data)
-  • num_workers / prefetch_factor cho DataLoader (tránh GPU đói data)
-  • DDP / FSDP support
-  • Gradient checkpointing (tiết kiệm 30–60% VRAM)
-  • Validation loop + eval harness (perplexity, accuracy, entropy)
-  • Data packing: nhiều sample trong một window (hiệu quả token)
-  • Dynamic sequence-length curriculum (ngắn → dài)
-  • Token-level metrics: accuracy, entropy per batch
+  • DistributedSampler.set_epoch(step) mỗi epoch (fix shuffle bị lặp DDP)
+  • Curriculum ctx thay đổi: dataset.ctx = new_ctx thay vì rebuild toàn bộ
+  • _PackedDataset cross-doc leakage: mask token đầu doc mới = 0
+  • Gradient clipping FSDP-aware: model.clip_grad_norm_() khi FSDP
+  • AMP skip_update: bỏ manual detect, rely hoàn toàn vào scaler.step()
+  • _prepare_data mask guard: trả mask khi có ít nhất 1 token cần loss
+  • Validation deterministic: dùng fixed seed riêng cho EvalHarness
+  • Best checkpoint: lưu model tốt nhất theo val_loss
   • set_seed() cudnn flags chỉ set khi CUDA available
 
 Yêu cầu:
@@ -115,10 +115,14 @@ class _PackedDataset(Dataset):
         mask = []  # 1 = tính loss, 0 = bỏ qua
         for seg in segments:
             toks  = list(seg)
-            # mask = 1 cho tất cả trừ token EOS cuối mỗi segment
+            # mask = 1 cho tất cả trừ:
+            #   - token EOS cuối doc (không train predict-after-EOS)
+            #   - token ĐẦU doc mới nếu buf không rỗng (tránh cross-doc leakage)
             smask = [1] * len(toks)
             if toks and toks[-1] == self.eos_id:
-                smask[-1] = 0   # không train trên chính EOS cuối doc
+                smask[-1] = 0   # EOS cuối doc
+            if buf:
+                smask[0] = 0    # token đầu doc tiếp theo không được predict từ doc trước
             buf.extend(toks)
             mask.extend(smask)
             while len(buf) >= self.ctx + 2:
@@ -192,6 +196,15 @@ class _SimpleDataset(Dataset):
             valid = [(0, n)]
 
         return valid
+
+    def update_ctx(self, new_ctx: int):
+        """
+        Cập nhật ctx và rebuild doc list mà không cần tạo lại toàn bộ dataset.
+        Dùng cho curriculum: tránh reset DataLoader iterator và DistributedSampler state.
+        """
+        if new_ctx != self.ctx:
+            self.ctx   = new_ctx
+            self._docs = self._build_docs()
 
     def __len__(self):
         return max(len(self._docs), 1)
@@ -281,6 +294,7 @@ class EvalHarness:
         batch_size: int = 4,
         vocab_size: Optional[int] = None,
         num_workers: int = 0,
+        val_seed: int = 0,    # fixed seed để val metrics deterministic
     ) -> Dict[str, float]:
         model.eval()
         dataset = _SimpleDataset(val_ids, ctx, eos_id)
@@ -288,8 +302,12 @@ class EvalHarness:
             model.train()
             return {"val_ppl": float("inf"), "val_acc": 0.0, "val_entropy": 0.0}
 
+        # Dùng Generator với seed cố định để val metrics không thay đổi mỗi lần chạy
+        g = torch.Generator()
+        g.manual_seed(val_seed)
         loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                             drop_last=True, num_workers=num_workers)
+                             drop_last=True, num_workers=num_workers,
+                             generator=g)
         total_loss = 0.0
         total_acc  = 0.0
         total_ent  = 0.0
@@ -605,31 +623,35 @@ class TrainerV1:
         loader      = self._make_dataloader(dataset, batch_size)
         loader_iter = iter(loader)
 
-        loss_hist   = []
+        loss_hist    = []
+        best_val_loss = float("inf")
         t0          = time.time()
         step        = start_step
         target_step = start_step + steps
         accum_steps = 0
+        epoch       = 0   # epoch counter cho DistributedSampler.set_epoch()
         trainable   = [p for p in model.parameters() if p.requires_grad]
         base_model  = model.module if hasattr(model, "module") else model
         vocab_size  = getattr(base_model, "vocab_size", None)
 
         while step < target_step:
-            # ── Curriculum: rebuild dataset nếu ctx thay đổi ──────
+            # ── Curriculum: cập nhật ctx mà không rebuild DataLoader ─
             if self.use_curriculum:
                 new_ctx = curriculum_ctx(step, g_total, self.ctx_min, self.ctx_max)
                 if new_ctx != ctx:
-                    ctx     = new_ctx
-                    if self.use_packing:
-                        dataset = _PackedDataset(segs, ctx, self.eos_token_id)
-                    else:
-                        dataset = _SimpleDataset(train_ids, ctx, self.eos_token_id, train_mask)
-                    loader      = self._make_dataloader(dataset, batch_size)
-                    loader_iter = iter(loader)
+                    ctx = new_ctx
+                    # Chỉ cập nhật ctx trong dataset — không reset loader/sampler
+                    dataset.update_ctx(ctx)
 
             try:
                 batch = next(loader_iter)
             except StopIteration:
+                # Hết epoch → set_epoch để shuffle khác đi (quan trọng cho DDP)
+                epoch += 1
+                if hasattr(loader, "sampler") and isinstance(
+                    loader.sampler, DistributedSampler if HAS_DDP else type(None)
+                ):
+                    loader.sampler.set_epoch(epoch)
                 loader_iter = iter(loader)
                 batch = next(loader_iter)
 
@@ -671,22 +693,17 @@ class TrainerV1:
                 if scaler.is_enabled():
                     scaler.unscale_(optimizer)
 
-                torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+                # FSDP-aware gradient clipping
+                if HAS_FSDP and isinstance(model, FSDP):
+                    model.clip_grad_norm_(grad_clip)
+                else:
+                    torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
 
-                skip_update = False
                 if scaler.is_enabled():
-                    prev_scale = scaler.get_scale()
-                    scaler.step(optimizer)
+                    scaler.step(optimizer)   # bỏ qua nội bộ nếu found_inf
                     scaler.update()
-                    if scaler.get_scale() < prev_scale:
-                        skip_update = True
                 else:
                     optimizer.step()
-
-                if skip_update:
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_steps = 0
-                    continue
 
                 step += 1
                 optimizer.zero_grad(set_to_none=True)
@@ -710,12 +727,20 @@ class TrainerV1:
                     metrics = EvalHarness.evaluate(
                         model, val_ids, ctx, self.eos_token_id,
                         self.device, self.val_batches, batch_size, vocab_size,
-                        num_workers=self.num_workers,
+                        num_workers=self.num_workers, val_seed=0,
                     )
                     print(f"  [Val] step={step} | "
                           f"ppl={metrics['val_ppl']:.2f} | "
                           f"acc={metrics['val_acc']:.3f} | "
                           f"entropy={metrics['val_entropy']:.3f}")
+                    # Lưu best checkpoint nếu val_loss cải thiện
+                    if metrics["val_loss"] < best_val_loss:
+                        best_val_loss = metrics["val_loss"]
+                        self._save_checkpoint(
+                            model, optimizer, scaler, step,
+                            best_val_loss, g_total, tag="best"
+                        )
+                        print(f"  [Val] ✅ Best model saved (val_loss={best_val_loss:.4f})")
 
             # ── Checkpoint ────────────────────────────────────────
             if step % save_every == 0 and step > start_step:
@@ -890,7 +915,7 @@ class TrainerV1:
                 else:
                     all_mask.extend([1] * len(ids))
                     all_mask.append(0)
-            return all_ids, all_mask if any(all_mask) else None
+            return all_ids, all_mask if all_mask else None
 
         if data and isinstance(data[0], list):
             for i, seq in enumerate(data):
@@ -905,7 +930,7 @@ class TrainerV1:
                 else:
                     all_mask.extend([1] * len(seq))
                     all_mask.append(0)
-            return all_ids, all_mask if any(all_mask) else None
+            return all_ids, all_mask if all_mask else None
 
         # Flat list[int] — đảm bảo EOS cuối để tránh cross-document prediction
         ids = list(data)
@@ -1150,7 +1175,8 @@ class TrainerV1:
                 "step": 0, "global_total_steps": None}
 
     def _save_checkpoint(self, model, optimizer, scaler, step, loss,
-                         global_total_steps: Optional[int] = None):
+                         global_total_steps: Optional[int] = None,
+                         tag: str = ""):
         # Chỉ rank 0 được save — tránh race condition khi DDP/FSDP multi-process
         if HAS_DDP and dist.is_initialized() and dist.get_rank() != 0:
             return
@@ -1166,7 +1192,8 @@ class TrainerV1:
         else:
             model_state = base.state_dict()
         trainable_param_names = [n for n, p in base.named_parameters() if p.requires_grad]
-        path = os.path.join(self.ckpt_dir, f"trainer_{step:06d}.pt")
+        fname = f"trainer_best.pt" if tag == "best" else f"trainer_{step:06d}.pt"
+        path  = os.path.join(self.ckpt_dir, fname)
         save_dict = {
             "step":                  step,
             "model":                 model_state,
@@ -1196,7 +1223,8 @@ class TrainerV1:
             return
         ckpts = sorted(
             [f for f in os.listdir(self.ckpt_dir)
-             if f.startswith("trainer_") and f.endswith(".pt")],
+             if f.startswith("trainer_") and f.endswith(".pt")
+             and f != "trainer_best.pt"],   # không prune best checkpoint
             key=lambda x: os.path.getmtime(os.path.join(self.ckpt_dir, x))
         )
         for f in ckpts[: max(0, len(ckpts) - self.keep_checkpoints)]:
