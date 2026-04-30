@@ -3,7 +3,7 @@ DracoAI V1 — Advanced Trainer (Production‑grade)
 =================================================
 Tất cả các chế độ huấn luyện cho DracoTransformerTorchV1.
 
-Đã sửa toàn bộ các lỗi (batch gốc + batch mới):
+Đã sửa toàn bộ các lỗi (batch gốc + batch mới + batch v1.1):
   • Shape mismatch CE loss / MTP loss
   • Gradient accumulation không reset khi gặp NaN
   • Flatten chat data gây trộn lẫn hội thoại
@@ -26,12 +26,23 @@ Tất cả các chế độ huấn luyện cho DracoTransformerTorchV1.
   • _prepare_data chèn EOS giữa documents
   • _prepare_data EOS check per-seq (fix edge case seq đầu tiên rỗng)
   • _prepare_data flat list[int]: đảm bảo EOS cuối (fix silent cross-doc)
+  • _prepare_data flat list[int]: giữ label_mask nếu được truyền (fix mask bị bỏ qua)
   • MTP length clamp: min(pred_len, label_len) tránh edge alignment
   • _SimpleDataset EOS-aware (không cross-document prediction)
   • _SimpleDataset hỗ trợ document-level uniform sampling (fix length bias)
   • _SimpleDataset resample offset mỗi lần __getitem__ (fix single-offset bug)
+  • _SimpleDataset offset deterministic per-sample: random.Random(idx + epoch_seed)
+    → multi-worker safe, reproducible, thay đổi qua epoch (fix global random state)
   • _SimpleDataset trả label_mask cho SFT label masking
   • _PackedDataset pad tail để không waste tokens
+  • CE + MTP loss normalize theo số token hợp lệ (reduction="sum"/n_valid_tok)
+    → hai loss cùng scale khi valid_len < T, tránh MTP overpower CE
+  • Curriculum DataLoader rebuild chỉ khi ctx thay đổi ≥ 64
+    → giảm gián đoạn prefetch warmup khi ctx tăng từng bước nhỏ
+  • Validation dùng _PackedDataset khi use_packing=True
+    → val_loss phản ánh đúng phân phối token, tránh mismatch train/val
+  • _log_moe_health entropy threshold động theo 0.3 * log(n_experts)
+    → tránh false alarm (2 experts) và cảnh báo quá muộn (16 experts)
   • Checkpoint pruning: atomic rename thay vì os.remove trực tiếp
   • Checkpoint save: rank-0 only để tránh race condition DDP/FSDP
   • FSDP state_dict: dùng FULL_STATE_DICT để checkpoint portable
@@ -40,14 +51,19 @@ Tất cả các chế độ huấn luyện cho DracoTransformerTorchV1.
   • Explicit attention_mask causal: truyền thẳng vào forward
   • Validation split tại EOS boundary (không split giữa document)
   • tok_per_s công thức đúng: tính batch_size × accumulation
-  • DistributedSampler.set_epoch(step) mỗi epoch (fix shuffle bị lặp DDP)
-  • Curriculum ctx thay đổi: dataset.ctx = new_ctx thay vì rebuild toàn bộ
+  • DistributedSampler.set_epoch() mỗi epoch + guard HAS_DDP (fix shuffle lặp + AttributeError)
+  • Curriculum + packing: _PackedDataset.update_ctx() rebuild windows; DataLoader reset an toàn
+  • Curriculum ctx thay đổi: rebuild DataLoader để tránh batch shape mismatch
   • _PackedDataset cross-doc leakage: mask token đầu doc mới = 0
   • Gradient clipping FSDP-aware: model.clip_grad_norm_() khi FSDP
-  • AMP skip_update: bỏ manual detect, rely hoàn toàn vào scaler.step()
-  • _prepare_data mask guard: trả mask khi có ít nhất 1 token cần loss
-  • Validation deterministic: dùng fixed seed riêng cho EvalHarness
-  • Best checkpoint: lưu model tốt nhất theo val_loss
+  • AMP overflow tracking: khôi phục prev_scale check → step không tăng khi overflow
+  • _prepare_data mask/ids length assert: phát hiện tokenizer mismatch sớm
+  • _compute_loss mask guard: trả (None,0,0) khi toàn bộ mask = 0 (tránh fake loss)
+  • FSDP isinstance check đúng: isinstance(model, FSDP) không phải isinstance(base, FSDP)
+  • _log_moe_health: torch.tensor thay np.array để tránh GPU→CPU sync không cần thiết
+  • tok_per_s DDP-aware: nhân world_size để throughput log chính xác
+  • Validation shuffle=False (seed đã cố định, shuffle thừa và tốn compute)
+  • Best checkpoint: lưu model tốt nhất theo val_loss (trainer_best.pt, không bị prune)
   • set_seed() cudnn flags chỉ set khi CUDA available
 
 Yêu cầu:
@@ -105,10 +121,18 @@ class _PackedDataset(Dataset):
     để loss không tính trên BOS giả của document tiếp theo.
     """
     def __init__(self, segments: List[List[int]], ctx: int, eos_id: int):
-        self.ctx    = ctx
-        self.eos_id = eos_id
-        self.windows: List[Tuple[List[int], List[int]]] = []  # (input_ids, label_mask)
+        self.ctx      = ctx
+        self.eos_id   = eos_id
+        self._segs    = segments   # giữ lại để update_ctx có thể rebuild
+        self.windows: List[Tuple[List[int], List[int]]] = []
         self._pack(segments)
+
+    def update_ctx(self, new_ctx: int):
+        """Rebuild windows với ctx mới — dùng cho curriculum khi use_packing=True."""
+        if new_ctx != self.ctx:
+            self.ctx     = new_ctx
+            self.windows = []
+            self._pack(self._segs)
 
     def _pack(self, segments):
         buf  = []
@@ -167,11 +191,13 @@ class _SimpleDataset(Dataset):
         ctx:    int,
         eos_id: int,
         label_masks: Optional[List[int]] = None,  # cùng độ dài ids
+        epoch_seed:  int = 0,   # tăng mỗi epoch để offset thay đổi qua các epoch
     ):
         self.ids         = ids
         self.ctx         = ctx
         self.eos_id      = eos_id
         self.label_masks = label_masks  # None → pretrain (all-1)
+        self.epoch_seed  = epoch_seed   # seed gốc cho RNG per-sample
         self._docs       = self._build_docs()   # list of (doc_start, doc_end_excl)
 
     def _build_docs(self) -> List[Tuple[int, int]]:
@@ -206,6 +232,10 @@ class _SimpleDataset(Dataset):
             self.ctx   = new_ctx
             self._docs = self._build_docs()
 
+    def set_epoch_seed(self, epoch: int):
+        """Tăng epoch_seed để offset thay đổi qua các epoch (gọi khi bắt đầu epoch mới)."""
+        self.epoch_seed = epoch
+
     def __len__(self):
         return max(len(self._docs), 1)
 
@@ -216,8 +246,10 @@ class _SimpleDataset(Dataset):
         else:
             ds, de = self._docs[idx % len(self._docs)]
             max_off = (de - ds) - (self.ctx + 2)
-            # Resample offset mỗi lần → coverage tốt hơn qua các epoch
-            offset = random.randint(0, max_off)
+            # Dùng RNG gắn với (idx, epoch_seed) → deterministic, multi-worker safe,
+            # không phụ thuộc thứ tự gọi của worker → reproduce được.
+            rng    = random.Random(idx + self.epoch_seed * 1_000_003)
+            offset = rng.randint(0, max_off)
             s = ds + offset
 
         ids = self.ids[s: s + self.ctx + 2]
@@ -295,19 +327,22 @@ class EvalHarness:
         vocab_size: Optional[int] = None,
         num_workers: int = 0,
         val_seed: int = 0,    # fixed seed để val metrics deterministic
+        use_packing: bool = False,  # dùng _PackedDataset để match train distribution khi use_packing=True
+        val_segments: Optional[List[List[int]]] = None,  # segments cho _PackedDataset
     ) -> Dict[str, float]:
         model.eval()
-        dataset = _SimpleDataset(val_ids, ctx, eos_id)
+        # Dùng cùng loại dataset với train để val_loss phản ánh đúng phân phối token
+        if use_packing and val_segments is not None:
+            dataset = _PackedDataset(val_segments, ctx, eos_id)
+        else:
+            dataset = _SimpleDataset(val_ids, ctx, eos_id)
         if len(dataset) == 0:
             model.train()
             return {"val_ppl": float("inf"), "val_acc": 0.0, "val_entropy": 0.0}
 
-        # Dùng Generator với seed cố định để val metrics không thay đổi mỗi lần chạy
-        g = torch.Generator()
-        g.manual_seed(val_seed)
-        loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                             drop_last=True, num_workers=num_workers,
-                             generator=g)
+        # shuffle=False: seed đã cố định qua Generator, shuffle thêm thừa + tốn compute
+        loader  = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                             drop_last=True, num_workers=num_workers)
         total_loss = 0.0
         total_acc  = 0.0
         total_ent  = 0.0
@@ -635,23 +670,31 @@ class TrainerV1:
         vocab_size  = getattr(base_model, "vocab_size", None)
 
         while step < target_step:
-            # ── Curriculum: cập nhật ctx mà không rebuild DataLoader ─
+            # ── Curriculum: cập nhật ctx + rebuild DataLoader ─────────
+            # Chỉ rebuild khi chênh lệch ctx ≥ 64 (tránh gián đoạn prefetch liên tục
+            # khi ctx thay đổi từng bước nhỏ trong cosine schedule).
+            # update_ctx() cũng phải được gọi để dataset trả đúng batch shape.
             if self.use_curriculum:
                 new_ctx = curriculum_ctx(step, g_total, self.ctx_min, self.ctx_max)
-                if new_ctx != ctx:
+                if new_ctx != ctx and abs(new_ctx - ctx) >= 64:
                     ctx = new_ctx
-                    # Chỉ cập nhật ctx trong dataset — không reset loader/sampler
-                    dataset.update_ctx(ctx)
+                    dataset.update_ctx(ctx)           # cập nhật docs/windows trong dataset
+                    loader      = self._make_dataloader(dataset, batch_size)
+                    loader_iter = iter(loader)
+                    epoch = 0   # reset epoch counter khi rebuild
 
             try:
                 batch = next(loader_iter)
             except StopIteration:
                 # Hết epoch → set_epoch để shuffle khác đi (quan trọng cho DDP)
                 epoch += 1
-                if hasattr(loader, "sampler") and isinstance(
-                    loader.sampler, DistributedSampler if HAS_DDP else type(None)
+                if HAS_DDP and hasattr(loader, "sampler") and isinstance(
+                    loader.sampler, DistributedSampler
                 ):
                     loader.sampler.set_epoch(epoch)
+                # Cập nhật epoch_seed cho _SimpleDataset → offset thay đổi qua epoch
+                if hasattr(dataset, "set_epoch_seed"):
+                    dataset.set_epoch_seed(epoch)
                 loader_iter = iter(loader)
                 batch = next(loader_iter)
 
@@ -699,15 +742,27 @@ class TrainerV1:
                 else:
                     torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
 
+                overflow = False
                 if scaler.is_enabled():
+                    prev_scale = scaler.get_scale()
                     scaler.step(optimizer)   # bỏ qua nội bộ nếu found_inf
                     scaler.update()
+                    # Nếu scale giảm → overflow xảy ra, step không thật sự update
+                    if scaler.get_scale() < prev_scale:
+                        overflow = True
                 else:
                     optimizer.step()
 
-                step += 1
                 optimizer.zero_grad(set_to_none=True)
                 accum_steps = 0
+
+                if not overflow:
+                    step += 1
+                else:
+                    # Không tăng step, không log loss ảo — xoá entry vừa push
+                    if loss_hist:
+                        loss_hist.pop()
+                    continue
 
             # ── Logging ───────────────────────────────────────────
             if step % log_every == 0 and step > start_step:
@@ -724,10 +779,13 @@ class TrainerV1:
             # ── Validation ────────────────────────────────────────
             if self.val_every > 0 and step % self.val_every == 0 and step > start_step:
                 if len(val_ids) >= ctx + 3:
+                    # Khi use_packing, tạo val_segments để _PackedDataset match train distribution
+                    val_segs = self._split_segments(val_ids) if self.use_packing else None
                     metrics = EvalHarness.evaluate(
                         model, val_ids, ctx, self.eos_token_id,
                         self.device, self.val_batches, batch_size, vocab_size,
                         num_workers=self.num_workers, val_seed=0,
+                        use_packing=self.use_packing, val_segments=val_segs,
                     )
                     print(f"  [Val] step={step} | "
                           f"ppl={metrics['val_ppl']:.2f} | "
@@ -925,6 +983,11 @@ class TrainerV1:
                     all_ids.append(eos_id)
                 if label_masks and i < len(label_masks):
                     msk = label_masks[i]
+                    assert len(msk) == len(seq), (
+                        f"[_prepare_data] Mask/ids length mismatch at index {i}: "
+                        f"ids={len(seq)}, mask={len(msk)}. "
+                        f"Tokenizer hoặc mask builder có thể không đồng bộ."
+                    )
                     all_mask.extend(msk)
                     all_mask.append(0)  # EOS boundary
                 else:
@@ -933,10 +996,20 @@ class TrainerV1:
             return all_ids, all_mask if all_mask else None
 
         # Flat list[int] — đảm bảo EOS cuối để tránh cross-document prediction
+        # FIX: nếu có label_masks thì phải trả mask, không được bỏ qua (trước đây luôn return None)
         ids = list(data)
         eos_id = self.eos_token_id
         if eos_id is not None and (not ids or ids[-1] != eos_id):
             ids.append(eos_id)
+        # Flat mode: label_masks[0] là mask cho toàn bộ flat list
+        if label_masks and isinstance(label_masks, list) and len(label_masks) > 0:
+            flat_mask_data = label_masks[0] if isinstance(label_masks[0], list) else list(label_masks)
+            # Sync độ dài: nếu EOS vừa thêm thì append 0 cho mask
+            if len(flat_mask_data) < len(ids):
+                flat_mask_data = list(flat_mask_data) + [0] * (len(ids) - len(flat_mask_data))
+            elif len(flat_mask_data) > len(ids):
+                flat_mask_data = flat_mask_data[:len(ids)]
+            return ids, flat_mask_data
         return ids, None
 
     def _init_train_state(self, mode, skill_group, lora_rank, lora_alpha, max_lr, resume):
@@ -1035,15 +1108,24 @@ class TrainerV1:
         if vs:
             logits = logits[:, :, :vs]
 
+        # Guard: nếu toàn bộ mask = 0 → không có token nào cần học → skip batch
+        if msk.sum() == 0:
+            return None, 0.0, 0.0
+
         # Áp dụng label mask: token ngoài mask → ignore_index=-100
         tgt_masked = tgt.clone()
         tgt_masked[~msk] = -100
 
-        ce_loss = F.cross_entropy(
+        # CE loss normalize theo số token hợp lệ (reduction="sum" / n_valid_tokens)
+        # Đảm bảo CE và MTP cùng scale khi valid_len < T
+        ce_n_tok = msk.sum().clamp(min=1).float()
+        ce_loss_raw = F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             tgt_masked.reshape(-1),
             ignore_index=-100,
+            reduction="sum",
         )
+        ce_loss = ce_loss_raw / ce_n_tok
 
         # ── Token-level metrics ────────────────────────────────────
         with torch.no_grad():
@@ -1055,6 +1137,8 @@ class TrainerV1:
             tok_ent = (ent * msk.float()).sum() / msk.sum().clamp(min=1)
 
         # ── MTP loss ───────────────────────────────────────────────
+        # Normalize MTP theo số token hợp lệ của MTP (không phải T toàn bộ)
+        # → CE và MTP cùng scale dù valid_len < T
         mtp_coeff = getattr(base, "_mtp_aux_coeff", 0.1)
         if mtp_coeff > 0 and l2.shape[1] > 1 and labels.shape[1] > 2:
             pred_len  = l2.shape[1] - 1
@@ -1067,11 +1151,14 @@ class TrainerV1:
                 mtp_tgt = labels[:, 2:2 + valid_len].clone()
                 mtp_msk = label_mask[:, 2:2 + valid_len]
                 mtp_tgt[~mtp_msk] = -100
-                mtp_loss = F.cross_entropy(
+                mtp_n_tok = mtp_msk.sum().clamp(min=1).float()
+                mtp_loss_raw = F.cross_entropy(
                     l2_logits.reshape(-1, l2_logits.shape[-1]),
                     mtp_tgt.reshape(-1),
                     ignore_index=-100,
+                    reduction="sum",
                 )
+                mtp_loss = mtp_loss_raw / mtp_n_tok
                 total = ce_loss + 0.01 * aux_total + mtp_coeff * mtp_loss
                 return total, tok_acc.item(), tok_ent.item()
 
@@ -1080,10 +1167,13 @@ class TrainerV1:
     def _log_moe_health(self, model):
         """
         Log MoE health: entropy, balance (min/max), std, collapse/imbalance warning.
-        Ngưỡng cảnh báo có thể set trong config:
-          config["moe_entropy_warn_threshold"]  (default 0.5)
-          config["moe_load_std_warn"]           (default 0.3)
-          config["moe_load_std_collapse"]       (default 0.01)
+        Ngưỡng entropy cảnh báo tính động theo log(n_experts) — tránh false alarm khi
+        n_experts nhỏ (ngưỡng cố định 0.5 gần max khi 2 expert) hoặc cảnh báo quá muộn
+        khi n_experts lớn (0.5 << log(16)).
+        Có thể override bằng config:
+          config["moe_entropy_warn_ratio"]    (default 0.3, cảnh báo khi entropy < ratio * log(n))
+          config["moe_load_std_warn"]         (default 0.3)
+          config["moe_load_std_collapse"]     (default 0.01)
         """
         try:
             base = model.module if hasattr(model, "module") else model
@@ -1098,15 +1188,19 @@ class TrainerV1:
             parts   = []
 
             if entropy is not None:
+                # Ngưỡng động: cảnh báo khi entropy < ratio * log(n_experts)
+                n_experts   = self.config.get("n_experts", 8)
+                warn_ratio  = self.config.get("moe_entropy_warn_ratio", 0.3)
+                entropy_thr = warn_ratio * math.log(max(n_experts, 2))
                 parts.append(f"router_entropy={entropy:.4f}")
-                if entropy < self.config.get("moe_entropy_warn_threshold", 0.5):
-                    parts.append("⚠️ LOW_ENTROPY(collapse risk)")
+                if entropy < entropy_thr:
+                    parts.append(f"⚠️ LOW_ENTROPY(< {entropy_thr:.3f}, collapse risk)")
 
             if load is not None:
-                arr     = np.array(load, dtype=float)
-                mx      = arr.max() + 1e-9
-                balance = arr.min() / mx
-                std     = float(np.std(arr))
+                arr     = torch.tensor(load, dtype=torch.float32)   # tránh GPU→CPU sync của np.array
+                mx      = arr.max().item() + 1e-9
+                balance = arr.min().item() / mx
+                std     = float(arr.std().item())
                 parts.append(f"expert_balance={balance:.3f} std={std:.4f}")
                 if std > self.config.get("moe_load_std_warn", 0.3):
                     parts.append("⚠️ HIGH_IMBALANCE")
