@@ -66,7 +66,7 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
     ✅ [KG-FIX] bfs/dfs guard for missing src/dst nodes
     ✅ [LTM-FIX] ltm_facts properly passed to recursive_critique path in process()
     ✅ [CRLF-FIX] All line endings normalized to LF
-    ── NEW FEATURES V1 ──────────────────────────────────────────────────────
+    ── NEW FEATURES V1.2 ──────────────────────────────────────────────────────
     ✅ [PARALLEL] ThreadPoolExecutor(max_workers=4) for heavy tasks in process()
          — KG extraction, ToT/MCTS, Debate, GoalDecomposer, SubGoalDecomposer
          run concurrently; light tasks (RAG, KG path, rerank, metaphor, etc.)
@@ -105,7 +105,7 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
     ✅ [CONTEXT-REWRITE] Sanitizer applied to all external content before prompt injection
     ✅ [TRANSFORMER-COMPAT] engine→transformer interface: expert_boost→intent_boost array,
          intent dict → intent_bias array, miro_tau passed to generate() correctly
-    ── FIXES V1 ─────────────────────────────────────────────────────────────
+    ── FIXES V1.5 ─────────────────────────────────────────────────────────────
     ✅ [RACE-FIX-LLM]  _LockedBridge proxy class added — wraps TransformerBridge and
          serializes ALL bridge.generate() calls through a single threading.Lock.
          ThinkingEngineV1.__init__ wraps self.bridge in _LockedBridge immediately
@@ -132,7 +132,7 @@ CUMULATIVE FIXES & FEATURES (V1 — all patches applied):
          eliminates KG read/write race in ThreadPoolExecutor parallel block
     ✅ [LOCK-FIX]    _router_lock added for SelfEvolvingRouter thread safety;
          evolving_router.apply() and .update() both guarded
-    ── REFACTOR V1 ──────────────────────────────────────────────────────────
+    ── REFACTOR V1.4 ──────────────────────────────────────────────────────────
     ✅ [IMPORT-DEDUP] TransformerBridge removed from engine_v1.py — imported from
          transformer_v1.py with graceful fallback stub (no duplicate source)
     ✅ [TOKENIZER]   ThinkingEngineV1 accepts tokenizer= param; tokenize_prompt() added
@@ -3765,9 +3765,12 @@ if __name__ == "__main__":
 
     # Engine accepts bridge= and tokenizer= params
     engine_with_bridge = ThinkingEngineV1(max_experts=4, bridge=stub_bridge)
-    assert engine_with_bridge.bridge is stub_bridge
+    assert isinstance(engine_with_bridge.bridge, _LockedBridge), \
+        "bridge should be wrapped in _LockedBridge"
+    assert object.__getattribute__(engine_with_bridge.bridge, '_bridge') is stub_bridge, \
+        "raw bridge inside _LockedBridge should be the stub passed in"
     assert engine_with_bridge.tokenizer is None
-    print("✅ ThinkingEngineV1 bridge= param: accepted")
+    print("✅ ThinkingEngineV1 bridge= param: accepted and wrapped in _LockedBridge")
 
     # tokenize_prompt raises when tokenizer=None
     try:
