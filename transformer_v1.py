@@ -1176,10 +1176,14 @@ class GQAttention:
         return self._rope_freqs
     def forward(self, x: np.ndarray, cache: "KVCache", layer_idx: int,
                 snap: Optional[dict] = None,
-                batch_idx: int = 0) -> np.ndarray:
+                batch_idx: int = 0,
+                pool: "Optional[TensorPool]" = None) -> np.ndarray:
         """
         x: (1, seq, d_model)  Returns: (1, seq, d_model)
         batch_idx: which KVCache slot to read/write (default=0, backward-compat).
+        pool: optional TensorPool for workspace buffer reuse. When provided,
+          intermediate Q/K/V tensors are borrowed from the pool and returned
+          after use instead of allocating fresh arrays each step.
         FIX ATTN-CLIP: attention scores clipped to [-50, 50] before softmax.
         """
         bsz, seq, _ = x.shape
@@ -1196,7 +1200,13 @@ class GQAttention:
         K_exp = np.repeat(K_f, self.n_rep, axis=1)
         V_exp = np.repeat(V_f, self.n_rep, axis=1)
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn  = Q @ K_exp.transpose(0, 1, 3, 2) * scale
+        # TensorPool integration: borrow attn score buffer to avoid per-step np.empty
+        attn_shape = (bsz, self.n_heads, seq, kv_seq)
+        if pool is not None:
+            attn = pool.get(attn_shape, np.float32)
+            np.multiply(Q @ K_exp.transpose(0, 1, 3, 2), scale, out=attn)
+        else:
+            attn = Q @ K_exp.transpose(0, 1, 3, 2) * scale
         # Causal mask — use cached triangle to avoid per-call allocation
         if seq > 1:
             if self._causal_mask is None or self._causal_mask_size < seq:
@@ -1222,6 +1232,9 @@ class GQAttention:
         attn_sum = attn.sum(axis=-1, keepdims=True)
         attn = attn / (attn_sum + 1e-9)
         out = attn @ V_exp
+        # Return attn buffer to pool before reshape (pool stores by original shape)
+        if pool is not None:
+            pool.put(attn)
         out = out.transpose(0, 2, 1, 3).reshape(bsz, seq, self.n_heads * self.head_dim)
         return _mm(out, self.W_o)
 # ─────────────────────────────────────────────────────────────────────
@@ -1506,10 +1519,11 @@ class TransformerBlock:
                 add_noise: bool = True,
                 intent_bias: Optional[np.ndarray] = None,
                 snap: Optional[dict] = None,
-                batch_idx: int = 0) -> Tuple[np.ndarray, Dict]:
+                batch_idx: int = 0,
+                pool: "Optional[TensorPool]" = None) -> Tuple[np.ndarray, Dict]:
         h     = rms_norm(x, self.norm1)
         h     = self.attn.forward(h, cache, self.layer_idx,
-                                  snap=snap, batch_idx=batch_idx)
+                                  snap=snap, batch_idx=batch_idx, pool=pool)
         x     = x + h
         h, aux = self.moe.forward(rms_norm(x, self.norm2),
                                   add_noise=add_noise,
@@ -2326,17 +2340,21 @@ class DracoTransformerV1:
         snap: optional delta-snapshot dict — passed into cache.update() so only
           positions modified during this forward are recorded for rollback.
         batch_idx: which KVCache slot to read/write (default=0, backward-compat).
+        Uses self._tensor_pool (if set via set_tensor_pool()) to reuse attention
+        score buffers across layers, reducing per-step heap allocation overhead.
         """
         ids = np.array(token_ids, dtype=np.int32)
         ids = np.clip(ids, 0, self.vocab_size - 1)
         x   = self.embedding[ids][None]
         aux_list = []
+        _pool = self._tensor_pool   # None when pool not attached (zero overhead)
         for block in self.blocks:
             x, aux = block.forward(x, cache,
                                    add_noise=add_noise,
                                    intent_bias=intent_bias,
                                    snap=snap,
-                                   batch_idx=batch_idx)
+                                   batch_idx=batch_idx,
+                                   pool=_pool)
             aux_list.append(aux)
         x  = rms_norm(x, self.norm_f)
         if self._lm_head_f32 is None:
@@ -2498,8 +2516,17 @@ class DracoTransformerV1:
         # Dynamic delta threshold: scale with model depth so every n_layers writes
         # per speculative token fit comfortably before escalating to full copy.
         # Default: n_layers * 2 → allows ~2 speculative tokens for any model size.
-        _snap_threshold = snap_delta_threshold if snap_delta_threshold is not None \
-            else self.n_layers * 2
+        # FIX SNAP-THRESHOLD-CLAMP: threshold must be >= n_layers so that a single
+        # forward pass (which writes exactly n_layers delta entries, one per layer)
+        # never triggers mid-forward escalation. Setting threshold < n_layers causes
+        # _snap_escalate_to_full() to fire inside update() at layer N < n_layers-1,
+        # which — even after the revert/re-apply fix — results in incomplete delta
+        # re-application because later layers have not been written yet. Minimum
+        # safe value is n_layers; default n_layers * 2 leaves room for 2-step chains.
+        _snap_threshold = max(
+            self.n_layers,
+            snap_delta_threshold if snap_delta_threshold is not None else self.n_layers * 2
+        )
         add_noise = not deterministic
         # ── Profiler session start ──────────────────────────────────────
         if profiler is not None:
@@ -2580,6 +2607,11 @@ class DracoTransformerV1:
                     verify_id = self._sample_topk_topp(last_logits, current_temp, top_p, min_p=min_p)
                 if verify_id == spec_pending:
                     # ✅ Speculative confirmed
+                    # FIX WAL-SPEC-MISS: the confirmed speculative token was tentatively
+                    # appended to ids (and streamed) when it was first proposed, but was
+                    # never journaled to WAL. On recovery, WAL would be missing it.
+                    # Journal it now, before clearing spec_pending.
+                    _wal_append(spec_pending)
                     if profiler is not None:
                         profiler.record_spec_accept()
                     spec_pending    = None
