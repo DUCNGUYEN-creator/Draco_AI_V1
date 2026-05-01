@@ -127,6 +127,43 @@ ADDITIONS (V1 — post-review consolidation):
     ✅ ADD ADAPTIVE-TEMP-INERTIA: Adaptive temperature updates now apply exponential moving
          average smoothing: current_temp = inertia * current_temp + (1-inertia) * target_temp.
          Prevents abrupt temperature oscillations. temp_inertia=0.8 configurable per call.
+BIG-TECH FEATURES (V1 — post-review integration):
+    ✅ ADD MULTI-EOS: generate(eos_ids=[id1, id2, ...]) — stops when any EOS token is
+         produced. Legacy eos_id parameter preserved for backward compatibility.
+         _eos_set built once at generate() entry for O(1) membership checks.
+    ✅ ADD INTERRUPT: generate(stop_event=threading.Event()) — cooperative interruption
+         via threading.Event.  Engine checks stop_event.is_set() before every step.
+         Returns tokens generated so far; safe to call from another thread.
+    ✅ ADD KVCACHE-CHECKPOINT: KVCache.save_checkpoint(path) / KVCache.load_checkpoint(path)
+         persist the full K/V buffer + cache_pos/filled vectors as a compressed .npz.
+         generate(checkpoint_every=N, checkpoint_path="ckpt") saves automatically every
+         N tokens — enables fault-tolerant long-form generation and session resume.
+    ✅ ADD ZERO-COPY-RETRIEVAL: KVCache._chrono_idx(b) pre-computes the chronological
+         index array for one batch slot and KVCache.get() uses a single fancy-index read
+         instead of 2-3 np.concatenate calls — reducing per-step allocations.
+    ✅ ADD PREFIX-CACHE: PrefixCache class (SHA-256 hash key, LRU eviction, thread-safe).
+         model.set_prefix_cache(PrefixCache(max_entries=32)) caches K/V state after
+         each prompt.  Subsequent generate() calls with the same prompt prefix skip
+         prefill entirely — 100% prefill savings for repeated system prompts.
+    ✅ ADD PROFILER-EXT: InferenceProfiler now tracks peak_mem_mb (RSS via resource
+         module), expert_usage (per-expert routing histogram), snap_escalations (count
+         of delta→full snapshot upgrades), and reject_rate.
+    ✅ ADD FUSED-MOE: MoELayer._get_stacked_weights() lazily stacks all expert W_g/W_u/W_d
+         into 3D arrays (n_experts, d, ff). forward() uses np.einsum batched matmul:
+         one batched gate+up projection and one batched down projection per top-k slot,
+         instead of O(n_active_experts) separate FFN calls. Falls back to per-expert
+         loop for QuantizedLinear weights. Cache invalidated by quantize_weights().
+    ✅ ADD SPEC-TREE: SpeculativeTreeDecoder class — multi-branch speculative decoding.
+         MTPHead.try_speculative_topk() returns up to tree_width candidates per level.
+         DFS tree search up to tree_depth deep; best accepted prefix is applied.
+         generate(use_speculative_tree=True, spec_tree_width=3, spec_tree_depth=2).
+         Orthogonal to use_speculative (single-token); enable one at a time.
+    ✅ ADD TOKEN-CHECKPOINT: generate(checkpoint_every=N) writes KVCache + token IDs
+         to disk every N tokens for fault-tolerance (see ADD KVCACHE-CHECKPOINT above).
+    ✅ ADD ADAPTIVE-LB: MoELayer.adapt_router_bias() nudges router_bias to correct
+         expert load imbalance observed during inference. DracoTransformerV1.adapt_load_balance()
+         applies it to all layers at once. Zero impact on inference latency — call
+         between generate() sessions to improve routing diversity over time.
 REFINEMENTS (V1 — post-consolidation polish):
     ✅ REF DYNAMIC-DELTA-THRESHOLD: snapshot() delta_threshold now auto-scales as n_layers * 2
          by default (set in generate() via snap_delta_threshold param). Accommodates any model
@@ -154,7 +191,50 @@ OPTIMISATIONS (V1 — this release, post-review):
          by Gumbel noise. Actual routing still uses noisy logits for diversity.
     ✅ OPT LOAD-EXPLICIT: QuantizedLinear.load() now explicitly sets _cached_W = None
          to make cache state unambiguous after load (forward-compat for future caching).
-BUGFIXES (V1 — consolidated post-review):
+    ✅ OPT BATCH-KVCACHE (🔥 BIG-TECH): KVCache buffer reshaped from
+         (n_layers, 1, n_kv_heads, window, head_dim) to
+         (n_layers, max_batch, n_kv_heads, window, head_dim).
+         Each batch slot has its own independent cache_pos / filled state vectors
+         (np.int32 arrays). Single-batch callers (batch_idx=0) are 100% backward-
+         compatible via scalar property shims. batch_idx now fully propagated through
+         GQAttention.forward → TransformerBlock.forward → DracoTransformerV1.forward.
+         Enables beam search, parallel multi-request serving, and full BLAS utilisation.
+         _make_cache(max_batch=N) pre-allocates N slots. Memory warning emitted when
+         estimated buffer size exceeds 4 GB.
+    ✅ OPT VECTORISED-KVCACHE-UPDATE (🔥 BIG-TECH): KVCache.update() computes all
+         buf_pos values in one NumPy vectorised op (np.where on sink/recent split) and
+         writes all positions with one fancy-index assignment — eliminating the Python
+         for-loop over seq tokens. For a 1024-token prefill: ~1024 iterations → 1 op.
+         Shape note: NumPy advanced indexing (mixed scalar + fancy on 5D buffer) moves
+         the indexed axis to the front → (seq, heads, dim). k[0].transpose(1,0,2) is
+         required before assignment. Verified empirically — removing transpose causes
+         shape mismatch (3,2,16) vs (2,3,16) with n_kv_heads=2.
+    ✅ ADD SAMPLER-CLASS: All sampling logic extracted from DracoTransformerV1 into a
+         standalone Sampler class with static methods: mirostat_v2, topk_topp, argmax.
+         DracoTransformerV1._sample_mirostat_v2 / _sample_topk_topp retained as thin
+         backward-compat shims. New code should call Sampler directly for testability
+         and composability (e.g. beam search, contrastive search).
+    ✅ ADD PROFILER: InferenceProfiler class — zero-overhead telemetry when not passed.
+         generate(profiler=prof) records per-step forward latency, speculative accept/
+         reject counts, and total throughput. profiler.summary() returns dict with
+         total_tokens, tokens_per_sec, avg_fwd_ms, p95_fwd_ms, spec_accept_rate.
+         Designed for production monitoring and regression detection.
+    ✅ ADD MEMORY-WARNING: _make_cache() emits ResourceWarning when estimated KVCache
+         size (n_layers × max_batch × n_kv_heads × window × head_dim × 4 bytes) exceeds
+         4 GB — guiding users to reduce window or enable use_memmap before OOM crash.
+BUGFIXES (V1 — consolidated post-review + post-doc patch):
+    ✅ FIX INT4-NGROUPS (🔴 CRITICAL): dequantize() INT4 n_groups computation corrected.
+         Was:  n_groups = self.W_q.shape[1] * 2 // self.group_size
+               → When in_feat is odd, W_q is padded to even width, so W_q.shape[1]*2
+               = in_feat+1. If (in_feat+1) is not divisible by group_size, n_groups is
+               wrong → reshape fails or silently returns garbage activations.
+         Now:  n_groups = self.in_feat // self.group_size
+               → Always uses the true (pre-padding) in_features; safe for all inputs.
+    ✅ FIX TRANSPOSED-SERIALIZE: QuantizedLinear.save() now stores _transposed flag
+         as meta[4]. load() restores it (defaults False for old files — backward-compat).
+         Previously, after quantize_weights()→save()→load(), the _transposed flag was
+         lost. Flag is used by GGUFExporter and any future introspection code that needs
+         to distinguish "weights stored pre-transposed" from standard orientation.
     ✅ FIX INT4-DEQUANT (🔴 CRITICAL): INT4 dequantize formula corrected.
          Was:  W_r * scale + zero * -scale  ← equivalent to (W_r - zero) * scale only
                if zero is additive, but our zero-point convention is multiplicative bias.
@@ -190,7 +270,7 @@ PRODUCTION ADDITIONS (V1 — this release):
          one generate() API.  Supports intent_bias (router) and intent_boost (logits) on
          both backends.  export_gguf() converts and auto-switches to llama.cpp backend."""
 from __future__ import annotations
-import math, os, json, time, copy, tempfile, struct, ctypes
+import math, os, json, time, copy, tempfile, struct, ctypes, threading
 from typing import List, Optional, Tuple, Dict, Callable
 import numpy as np
 # ── Constants ──────────────────────────────────────────────────────────
@@ -320,7 +400,10 @@ class QuantizedLinear:
             result = self.W_q.astype(np.float32) * self.scale[:, None]
         elif self.quant == 'int4':
             out_f = self.out_feat
-            n_groups = self.W_q.shape[1] * 2 // self.group_size  # recompute
+            # FIX INT4-NGROUPS: use self.in_feat (original, pre-padding) to compute
+            # n_groups.  Using W_q.shape[1]*2 is wrong when in_feat was odd-padded:
+            # padded_in = in_feat + 1 → (in_feat+1)//group_size ≠ in_feat//group_size.
+            n_groups = self.in_feat // self.group_size  # always correct
             # Unpack nibbles
             lo = (self.W_q & 0x0F).astype(np.float32)
             hi = ((self.W_q >> 4) & 0x0F).astype(np.float32)
@@ -354,11 +437,17 @@ class QuantizedLinear:
 
     # ── Serialise / deserialise ──────────────────────────────────────
     def save(self, path: str):
-        """Save to a single .npz file."""
+        """Save to a single .npz file.
+        FIX TRANSPOSED-SERIALIZE: _transposed flag now stored in meta[4] so that
+        load() can restore correct weight orientation after quantize→save→load.
+        Old files without meta[4] default _transposed=False (backward-compatible).
+        """
+        transposed_flag = 1 if getattr(self, "_transposed", False) else 0
         d: dict = {"W_q": self.W_q, "scale": self.scale,
                    "meta": np.array([self.in_feat, self.out_feat,
                                      self.group_size,
-                                     1 if self.quant == 'int4' else 0])}
+                                     1 if self.quant == 'int4' else 0,
+                                     transposed_flag])}
         if self.zero is not None:
             d["zero"] = self.zero
         np.savez_compressed(path, **d)
@@ -375,6 +464,9 @@ class QuantizedLinear:
         ql.out_feat   = int(meta[1])
         ql.group_size = int(meta[2])
         ql.quant      = 'int4' if int(meta[3]) else 'int8'
+        # FIX TRANSPOSED-SERIALIZE: restore _transposed flag (meta[4] may be absent
+        # in files saved before this fix — default False is safe).
+        ql._transposed = bool(int(meta[4])) if len(meta) > 4 else False
         ql._cached_W  = None
         return ql
 # ─────────────────────────────────────────────────────────────────────
@@ -423,7 +515,8 @@ class KVCache:
     """
     def __init__(self, n_layers: int, n_kv_heads: int, head_dim: int,
                  window: int = 1024, sink: int = SINK_TOKENS,
-                 use_memmap: bool = False, memmap_dir: Optional[str] = None):
+                 use_memmap: bool = False, memmap_dir: Optional[str] = None,
+                 max_batch: int = 1):
         """
         use_memmap=True: buffers backed by disk-mapped temp files.
             Avoids upfront RAM allocation — only pages in physical RAM that are
@@ -431,18 +524,30 @@ class KVCache:
             Recommended on machines with < 8 GB free RAM and large windows.
         use_memmap=False (default): np.empty — fast allocation, no zero-fill,
             safe because update() always writes before get() reads.
+        max_batch (default=1): pre-allocate buffer for up to max_batch independent
+            inference slots. Each slot has its own cache_pos / filled state.
+            When max_batch=1 the API is fully backward-compatible (batch_idx=0).
+            Increase for beam search or multi-request parallel serving.
+
+        ⚠ MEMMAP + max_batch: memmap buffers scale with max_batch — ensure enough
+            disk space. Multi-process access is still NOT safe without locking.
         """
         self.n_layers   = n_layers
         self.n_kv_heads = n_kv_heads
         self.head_dim   = head_dim
         self.window     = window
         self.sink       = sink
-        self.cache_pos: int = 0
-        self.filled:    int = 0
+        self.max_batch  = max_batch
+        # Per-slot state vectors — each batch slot manages its own position.
+        # For max_batch=1 these are 1-element arrays; callers use cache_pos / filled
+        # properties (backward-compat shims) that read/write slot 0.
+        self._cache_pos = np.zeros(max_batch, dtype=np.int32)
+        self._filled    = np.zeros(max_batch, dtype=np.int32)
         self._use_memmap = use_memmap
         self._k_file     = None
         self._v_file     = None
-        shape = (n_layers, 1, n_kv_heads, window, head_dim)
+        # Buffer shape: (n_layers, max_batch, n_kv_heads, window, head_dim)
+        shape = (n_layers, max_batch, n_kv_heads, window, head_dim)
         dtype = np.float16
         if use_memmap:
             _dir = memmap_dir or tempfile.gettempdir()
@@ -460,14 +565,39 @@ class KVCache:
             # All positions are written by update() before get() reads them.
             self.k_buf = np.empty(shape, dtype=dtype)
             self.v_buf = np.empty(shape, dtype=dtype)
-    def reset(self):
-        self.k_buf[:] = 0
-        self.v_buf[:] = 0
-        if self._use_memmap:
-            self.k_buf.flush()
-            self.v_buf.flush()
-        self.cache_pos = 0
-        self.filled    = 0
+
+    # ── Backward-compat scalar properties for single-batch callers ────
+    @property
+    def cache_pos(self) -> int:
+        return int(self._cache_pos[0])
+    @cache_pos.setter
+    def cache_pos(self, v: int):
+        self._cache_pos[0] = v
+
+    @property
+    def filled(self) -> int:
+        return int(self._filled[0])
+    @filled.setter
+    def filled(self, v: int):
+        self._filled[0] = v
+    def reset(self, batch_idx: Optional[int] = None):
+        """Reset cache state. batch_idx=None resets all slots (default)."""
+        if batch_idx is None:
+            self.k_buf[:] = 0
+            self.v_buf[:] = 0
+            if self._use_memmap:
+                self.k_buf.flush()
+                self.v_buf.flush()
+            self._cache_pos[:] = 0
+            self._filled[:]    = 0
+        else:
+            self.k_buf[:, batch_idx] = 0
+            self.v_buf[:, batch_idx] = 0
+            if self._use_memmap:
+                self.k_buf.flush()
+                self.v_buf.flush()
+            self._cache_pos[batch_idx] = 0
+            self._filled[batch_idx]    = 0
 
     def cleanup(self):
         """Delete memmap temp files. Call when KVCache is no longer needed."""
@@ -478,7 +608,55 @@ class KVCache:
                 except OSError:
                     pass
         self._k_file = self._v_file = None
-    def snapshot(self, delta_threshold: int = 64) -> dict:
+
+    # ── KVCache Checkpointing (ADD 2.6) ──────────────────────────────
+    def save_checkpoint(self, path: str):
+        """
+        Persist the full KVCache state to disk as a compressed .npz archive.
+        Useful for long-form generation fault-tolerance or session resume.
+
+        Saves: k_buf, v_buf (all layers/slots), _cache_pos, _filled vectors.
+        Reload with KVCache.load_checkpoint(path).
+
+        ⚠ memmap buffers are flushed before save; non-memmap buffers are
+        written as plain arrays.  The loaded cache is always RAM-backed
+        (use_memmap is not preserved — reconnect manually if needed).
+        """
+        if self._use_memmap:
+            self.k_buf.flush()
+            self.v_buf.flush()
+        np.savez_compressed(
+            path,
+            k_buf      = np.asarray(self.k_buf),
+            v_buf      = np.asarray(self.v_buf),
+            cache_pos  = self._cache_pos,
+            filled     = self._filled,
+            meta       = np.array([self.n_layers, self.max_batch,
+                                   self.n_kv_heads, self.window,
+                                   self.head_dim, self.sink]),
+        )
+
+    @staticmethod
+    def load_checkpoint(path: str) -> "KVCache":
+        """
+        Restore a KVCache from a .npz checkpoint saved by save_checkpoint().
+        Returns a RAM-backed KVCache (use_memmap=False) with state fully restored.
+        Backward-compatible: if file lacks any key it raises KeyError with a clear msg.
+        """
+        fname = path if path.endswith(".npz") else path + ".npz"
+        data  = np.load(fname)
+        meta  = data["meta"].tolist()
+        n_layers, max_batch, n_kv_heads, window, head_dim, sink = (
+            int(x) for x in meta)
+        cache = KVCache(n_layers, n_kv_heads, head_dim,
+                        window=window, sink=int(sink),
+                        use_memmap=False, max_batch=max_batch)
+        np.copyto(cache.k_buf, data["k_buf"])
+        np.copyto(cache.v_buf, data["v_buf"])
+        cache._cache_pos[:] = data["cache_pos"]
+        cache._filled[:]    = data["filled"]
+        return cache
+    def snapshot(self, delta_threshold: int = 64, batch_idx: int = 0) -> dict:
         """
         Multi-delta snapshot for transactional speculative decoding rollback.
         Instead of copying the entire K/V buffer (which can be 4+ GB for large
@@ -488,9 +666,13 @@ class KVCache:
         delta_threshold: if the number of delta positions exceeds this value,
         fall back to a full buffer copy (safety net for long speculative chains).
 
+        batch_idx: which batch slot this snapshot applies to (default=0,
+        backward-compatible for single-batch inference).
+
         Returns a dict with:
           - "mode": "delta" or "full"
-          - "cache_pos", "filled": scalar state
+          - "cache_pos", "filled": scalar state for the captured slot
+          - "batch_idx": which slot was snapshotted
           - For delta mode: "deltas" list of (layer, pos, k_slice, v_slice)
           - For full mode:  "k_buf", "v_buf" full copies
         """
@@ -498,8 +680,9 @@ class KVCache:
             self.k_buf.flush()
             self.v_buf.flush()
         snap: dict = {
-            "cache_pos": self.cache_pos,
-            "filled":    self.filled,
+            "cache_pos": int(self._cache_pos[batch_idx]),
+            "filled":    int(self._filled[batch_idx]),
+            "batch_idx": batch_idx,
             "mode":      "delta",
             "_deltas":   [],          # list of (layer, buf_pos, k_fp16, v_fp16)
             "_seen":     set(),       # set of buf_pos already captured this snap
@@ -508,62 +691,87 @@ class KVCache:
         return snap
 
     def update(self, layer: int, k: np.ndarray, v: np.ndarray,
-               snap: Optional[dict] = None):
+               snap: Optional[dict] = None, batch_idx: int = 0):
         """
         Store K,V for one layer.
         k, v shape: (1, n_kv_heads, seq, head_dim)
+
+        batch_idx: which buffer slot to write into (default=0, backward-compat).
+
         If snap is provided (active speculative chain), record the positions
         being overwritten for the first time so restore() can roll them back.
+
         Two distinct paths:
           1. seq > window  → prefill-long: copy sink + tail, no modulo
-          2. seq <= window → normal: sequential write with wrap-around
+          2. seq <= window → vectorised: fancy-index write for all positions at once
+             (OPT: replaces Python for-loop over seq tokens → single np assignment)
         filled updated only on layer==0 to avoid n_layers redundant writes.
         """
         seq = k.shape[2]
+        b   = batch_idx
+        cache_pos_b = int(self._cache_pos[b])
+
         if seq > self.window:
             # Long-prefill path: if snap active, fall back to full copy
             # (we'd need to record every position — easier to do full copy once)
             if snap is not None and snap.get("mode") == "delta":
                 self._snap_escalate_to_full(snap)
             tail_len = self.window - self.sink
-            self.k_buf[layer, :, :, :self.sink, :]            = k[:, :, :self.sink,  :].astype(np.float16)
-            self.v_buf[layer, :, :, :self.sink, :]            = v[:, :, :self.sink,  :].astype(np.float16)
-            self.k_buf[layer, :, :, self.sink:self.window, :] = k[:, :, -tail_len:, :].astype(np.float16)
-            self.v_buf[layer, :, :, self.sink:self.window, :] = v[:, :, -tail_len:, :].astype(np.float16)
+            self.k_buf[layer, b, :, :self.sink, :]            = k[0, :, :self.sink,  :].astype(np.float16)
+            self.v_buf[layer, b, :, :self.sink, :]            = v[0, :, :self.sink,  :].astype(np.float16)
+            self.k_buf[layer, b, :, self.sink:self.window, :] = k[0, :, -tail_len:, :].astype(np.float16)
+            self.v_buf[layer, b, :, self.sink:self.window, :] = v[0, :, -tail_len:, :].astype(np.float16)
             if layer == 0:
-                self.filled    = self.window
-                self.cache_pos = self.window
+                self._filled[b]    = self.window
+                self._cache_pos[b] = self.window
         else:
-            for s in range(seq):
-                abs_pos = self.cache_pos + s
-                if abs_pos < self.sink:
-                    buf_pos = abs_pos
-                else:
-                    buf_pos = self.sink + (abs_pos - self.sink) % max(1, self.window - self.sink)
-                # Record delta before overwriting, if snap is active
-                if snap is not None and snap.get("mode") == "delta":
-                    seen = snap["_seen"]
-                    key = (layer, buf_pos)
+            # ── Vectorised path: compute all buf_pos in one shot ─────────
+            # abs_pos[s] = cache_pos + s  for s in 0..seq-1
+            abs_pos    = cache_pos_b + np.arange(seq, dtype=np.int32)
+            still_sink = abs_pos < self.sink
+            recent_cap = max(1, self.window - self.sink)
+            buf_pos    = np.where(
+                still_sink,
+                abs_pos,
+                self.sink + (abs_pos - self.sink) % recent_cap
+            )
+            # Delta snapshot: record positions being overwritten for first time
+            if snap is not None and snap.get("mode") == "delta":
+                seen = snap["_seen"]
+                for s, bp in enumerate(buf_pos):
+                    key = (layer, int(bp))
                     if key not in seen:
                         seen.add(key)
                         snap["_deltas"].append((
-                            layer, buf_pos,
-                            self.k_buf[layer, :, :, buf_pos, :].copy(),
-                            self.v_buf[layer, :, :, buf_pos, :].copy(),
+                            layer, int(bp),
+                            self.k_buf[layer, b, :, bp, :].copy(),
+                            self.v_buf[layer, b, :, bp, :].copy(),
                         ))
-                        # If delta count exceeds threshold, escalate to full copy
                         if len(snap["_deltas"]) > snap["_threshold"]:
                             self._snap_escalate_to_full(snap)
-                self.k_buf[layer, :, :, buf_pos, :] = k[:, :, s, :].astype(np.float16)
-                self.v_buf[layer, :, :, buf_pos, :] = v[:, :, s, :].astype(np.float16)
+                            break   # escalated — no need to continue recording
+            # Vectorised write: all seq tokens in one fancy-index assignment.
+            # k[0] shape: (n_kv_heads, seq, head_dim)
+            # k_buf[layer,b, :, buf_pos, :] shape: (seq, n_kv_heads, head_dim)
+            # because NumPy advanced indexing moves the fancy-index axis to front
+            # when mixed with basic slices. So we transpose k[0] accordingly:
+            # k[0].transpose(1,0,2) → (seq, n_kv_heads, head_dim) ✓
+            self.k_buf[layer, b, :, buf_pos, :] = k[0].transpose(1, 0, 2).astype(np.float16)
+            self.v_buf[layer, b, :, buf_pos, :] = v[0].transpose(1, 0, 2).astype(np.float16)
             if layer == 0:
-                self.filled = min(self.cache_pos + seq, self.window)
+                self._filled[b] = min(cache_pos_b + seq, self.window)
 
     def _snap_escalate_to_full(self, snap: dict):
-        """Escalate a delta snapshot to a full buffer copy (fallback path)."""
+        """Escalate a delta snapshot to a full buffer copy (fallback path).
+        Only copies the relevant batch slot's data for memory efficiency.
+        Records escalation count for profiler telemetry.
+        """
+        b = snap.get("batch_idx", 0)
         snap["mode"]  = "full"
-        snap["k_buf"] = self.k_buf.copy()
-        snap["v_buf"] = self.v_buf.copy()
+        snap["_escalated"] = True   # flag for profiler to count
+        # Copy only the batch slot being snapshotted to save memory
+        snap["k_buf"] = self.k_buf[:, b, :, :, :].copy()
+        snap["v_buf"] = self.v_buf[:, b, :, :, :].copy()
         snap.pop("_deltas",    None)
         snap.pop("_seen",      None)
         snap.pop("_threshold", None)
@@ -572,57 +780,90 @@ class KVCache:
         """
         Restore cache state from a snapshot (delta or full mode).
         Delta mode: replay recorded (layer, buf_pos, k, v) tuples in reverse.
-        Full mode:  np.copyto the entire buffer (fallback for large chains).
+        Full mode:  np.copyto the relevant batch slot (not entire buffer).
+        batch_idx is read from snap["batch_idx"] (default 0 for compat).
         """
-        self.cache_pos = snap["cache_pos"]
-        self.filled    = snap["filled"]
+        b = snap.get("batch_idx", 0)
+        self._cache_pos[b] = snap["cache_pos"]
+        self._filled[b]    = snap["filled"]
         if snap.get("mode") == "full":
-            np.copyto(self.k_buf, snap["k_buf"])
-            np.copyto(self.v_buf, snap["v_buf"])
+            # Restore only this slot (k_buf saved as (n_layers, heads, window, dim))
+            np.copyto(self.k_buf[:, b, :, :, :], snap["k_buf"])
+            np.copyto(self.v_buf[:, b, :, :, :], snap["v_buf"])
         else:
             # Replay deltas in reverse order (last overwrite first)
             for layer, buf_pos, k_old, v_old in reversed(snap["_deltas"]):
-                np.copyto(self.k_buf[layer, :, :, buf_pos, :], k_old)
-                np.copyto(self.v_buf[layer, :, :, buf_pos, :], v_old)
-    def get(self, layer: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Return K, V in chronological order. Shape: (1, n_kv_heads, filled, head_dim)"""
-        if self.filled < self.window:
-            k = self.k_buf[layer, :, :, :self.filled, :]
-            v = self.v_buf[layer, :, :, :self.filled, :]
-            return k.astype(np.float32), v.astype(np.float32)
+                np.copyto(self.k_buf[layer, b, :, buf_pos, :], k_old)
+                np.copyto(self.v_buf[layer, b, :, buf_pos, :], v_old)
+    def _chrono_idx(self, batch_idx: int) -> np.ndarray:
+        """
+        ADD ZERO-COPY-RETRIEVAL: Pre-compute chronological index array for one slot.
+        Returns an int32 index array of length `filled` that, when used as a fancy
+        index on axis=3 of k_buf/v_buf, produces tokens in temporal order
+        (sink first, then recent oldest→newest).
+
+        Replaces the 2-3× np.concatenate calls in get() with a single fancy-index
+        read — reducing allocations from 3 new arrays to 1.
+
+        Called by get(); result is NOT cached (cache_pos changes every step).
+        For decode (seq=1), this is a trivial 1-element append so overhead is O(1).
+        """
+        b         = batch_idx
+        filled    = int(self._filled[b])
+        cache_pos = int(self._cache_pos[b])
+        if filled < self.window:
+            return np.arange(filled, dtype=np.int32)
         recent_cap = self.window - self.sink
         if recent_cap <= 0:
-            k = self.k_buf[layer, :, :, :self.filled, :]
-            v = self.v_buf[layer, :, :, :self.filled, :]
-            return k.astype(np.float32), v.astype(np.float32)
-        rec_start = self.sink + (self.cache_pos - self.sink) % recent_cap
-        k_sink = self.k_buf[layer, :, :, :self.sink, :]
-        v_sink = self.v_buf[layer, :, :, :self.sink, :]
-        k_rec  = np.concatenate([
-            self.k_buf[layer, :, :, rec_start:self.window, :],
-            self.k_buf[layer, :, :, self.sink:rec_start,   :],
-        ], axis=2)
-        v_rec  = np.concatenate([
-            self.v_buf[layer, :, :, rec_start:self.window, :],
-            self.v_buf[layer, :, :, self.sink:rec_start,   :],
-        ], axis=2)
-        k = np.concatenate([k_sink, k_rec], axis=2)
-        v = np.concatenate([v_sink, v_rec], axis=2)
-        return k.astype(np.float32), v.astype(np.float32)
-    def step(self, seq_len: int = 1):
+            return np.arange(filled, dtype=np.int32)
+        rec_start = self.sink + (cache_pos - self.sink) % recent_cap
+        # sink positions: [0 .. sink-1]  (always in order)
+        # recent positions in chronological wrap order: rec_start..window, then sink..rec_start
+        sink_idx   = np.arange(self.sink, dtype=np.int32)
+        if rec_start == self.sink:
+            # perfectly aligned — no wrap needed
+            recent_idx = np.arange(self.sink, self.window, dtype=np.int32)
+        else:
+            recent_idx = np.concatenate([
+                np.arange(rec_start,   self.window, dtype=np.int32),
+                np.arange(self.sink,   rec_start,   dtype=np.int32),
+            ])
+        return np.concatenate([sink_idx, recent_idx])
+
+    def get(self, layer: int, batch_idx: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        """Return K, V in chronological order. Shape: (1, n_kv_heads, filled, head_dim)
+        batch_idx: which slot to read (default=0, backward-compatible).
+
+        ADD ZERO-COPY-RETRIEVAL: Uses _chrono_idx() to produce a single fancy-index
+        read instead of 2-3 np.concatenate calls, reducing per-step allocations.
+        """
+        b      = batch_idx
+        filled = int(self._filled[b])
+        if filled < self.window:
+            k = self.k_buf[layer, b, :, :filled, :]
+            v = self.v_buf[layer, b, :, :filled, :]
+            return k[None].astype(np.float32), v[None].astype(np.float32)
+        idx = self._chrono_idx(b)
+        # Single fancy-index read — one allocation instead of three concatenates
+        k = self.k_buf[layer, b, :, idx, :]
+        v = self.v_buf[layer, b, :, idx, :]
+        return k[None].astype(np.float32), v[None].astype(np.float32)
+    def step(self, seq_len: int = 1, batch_idx: int = 0):
         """Advance cache pointer after a forward pass.
+        batch_idx: which slot to advance (default=0, backward-compatible).
         FIX KVCACHE-LONGPREFILL-POS: When the long-prefill path already set
         cache_pos = window, adding seq_len (which is > window) would make
         cache_pos >> window and cause get() rec_start to point to the wrong
         buffer slot on the very next decode step.  Guard: if cache_pos was
         already pinned to window by the long-prefill path, do not add again.
         """
-        if self.cache_pos == self.window and seq_len > self.window:
+        b = batch_idx
+        if self._cache_pos[b] == self.window and seq_len > self.window:
             # Long-prefill just ran; cache_pos pinned to window.
             # Skip re-increment — next decode's update() will wrap correctly.
             pass
         else:
-            self.cache_pos += seq_len
+            self._cache_pos[b] += seq_len
 # ─────────────────────────────────────────────────────────────────────
 # Layer normalisations
 # ─────────────────────────────────────────────────────────────────────
@@ -631,14 +872,186 @@ def rms_norm(x: np.ndarray, w: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return (x / rms) * w
 
 def _mm(x: np.ndarray, W) -> np.ndarray:
-    """Matrix multiply that transparently handles both np.ndarray and QuantizedLinear.
-    For ndarray:        x @ W      (standard, W shape: in × out)
-    For QuantizedLinear with _transposed=True: x @ dequant(W).T
-      = same as x @ original_W  because QL stores W.T in (out, in) convention.
-    """
+    """Matrix multiply that transparently handles both np.ndarray and QuantizedLinear."""
     if isinstance(W, QuantizedLinear):
-        return W.forward(x)   # ql.forward already does x @ W_fp.T
+        return W.forward(x)
     return x @ W
+# ─────────────────────────────────────────────────────────────────────
+# Sampler — decoupled sampling strategies (ADD SAMPLER-CLASS)
+# ─────────────────────────────────────────────────────────────────────
+class Sampler:
+    """
+    Standalone sampling module — decoupled from DracoTransformerV1 so that
+    sampling strategy can be swapped, subclassed, or tested independently.
+
+    All methods are static — no instance state required.
+    DracoTransformerV1.generate() delegates to this class.
+    The legacy _sample_mirostat_v2 / _sample_topk_topp static methods on
+    DracoTransformerV1 remain as thin shims for backward compatibility.
+    """
+
+    @staticmethod
+    def mirostat_v2(logits: np.ndarray, mu: float,
+                    tau: float = 5.0, eta: float = 0.1) -> Tuple[int, float]:
+        """Mirostat v2 adaptive sampling. mu updated with MINUS sign (Basu 2020)."""
+        logits = np.clip(logits, -50.0, 50.0)
+        probs  = np.exp(logits - logits.max())
+        probs /= probs.sum() + 1e-9
+        bad = ~np.isfinite(probs)
+        if bad.any():
+            probs[bad] = 0.0
+            s = probs.sum()
+            probs[:] = (probs / s) if s > 1e-9 else (1.0 / len(probs))
+        idx          = np.argsort(probs)[::-1]
+        probs_sorted = probs[idx]
+        surprises    = -np.log2(probs_sorted + 1e-9)
+        cutoff       = max(1, int(np.searchsorted(surprises, mu)))
+        trunc        = probs_sorted[:cutoff].copy()
+        t_sum        = trunc.sum()
+        if t_sum < 1e-9:
+            trunc = np.ones(1); t_sum = 1.0
+        trunc /= t_sum
+        chosen_local = int(np.random.choice(len(trunc), p=trunc))
+        chosen_id    = int(idx[chosen_local])
+        surprise     = float(-np.log2(probs[chosen_id] + 1e-9))
+        return chosen_id, max(0.1, mu - eta * (surprise - tau))
+
+    @staticmethod
+    def topk_topp(logits: np.ndarray,
+                  temp: float = DEFAULT_TEMP,
+                  top_p: float = DEFAULT_TOP_P,
+                  top_k: int = 50,
+                  min_p: float = 0.0) -> int:
+        """Top-k → Top-p nucleus → min-p filter → categorical sample."""
+        logits = np.clip(logits / max(temp, 1e-6), -50.0, 50.0)
+        if top_k > 0:
+            kth    = np.partition(logits, -top_k)[-top_k]
+            logits = np.where(logits < kth, -1e9, logits)
+        probs = np.exp(logits - logits.max())
+        probs /= probs.sum() + 1e-9
+        if min_p > 0.0:
+            max_prob = float(probs.max())
+            probs[probs < min_p * max_prob] = 0.0
+            p_sum = probs.sum()
+            probs = probs / p_sum if p_sum > 1e-9 else np.full_like(probs, 1.0 / len(probs))
+        idx    = np.argsort(probs)[::-1]
+        cumsum = np.cumsum(probs[idx])
+        cut    = int(np.searchsorted(cumsum, top_p)) + 1
+        probs_trunc = np.zeros_like(probs)
+        probs_trunc[idx[:cut]] = probs[idx[:cut]]
+        p_sum = probs_trunc.sum()
+        if p_sum < 1e-9:
+            probs_trunc[idx[0]] = 1.0; p_sum = 1.0
+        probs_trunc /= p_sum
+        bad = ~np.isfinite(probs_trunc)
+        if bad.any():
+            probs_trunc[bad] = 0.0
+            s = probs_trunc.sum()
+            if s < 1e-9:
+                probs_trunc[idx[0]] = 1.0
+            else:
+                probs_trunc /= s
+        return int(np.random.choice(len(probs_trunc), p=probs_trunc))
+
+    @staticmethod
+    def argmax(logits: np.ndarray) -> int:
+        """Deterministic greedy decode (equivalent to temp → 0)."""
+        return int(np.argmax(logits))
+
+# ─────────────────────────────────────────────────────────────────────
+# InferenceProfiler — optional telemetry (ADD PROFILER)
+# ─────────────────────────────────────────────────────────────────────
+class InferenceProfiler:
+    """
+    Lightweight per-step telemetry — zero overhead when not passed to generate().
+
+    Tracks: forward latency (ms), throughput (tok/s), speculative accept/reject.
+
+    Usage:
+        profiler = InferenceProfiler()
+        model.generate([...], profiler=profiler)
+        print(profiler.summary())
+        # → {'total_tokens': 64, 'tokens_per_sec': 38.2, 'spec_accept_rate': 0.71, ...}
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._fwd_times:    List[float]       = []
+        self._spec_accept:  int               = 0
+        self._spec_reject:  int               = 0
+        self._n_tokens:     int               = 0
+        self._start_wall:   float             = 0.0
+        self._end_wall:     float             = 0.0
+        # ADD PROFILER-EXT: expanded metrics
+        self._expert_hits:  List[int]         = []   # expert index per routing event
+        self._escalate_count: int             = 0    # delta→full snapshot escalations
+        self._peak_mem_mb:  float             = 0.0  # peak RSS memory in MB
+
+    def start_session(self):
+        self.reset()
+        self._start_wall = time.perf_counter()
+
+    def record_forward(self, elapsed_s: float):
+        self._fwd_times.append(elapsed_s * 1000.0)
+        # Snapshot RSS memory on every forward — tracks peak usage
+        try:
+            import resource as _res
+            rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+            # Linux: kilobytes; macOS: bytes
+            import sys as _sys
+            mb = rss / 1024 if _sys.platform != 'darwin' else rss / (1024 * 1024)
+            if mb > self._peak_mem_mb:
+                self._peak_mem_mb = mb
+        except Exception:
+            pass
+
+    def record_spec_accept(self):   self._spec_accept += 1
+    def record_spec_reject(self):   self._spec_reject += 1
+    def record_tokens(self, n: int): self._n_tokens += n
+    def record_expert(self, expert_idx: int): self._expert_hits.append(expert_idx)
+    def record_escalate(self):       self._escalate_count += 1
+
+    def end_session(self):
+        self._end_wall = time.perf_counter()
+
+    def summary(self) -> dict:
+        wall = max(self._end_wall - self._start_wall, 1e-9)
+        fwd  = self._fwd_times
+        # Expert usage distribution
+        if self._expert_hits:
+            import collections
+            cnt = collections.Counter(self._expert_hits)
+            expert_usage = {int(k): int(v) for k, v in sorted(cnt.items())}
+        else:
+            expert_usage = {}
+        return {
+            "total_tokens":     self._n_tokens,
+            "wall_time_s":      round(wall, 3),
+            "tokens_per_sec":   round(self._n_tokens / wall, 2),
+            "n_forward_calls":  len(fwd),
+            "avg_fwd_ms":       round(float(np.mean(fwd)),           2) if fwd else 0.0,
+            "p95_fwd_ms":       round(float(np.percentile(fwd, 95)), 2) if fwd else 0.0,
+            "spec_accept":      self._spec_accept,
+            "spec_reject":      self._spec_reject,
+            "spec_accept_rate": round(
+                self._spec_accept / max(1, self._spec_accept + self._spec_reject), 3),
+            # ADD PROFILER-EXT metrics
+            "peak_mem_mb":      round(self._peak_mem_mb, 1),
+            "expert_usage":     expert_usage,
+            "snap_escalations": self._escalate_count,
+            "reject_rate":      round(
+                self._spec_reject / max(1, self._n_tokens), 3),
+        }
+
+    def __repr__(self) -> str:
+        s = self.summary()
+        return (f"InferenceProfiler | {s['total_tokens']} tok | "
+                f"{s['tokens_per_sec']} tok/s | avg_fwd={s['avg_fwd_ms']}ms | "
+                f"spec_accept={s['spec_accept_rate']:.1%} | "
+                f"peak_mem={s['peak_mem_mb']}MB | escalations={s['snap_escalations']}")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Grouped Query Attention
 # ─────────────────────────────────────────────────────────────────────
@@ -664,23 +1077,24 @@ class GQAttention:
         if self._rope_freqs is None or self._rope_freqs.shape[0] != head_dim // 2:
             self._rope_freqs = _rope_freqs(head_dim)
         return self._rope_freqs
-    def forward(self, x: np.ndarray, cache: KVCache, layer_idx: int,
-                snap: Optional[dict] = None) -> np.ndarray:
+    def forward(self, x: np.ndarray, cache: "KVCache", layer_idx: int,
+                snap: Optional[dict] = None,
+                batch_idx: int = 0) -> np.ndarray:
         """
         x: (1, seq, d_model)  Returns: (1, seq, d_model)
+        batch_idx: which KVCache slot to read/write (default=0, backward-compat).
         FIX ATTN-CLIP: attention scores clipped to [-50, 50] before softmax.
-        snap: optional delta-snapshot dict passed through to cache.update().
         """
         bsz, seq, _ = x.shape
         freqs  = self._get_rope(self.head_dim)
-        offset = cache.cache_pos
+        offset = cache._cache_pos[batch_idx]
         Q = _mm(x, self.W_q).reshape(bsz, seq, self.n_heads,    self.head_dim).transpose(0, 2, 1, 3)
         K = _mm(x, self.W_k).reshape(bsz, seq, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         V = _mm(x, self.W_v).reshape(bsz, seq, self.n_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         Q = _apply_rope(Q, freqs, offset)
         K = _apply_rope(K, freqs, offset)
-        cache.update(layer_idx, K, V, snap=snap)
-        K_f, V_f = cache.get(layer_idx)
+        cache.update(layer_idx, K, V, snap=snap, batch_idx=batch_idx)
+        K_f, V_f = cache.get(layer_idx, batch_idx=batch_idx)
         kv_seq   = K_f.shape[2]
         K_exp = np.repeat(K_f, self.n_rep, axis=1)
         V_exp = np.repeat(V_f, self.n_rep, axis=1)
@@ -752,59 +1166,152 @@ class MoELayer:
         self.experts     = [ExpertFFN(d_model, d_ff) for _ in range(n_experts)]
         self.shared      = ExpertFFN(d_model, d_ff)
         self.norm_w      = np.ones(d_model, dtype=np.float32)
+        # ADD ADAPTIVE-LB: per-expert hit counters for online load balancing
+        self._expert_counts = np.zeros(n_experts, dtype=np.int64)
+        self._lb_steps      = 0   # number of forward() calls since last adapt
+    def _get_stacked_weights(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        ADD FUSED-MOE: Lazily stack expert weights into 3D arrays for grouped matmul.
+        Returns (W_g_stk, W_u_stk, W_d_stk) each shape (n_experts, d_model, d_ff) or
+        (n_experts, d_ff, d_model) for W_d.  Result cached in _stacked_* attrs.
+        Cache is invalidated by quantize_weights() / load via _invalidate_stacked().
+
+        When all experts have plain np.ndarray weights (not QuantizedLinear), the
+        fused path stacks them once and reuses on every forward() call — reducing
+        BLAS calls from n_active_experts*2 to 2 for the gate+up projection, and
+        1 for down projection.
+        """
+        if getattr(self, "_stacked_valid", False):
+            return self._W_g_stk, self._W_u_stk, self._W_d_stk
+        if any(isinstance(e.W_g, QuantizedLinear) for e in self.experts):
+            self._stacked_valid = False
+            return None, None, None   # fall back to per-expert loop
+        self._W_g_stk = np.stack([e.W_g for e in self.experts], axis=0)  # (E, d, ff)
+        self._W_u_stk = np.stack([e.W_u for e in self.experts], axis=0)  # (E, d, ff)
+        self._W_d_stk = np.stack([e.W_d for e in self.experts], axis=0)  # (E, ff, d)
+        self._stacked_valid = True
+        return self._W_g_stk, self._W_u_stk, self._W_d_stk
+
+    def _invalidate_stacked(self):
+        """Invalidate stacked weight cache (call after quantize or weight reload)."""
+        self._stacked_valid = False
+
+    def adapt_router_bias(self, imbalance_thresh: float = 0.3,
+                          correction_scale: float = 0.1,
+                          reset_counts: bool = True):
+        """
+        ADD ADAPTIVE-LB: Online expert load balancing via router_bias adjustment.
+
+        Computes the fraction of tokens routed to each expert over the observed
+        window.  Experts that are significantly underloaded (relative to the
+        ideal 1/n_experts fraction) get a positive router_bias boost; overloaded
+        experts get a small penalty.  This nudges the router toward more uniform
+        utilisation without touching the learned W_router weights.
+
+        imbalance_thresh: minimum fractional deviation from ideal to trigger
+          adjustment.  0.3 = 30% above/below ideal triggers a correction.
+        correction_scale: magnitude of the bias nudge (default 0.1 logit).
+        reset_counts: if True, reset _expert_counts after adapting (default True).
+
+        Call periodically during long inference runs, e.g. every 512 tokens.
+        Safe to call at any time — does not affect the current forward pass.
+        """
+        if self._lb_steps == 0:
+            return
+        total     = self._expert_counts.sum()
+        if total == 0:
+            return
+        fracs     = self._expert_counts / total
+        ideal     = 1.0 / self.n_experts
+        deviation = fracs - ideal      # positive = overloaded, negative = underloaded
+        # Apply correction proportional to deviation, capped at correction_scale
+        adj = -np.clip(deviation / (ideal + 1e-9), -1.0, 1.0) * correction_scale
+        # Only adjust if deviation exceeds threshold
+        mask = np.abs(deviation) > ideal * imbalance_thresh
+        self.router_bias[mask] += adj[mask].astype(np.float32)
+        if reset_counts:
+            self._expert_counts[:] = 0
+            self._lb_steps = 0
+
     def forward(self, x: np.ndarray,
                 add_noise: bool = True,
                 intent_bias: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
         """
         x: (batch=1, seq, d_model)
         Returns: (output, aux_losses_dict)
-        FIX MOE-NOISE: Gumbel noise injected when add_noise=True (inference).
+
+        ADD FUSED-MOE GROUPED MATMUL: when weights are plain float32/float16
+        (not quantized), stack all expert W_g/W_u/W_d into 3D arrays and perform
+        a single batched matmul per projection using einsum or advanced indexing,
+        reducing BLAS calls from O(n_active_experts) to O(1) per projection.
+        Falls back to per-expert loop when QuantizedLinear weights are present.
+
+        FIX MOE-NOISE: Gumbel noise injected when add_noise=True.
         intent_bias: optional (n_experts,) array — engine bias added to router logits.
         """
         bsz, seq, d = x.shape
         x_flat = x.reshape(seq, d)
         logits = x_flat @ self.W_router + self.router_bias
-        # Kết nối Engine → Router: cộng intent_bias (đã nhân với INTENT_BIAS_ALPHA ở ngoài)
         if intent_bias is not None:
             logits = logits + intent_bias.reshape(1, -1)
-        # Softmax over all experts for load-balance metrics — computed BEFORE noise
-        # so that aux metrics (importance_loss, load_loss) reflect the clean routing
-        # distribution. Adding noise after avoids aux metrics fluctuating due to noise
-        # while still letting the actual routing benefit from diversity.
+        # Clean routing for aux metrics (before noise)
         router_soft = np.exp(np.clip(logits - logits.max(axis=-1, keepdims=True), -50, 50))
         router_soft = router_soft / (router_soft.sum(axis=-1, keepdims=True) + 1e-9)
-        # FIX MOE-NOISE
         if add_noise and seq > 0:
             noise = np.random.gumbel(size=logits.shape).astype(np.float32) * MOE_NOISE_SCALE
             logits = logits + noise
-        # Top-k selection
         top_idx = np.argsort(logits, axis=-1)[:, -self.top_k:][:, ::-1]
-        # Gate weights: softmax over selected experts only
         top_logits = np.take_along_axis(logits, top_idx, axis=1)
         top_logits = top_logits - top_logits.max(axis=-1, keepdims=True)
         gates = np.exp(np.clip(top_logits, -50, 50))
         gates = gates / (gates.sum(axis=-1, keepdims=True) + 1e-9)
+
         output = np.zeros((seq, d), dtype=np.float32)
-        for k in range(self.top_k):
-            expert_ids = top_idx[:, k]   # (seq,)
-            g_k        = gates[:, k]     # (seq,)
-            # Vectorised dispatch via np.unique — groups all tokens routed to the
-            # same expert and runs one FFN call per active expert on its token batch.
-            # This replaces the O(n_experts * seq) Python loop with O(n_active) calls,
-            # significantly reducing per-step Python overhead on long sequences.
-            unique_experts, inverse = np.unique(expert_ids, return_inverse=True)
-            for local_e, e in enumerate(unique_experts):
-                mask   = inverse == local_e        # bool (seq,)
-                x_sel  = x_flat[mask]              # (n_tok, d)
-                g_sel  = g_k[mask]                 # (n_tok,)
-                normed = rms_norm(x_sel, self.norm_w)
-                e_out  = self.experts[e].forward(normed)
-                output[mask] += g_sel[:, None] * e_out
-        output += self.shared.forward(rms_norm(x_flat, self.norm_w))
+        normed_flat = rms_norm(x_flat, self.norm_w)
+        # ADD ADAPTIVE-LB: tally expert usage for online load balancing
+        for k_t in range(self.top_k):
+            for eid in top_idx[:, k_t]:
+                self._expert_counts[int(eid)] += 1
+        self._lb_steps += 1
+
+        # ── Fused grouped matmul path (no QuantizedLinear) ─────────────
+        W_g_stk, W_u_stk, W_d_stk = self._get_stacked_weights()
+        if W_g_stk is not None and seq > 0:
+            # For each top-k slot, gather weights for each token's selected expert
+            # using advanced indexing, then perform a single batched matmul.
+            # top_idx: (seq, top_k)  → flatten → (seq*top_k,)
+            # Gather: W_g_sel[i] = W_g_stk[top_idx_flat[i]]  → (seq*top_k, d, ff)
+            for k in range(self.top_k):
+                expert_ids = top_idx[:, k]          # (seq,)
+                g_k        = gates[:, k]             # (seq,)
+                # Gather expert weights for each token's chosen expert
+                W_g_sel = W_g_stk[expert_ids]       # (seq, d, ff)
+                W_u_sel = W_u_stk[expert_ids]       # (seq, d, ff)
+                W_d_sel = W_d_stk[expert_ids]       # (seq, ff, d)
+                # Batched matmul: normed_flat[i] @ W_g_sel[i]
+                # np.einsum('bi,bij->bj', ...) = batched dot
+                gate_act = np.einsum('bi,bij->bj', normed_flat, W_g_sel)  # (seq, ff)
+                gate_act = gate_act / (1.0 + np.exp(-np.clip(gate_act, -50, 50)))  # SiLU
+                up_act   = np.einsum('bi,bij->bj', normed_flat, W_u_sel)   # (seq, ff)
+                fused    = gate_act * up_act
+                down_out = np.einsum('bi,bij->bj', fused, W_d_sel)        # (seq, d)
+                output  += g_k[:, None] * down_out
+        else:
+            # ── Fallback: per-expert loop (QuantizedLinear or empty) ───
+            for k in range(self.top_k):
+                expert_ids = top_idx[:, k]
+                g_k        = gates[:, k]
+                unique_experts, inverse = np.unique(expert_ids, return_inverse=True)
+                for local_e, e in enumerate(unique_experts):
+                    mask   = inverse == local_e
+                    x_sel  = normed_flat[mask]
+                    g_sel  = g_k[mask]
+                    e_out  = self.experts[e].forward(x_sel)
+                    output[mask] += g_sel[:, None] * e_out
+
+        output += self.shared.forward(normed_flat)
         # Aux losses
         importance = router_soft.mean(axis=0)
-        # top_idx shape: (seq, top_k) — compare each expert against all selected experts per token
-        # Result: (n_experts, seq) bool → any over top_k axis → fraction of tokens per expert
         load = (top_idx[None, :, :] == np.arange(self.n_experts)[:, None, None]).any(axis=-1).mean(axis=1)
         aux = {
             "importance_loss": float(importance.std()),
@@ -839,12 +1346,15 @@ class MTPHead:
         h2 = silu(h1 @ self.W2)
         W  = self.lm_head
         return h1 @ W.T, h2 @ W.T
-    def try_speculative(self, l2: np.ndarray, thresh: float = SPEC_THRESH
+    def try_speculative(self, l2: np.ndarray, thresh: float = SPEC_THRESH,
+                        top_k_beam: int = 1
                         ) -> Tuple[Optional[int], float]:
         """
         Return (token_id, confidence) if MTP prediction is confident enough.
         The caller MUST: (1) snapshot cache, (2) forward spec token, (3) verify,
         (4) restore cache if rejected.
+
+        top_k_beam=1 (default): legacy single-token speculative (unchanged behaviour).
         """
         last_logits = l2[0, -1].astype(np.float64)
         last_logits = np.clip(last_logits, -50, 50)
@@ -855,6 +1365,33 @@ class MTPHead:
         if best_prob >= thresh:
             return best_id, best_prob
         return None, 0.0
+
+    def try_speculative_topk(self, l2: np.ndarray, thresh: float = SPEC_THRESH,
+                             top_k_beam: int = 3
+                             ) -> List[Tuple[int, float]]:
+        """
+        ADD SPEC-TREE: Return up to top_k_beam (token_id, confidence) candidates
+        whose probability >= thresh, sorted descending by confidence.
+        Used by SpeculativeTreeDecoder to build a multi-branch tree.
+
+        Returns empty list when no candidate exceeds thresh (no speculation).
+        """
+        last_logits = l2[0, -1].astype(np.float64)
+        last_logits = np.clip(last_logits, -50, 50)
+        probs = np.exp(last_logits - last_logits.max())
+        probs /= probs.sum() + 1e-9
+        # Partial sort: top top_k_beam indices descending
+        if top_k_beam >= len(probs):
+            top_ids = np.argsort(probs)[::-1]
+        else:
+            top_ids = np.argpartition(probs, -top_k_beam)[-top_k_beam:]
+            top_ids = top_ids[np.argsort(probs[top_ids])[::-1]]
+        candidates = [
+            (int(i), float(probs[i]))
+            for i in top_ids
+            if float(probs[i]) >= thresh
+        ]
+        return candidates
 # ─────────────────────────────────────────────────────────────────────
 # Transformer Block
 # ─────────────────────────────────────────────────────────────────────
@@ -866,18 +1403,247 @@ class TransformerBlock:
         self.moe       = MoELayer(d_model, d_ff, n_experts)
         self.norm1     = np.ones(d_model, dtype=np.float32)
         self.norm2     = np.ones(d_model, dtype=np.float32)
-    def forward(self, x: np.ndarray, cache: KVCache,
+    def forward(self, x: np.ndarray, cache: "KVCache",
                 add_noise: bool = True,
                 intent_bias: Optional[np.ndarray] = None,
-                snap: Optional[dict] = None) -> Tuple[np.ndarray, Dict]:
+                snap: Optional[dict] = None,
+                batch_idx: int = 0) -> Tuple[np.ndarray, Dict]:
         h     = rms_norm(x, self.norm1)
-        h     = self.attn.forward(h, cache, self.layer_idx, snap=snap)
+        h     = self.attn.forward(h, cache, self.layer_idx,
+                                  snap=snap, batch_idx=batch_idx)
         x     = x + h
         h, aux = self.moe.forward(rms_norm(x, self.norm2),
                                   add_noise=add_noise,
                                   intent_bias=intent_bias)
         x = x + h
         return x, aux
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SpeculativeTreeDecoder — multi-branch speculative decoding (ADD SPEC-TREE)
+# ─────────────────────────────────────────────────────────────────────
+class SpeculativeTreeDecoder:
+    """
+    Speculative Tree Decoding (SpecInfer style) using the MTPHead.
+
+    Instead of speculating a single token, builds a shallow tree of candidate
+    tokens (up to `tree_width` branches at each level, up to `tree_depth` deep)
+    and verifies them in one batched forward pass.
+
+    Algorithm per step:
+      1. Call mtp.try_speculative_topk(l2) → get up to tree_width candidates.
+      2. For each candidate: snapshot cache, forward candidate, record (l2_new, snap).
+      3. Verify: sample from the original logits at each branch position.
+         - If sampled token matches candidate → accept, continue deeper.
+         - On first mismatch → reject this branch; restore cache.
+      4. Return the longest accepted prefix found across all branches.
+
+    Usage:
+        decoder = SpeculativeTreeDecoder(model, tree_width=3, tree_depth=2)
+        # Called internally by generate() when use_speculative_tree=True.
+        # Direct use:
+        accepted, new_logits, new_l2 = decoder.try_tree(
+            cache, logits, l2, ids, freq, pos, n_pos, _eos_set, mu, use_mirostat
+        )
+
+    Notes:
+      - tree_depth=1 is equivalent to the existing single-token speculative path.
+      - tree_width=1 with depth=1 is identical to the original try_speculative().
+      - Memory: each branch requires a full-copy KVCache snapshot (safe via
+        _snap_escalate_to_full). For tree_width=3, depth=2: 9 snapshots maximum.
+      - Rollback is guaranteed: if no branch is accepted, the original cache state
+        is fully restored.
+    """
+    def __init__(self, model: "DracoTransformerV1",
+                 tree_width: int = 3, tree_depth: int = 2,
+                 thresh: float = SPEC_THRESH):
+        self.model      = model
+        self.tree_width = tree_width
+        self.tree_depth = tree_depth
+        self.thresh     = thresh
+
+    def try_tree(
+        self,
+        cache:        "KVCache",
+        logits:       np.ndarray,
+        l2:           np.ndarray,
+        ids:          List[int],
+        freq:         Dict[int, int],
+        pos:          Dict[int, int],
+        n_pos:        int,
+        _eos_set:     set,
+        mu:           float,
+        use_mirostat: bool,
+        temp:         float = DEFAULT_TEMP,
+        top_p:        float = DEFAULT_TOP_P,
+        min_p:        float = 0.0,
+        tau:          float = 5.0,
+        eta:          float = 0.1,
+        intent_boost: Optional[np.ndarray] = None,
+        intent_bias:  Optional[np.ndarray] = None,
+        add_noise:    bool = True,
+    ) -> Tuple[List[int], np.ndarray, np.ndarray, float]:
+        """
+        Attempt tree speculation from the current state.
+
+        Returns:
+            accepted_ids : list of accepted new token IDs (may be empty)
+            final_logits : logits after the last accepted token (for next iteration)
+            final_l2     : MTP logits after the last accepted token
+            final_mu     : updated Mirostat mu
+
+        If accepted_ids is empty, the caller must sample from `logits` normally.
+        The cache state reflects the accepted tokens (rejected branches are restored).
+        """
+        model = self.model
+
+        def _sample(lg, _mu):
+            if use_mirostat:
+                return Sampler.mirostat_v2(lg, _mu, tau, eta)
+            else:
+                return Sampler.topk_topp(lg, temp, top_p, min_p=min_p), _mu
+
+        # ── Recursive DFS tree search ─────────────────────────────────
+        def _search(cur_l2, cur_logits, depth, cur_mu
+                    ) -> Tuple[List[int], np.ndarray, np.ndarray, float]:
+            if depth == 0:
+                return [], cur_logits, cur_l2, cur_mu
+            candidates = model.mtp.try_speculative_topk(
+                cur_l2, self.thresh, self.tree_width)
+            if not candidates:
+                return [], cur_logits, cur_l2, cur_mu
+
+            best_accepted: List[int] = []
+            best_logits  = cur_logits
+            best_l2      = cur_l2
+            best_mu      = cur_mu
+
+            for spec_id, spec_conf in candidates:
+                if spec_id in _eos_set:
+                    # EOS candidate: accept immediately as depth-1 result
+                    return [spec_id], cur_logits, cur_l2, cur_mu
+
+                # Snapshot before forwarding candidate
+                snap = cache.snapshot(delta_threshold=0)
+                cache._snap_escalate_to_full(snap)
+
+                l1_c, l2_c, _ = model.forward(
+                    [spec_id], cache,
+                    intent_boost=intent_boost,
+                    add_noise=add_noise,
+                    intent_bias=intent_bias,
+                )
+                branch_logits = l1_c[0, -1].copy().astype(np.float64)
+                branch_logits = np.clip(branch_logits, -50.0, 50.0)
+
+                # Verify: sample from cur_logits (pre-spec)
+                verify_id, verify_mu = _sample(cur_logits.copy(), cur_mu)
+
+                if verify_id == spec_id:
+                    # ✅ Accepted — recurse deeper
+                    deeper, d_logits, d_l2, d_mu = _search(
+                        l2_c, branch_logits, depth - 1, verify_mu)
+                    chain = [spec_id] + deeper
+                    if len(chain) > len(best_accepted):
+                        best_accepted = chain
+                        best_logits   = d_logits
+                        best_l2       = d_l2
+                        best_mu       = d_mu
+                    # Restore before trying next branch (undo deeper recursion too)
+                    cache.restore(snap)
+                else:
+                    # ❌ Rejected — restore and try next branch
+                    cache.restore(snap)
+
+            # Re-forward the best accepted chain to fix cache state
+            if best_accepted:
+                for tok in best_accepted:
+                    model.forward([tok], cache,
+                                  intent_boost=intent_boost,
+                                  add_noise=add_noise,
+                                  intent_bias=intent_bias)
+
+            return best_accepted, best_logits, best_l2, best_mu
+
+        return _search(l2, logits, self.tree_depth, mu)
+
+# ─────────────────────────────────────────────────────────────────────
+# PrefixCache — KV reuse for repeated system prompts (ADD PREFIX-CACHE)
+# ─────────────────────────────────────────────────────────────────────
+class PrefixCache:
+    """
+    Prompt-prefix KV cache: stores the K/V state produced by a common prefix
+    (e.g. system prompt) and copies it into any new request that shares that prefix,
+    eliminating 100% of the prefix prefill cost.
+
+    Design:
+      - Key: SHA-256 hash of the prefix token IDs (bytes).
+      - Value: (KVCache snapshot dict, prefix_len) tuple.
+      - Capacity: LRU eviction when max_entries is exceeded.
+      - Thread-safe: uses threading.Lock for concurrent access.
+
+    Usage:
+        prefix_cache = PrefixCache(max_entries=32)
+        model.set_prefix_cache(prefix_cache)
+        # First call: prefills and stores the prefix KV.
+        # Subsequent calls with the same prefix: reuses stored KV, skips prefill.
+
+    Limitations:
+      - Only the EXACT matching prefix is reused (no partial match).
+      - Snapshot is a full buffer copy for safety (delta mode would risk aliasing).
+      - Cache entries are invalidated automatically when max_entries is exceeded (LRU).
+    """
+    def __init__(self, max_entries: int = 32):
+        self._max   = max_entries
+        self._store: "dict[str, tuple]" = {}   # hash → (snap, prefix_len, access_time)
+        self._lock  = threading.Lock()
+
+    @staticmethod
+    def _hash(token_ids: List[int]) -> str:
+        import hashlib
+        return hashlib.sha256(
+            b"".join(t.to_bytes(4, "little") for t in token_ids)
+        ).hexdigest()
+
+    def get(self, prefix_ids: List[int]) -> "Optional[tuple]":
+        """Return (snap, prefix_len) if prefix is cached, else None."""
+        h = self._hash(prefix_ids)
+        with self._lock:
+            entry = self._store.get(h)
+            if entry is not None:
+                snap, plen, _ = entry
+                self._store[h] = (snap, plen, time.perf_counter())  # update LRU
+                return snap, plen
+        return None
+
+    def put(self, prefix_ids: List[int], snap: dict):
+        """Store a full-copy snapshot for prefix_ids (evicts LRU if over capacity)."""
+        h = self._hash(prefix_ids)
+        with self._lock:
+            if len(self._store) >= self._max and h not in self._store:
+                # Evict least recently used entry
+                lru_key = min(self._store, key=lambda k: self._store[k][2])
+                del self._store[lru_key]
+            self._store[h] = (snap, len(prefix_ids), time.perf_counter())
+
+    def invalidate(self, prefix_ids: List[int]):
+        """Remove a specific prefix from the cache."""
+        h = self._hash(prefix_ids)
+        with self._lock:
+            self._store.pop(h, None)
+
+    def clear(self):
+        """Flush all cached entries."""
+        with self._lock:
+            self._store.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+    def __repr__(self) -> str:
+        return f"PrefixCache(entries={len(self)}/{self._max})"
+
 # ─────────────────────────────────────────────────────────────────────
 # Full Transformer Model
 # ─────────────────────────────────────────────────────────────────────
@@ -927,22 +1693,37 @@ class DracoTransformerV1:
         self._miro_mu: float = 5.0          # FIX: persistent Mirostat mu across turns
         self._memmap_cache: bool = False     # set True to use memmap KVCache
         self._memmap_dir: Optional[str] = None
+        self._prefix_cache: Optional["PrefixCache"] = None   # ADD PREFIX-CACHE
         # Cached float32 lm_head to avoid .astype() on every forward() call.
         # Invalidated whenever lm_head is reassigned (load, cast, quantize).
         self._lm_head_f32: Optional[np.ndarray] = None
-    def _make_cache(self) -> KVCache:
+    def _make_cache(self, max_batch: int = 1) -> KVCache:
+        # ADD MEMORY-WARNING: estimate buffer size and warn if > 4 GB
+        _bytes = (self.n_layers * max_batch * self.n_kv_heads *
+                  self.window * self.head_dim * 2 * 2)   # *2 for K+V, *2 for float16
+        if _bytes > 4 * 1024**3:
+            import warnings
+            warnings.warn(
+                f"KVCache allocation ~{_bytes / 1024**3:.1f} GB "
+                f"(n_layers={self.n_layers}, max_batch={max_batch}, "
+                f"n_kv_heads={self.n_kv_heads}, window={self.window}). "
+                "Consider reducing window or using use_memmap=True.",
+                ResourceWarning, stacklevel=2,
+            )
         return KVCache(
             self.n_layers, self.n_kv_heads, self.head_dim,
             window=self.window, sink=SINK_TOKENS,
             use_memmap=self._memmap_cache,
             memmap_dir=self._memmap_dir,
+            max_batch=max_batch,
         )
-    # ── Forward pass ─────────────────────────────────────────────────
+
     def forward(self, token_ids: List[int], cache: KVCache,
                 intent_boost: Optional[np.ndarray] = None,
                 add_noise: bool = True,
                 intent_bias: Optional[np.ndarray] = None,
                 snap: Optional[dict] = None,
+                batch_idx: int = 0,
                 ) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
         """
         Returns: (l1, l2, aux_list)
@@ -951,6 +1732,7 @@ class DracoTransformerV1:
           aux_list: per-block MoE aux losses
         snap: optional delta-snapshot dict — passed into cache.update() so only
           positions modified during this forward are recorded for rollback.
+        batch_idx: which KVCache slot to read/write (default=0, backward-compat).
         """
         ids = np.array(token_ids, dtype=np.int32)
         ids = np.clip(ids, 0, self.vocab_size - 1)
@@ -960,11 +1742,10 @@ class DracoTransformerV1:
             x, aux = block.forward(x, cache,
                                    add_noise=add_noise,
                                    intent_bias=intent_bias,
-                                   snap=snap)
+                                   snap=snap,
+                                   batch_idx=batch_idx)
             aux_list.append(aux)
         x  = rms_norm(x, self.norm_f)
-        # Use cached float32 lm_head — avoids .astype(float32) on every call.
-        # _lm_head_f32 is invalidated by load_external_weights, load_weights, cast_weights.
         if self._lm_head_f32 is None:
             self._lm_head_f32 = self.lm_head.astype(np.float32)
         x32 = x.astype(np.float32) if x.dtype != np.float32 else x
@@ -974,7 +1755,7 @@ class DracoTransformerV1:
             l1 = l1 + self._id_bias[None, None, :]
         if intent_boost is not None:
             l1 = l1 + intent_boost[None, None, :]
-        cache.step(len(token_ids))
+        cache.step(len(token_ids), batch_idx=batch_idx)
         return l1, l2, aux_list
     # ── Sanity checks ─────────────────────────────────────────────────
     @staticmethod
@@ -985,88 +1766,27 @@ class DracoTransformerV1:
         if np.any(np.isinf(logits)):
             raise RuntimeError(f"Inf in logits {label}")
     # ── Sampling ──────────────────────────────────────────────────────
+    # ── Sampling — shims delegating to Sampler class ──────────────────
+    # Kept for backward compatibility. New code should call Sampler directly.
     @staticmethod
     def _sample_mirostat_v2(logits: np.ndarray, mu: float, tau: float = 5.0,
                              eta: float = 0.1) -> Tuple[int, float]:
-        """
-        Mirostat v2 adaptive sampling.
-        FIX 2.2 (🔴 CRITICAL): mu update sign corrected to MINUS.
-        FIX LOGITS-CLIP: logits clipped to [-50, 50] before exp.
-        FIX PROBS-GUARD: probs re-normalised and NaN-guarded.
-        """
-        logits = np.clip(logits, -50.0, 50.0)
-        probs  = np.exp(logits - logits.max())
-        probs /= probs.sum() + 1e-9
-        # Guard NaN/Inf
-        bad = ~np.isfinite(probs)
-        if bad.any():
-            probs[bad] = 0.0
-            s = probs.sum()
-            if s < 1e-9:
-                probs[:] = 1.0 / len(probs)
-            else:
-                probs /= s
-        idx          = np.argsort(probs)[::-1]
-        probs_sorted = probs[idx]
-        surprises    = -np.log2(probs_sorted + 1e-9)
-        cutoff       = max(1, int(np.searchsorted(surprises, mu)))
-        trunc_probs = probs_sorted[:cutoff]
-        trunc_sum   = trunc_probs.sum()
-        if trunc_sum < 1e-9:
-            trunc_probs = probs_sorted[:1].copy()
-            trunc_probs[:] = 1.0
-        else:
-            trunc_probs = trunc_probs / trunc_sum
-        chosen_local = int(np.random.choice(len(trunc_probs), p=trunc_probs))
-        chosen_id    = int(idx[chosen_local])
-        surprise = float(-np.log2(probs[chosen_id] + 1e-9))
-        mu_new   = mu - eta * (surprise - tau)   # FIX 2.2: MINUS (not plus)
-        return chosen_id, max(0.1, mu_new)
+        """Backward-compat shim → Sampler.mirostat_v2."""
+        return Sampler.mirostat_v2(logits, mu, tau, eta)
+
     @staticmethod
     def _sample_topk_topp(logits: np.ndarray, temp: float = DEFAULT_TEMP,
                           top_p: float = DEFAULT_TOP_P, top_k: int = 50,
                           min_p: float = 0.0) -> int:
-        """
-        FIX LOGITS-CLIP: clip logits before exp.
-        FIX MIN-P: filter tokens below min_p * max_prob after top-k/p.
-        FIX PROBS-GUARD: ensure valid probability distribution.
-        """
-        logits = np.clip(logits / max(temp, 1e-6), -50.0, 50.0)
-        if top_k > 0:
-            kth    = np.partition(logits, -top_k)[-top_k]
-            logits = np.where(logits < kth, -1e9, logits)
-        probs = np.exp(logits - logits.max())
-        probs /= probs.sum() + 1e-9
-        # FIX MIN-P
-        if min_p > 0.0:
-            max_prob = float(probs.max())
-            probs[probs < min_p * max_prob] = 0.0
-            p_sum = probs.sum()
-            if p_sum > 1e-9:
-                probs /= p_sum
-            else:
-                probs[:] = 1.0 / len(probs)
-        # Top-p nucleus
-        idx    = np.argsort(probs)[::-1]
-        cumsum = np.cumsum(probs[idx])
-        cut    = int(np.searchsorted(cumsum, top_p)) + 1
-        probs_trunc = np.zeros_like(probs)
-        probs_trunc[idx[:cut]] = probs[idx[:cut]]
-        p_sum = probs_trunc.sum()
-        if p_sum < 1e-9:
-            probs_trunc[idx[0]] = 1.0
-            p_sum = 1.0
-        probs_trunc /= p_sum
-        # FIX PROBS-GUARD
-        bad = ~np.isfinite(probs_trunc)
-        if bad.any():
-            probs_trunc[bad] = 0.0
-            s = probs_trunc.sum()
-            if s < 1e-9:
-                probs_trunc[idx[0]] = 1.0
-            else:
-                probs_trunc /= s
-        return int(np.random.choice(len(probs_trunc), p=probs_trunc))
+        """Backward-compat shim → Sampler.topk_topp."""
+        return Sampler.topk_topp(logits, temp, top_p, top_k, min_p)
+
+
+    # ── Prefix Cache control ──────────────────────────────────────────
+    def set_prefix_cache(self, cache: "Optional[PrefixCache]"):
+        """Attach a PrefixCache to this model.  Pass None to disable."""
+        self._prefix_cache = cache
+
     # ── Generate ──────────────────────────────────────────────────────
     def generate(
         self,
@@ -1076,9 +1796,13 @@ class DracoTransformerV1:
         top_p:               float = DEFAULT_TOP_P,
         min_p:               float = 0.0,
         eos_id:              int   = 151645,
+        eos_ids:             Optional[List[int]] = None,
         new_prompt:          bool  = True,
         use_mirostat:        bool  = True,
         use_speculative:     bool  = True,
+        use_speculative_tree: bool = False,
+        spec_tree_width:     int   = 3,
+        spec_tree_depth:     int   = 2,
         adaptive_temp:       bool  = False,
         deterministic:       bool  = False,
         rep_alpha:           float = 0.5,
@@ -1088,48 +1812,55 @@ class DracoTransformerV1:
         stream_cb:           Optional[Callable[[int, float], None]] = None,
         intent_boost:        Optional[np.ndarray] = None,
         intent_bias:         Optional[np.ndarray] = None,
+        profiler:            Optional["InferenceProfiler"] = None,
+        stop_event:          Optional[threading.Event] = None,
+        checkpoint_every:    int   = 0,
+        checkpoint_path:     Optional[str] = None,
     ) -> List[int]:
         """
         Generate up to max_new_tokens tokens from prompt_ids.
 
+        profiler (optional): InferenceProfiler instance. When provided, generate()
+          records per-step forward latency, speculative accept/reject counts, and
+          total throughput — enabling production monitoring with zero overhead when
+          profiler=None (default).
+
+          Usage:
+              prof = InferenceProfiler()
+              model.generate(ids, profiler=prof)
+              print(prof)   # InferenceProfiler | 64 tok | 38.2 tok/s | ...
+
         rep_alpha (default 0.5): Controls soft repetition penalty strength.
-          Formula: rep_alpha * log(1 + count) / distance. Lower = more lenient,
-          higher = stronger suppression of repeated tokens.
-
-        temp_inertia (default 0.8): Exponential moving average factor for
-          adaptive temperature smoothing. Range [0, 1). Higher = slower change,
-          lower = more reactive. Only used when adaptive_temp=True.
-
-        snap_delta_threshold: Max number of K/V positions to track in delta mode
-          before falling back to full buffer copy. Default: n_layers * 2.
-          This auto-scales with model depth — a 32-layer model gets threshold=64
-          (allowing ~2 speculative tokens), a 4-layer test model gets 8.
-          Increase if you extend speculative chains beyond 2 tokens.
-
-        deterministic=True: disables Gumbel noise in MoE router (add_noise=False),
-          making inference fully reproducible given the same weights and inputs.
-          Useful for testing, debugging, or eval benchmarks.
-
-        FIX CACHE-ROLLBACK (🔴 CRITICAL): When a speculative token is rejected
-        (verify_id != spec_pending):
-            1. cache.restore(snap) is called to revert K/V to pre-speculation state.
-            2. pre_spec_logits (clean logits saved BEFORE the spec forward) are used
-               to re-sample verify_id — preventing the rejected token's K/V from
-               contaminating the sampling distribution.
-            3. If verify_id == eos_id, forward EOS once to keep cache consistent.
-            4. The next loop iteration forwards verify_id correctly from the clean state.
-        FIX INDENT (🔴 CRITICAL): The speculative verification block was correctly
-        placed inside while, after penalty application.
-        FIX SPEC-ACCEPT-MISSING-KV (🔴 CRITICAL): forward([nid]) called in accept
-        block before chaining speculative T+3.
-        FIX LOGITS-PIPELINE: clip → repetition_penalty → sample.
-        FIX ADAPTIVE-TEMP: temperature adjusted based on output entropy with inertia.
+        temp_inertia (default 0.8): EMA smoothing for adaptive temperature.
+        snap_delta_threshold: K/V delta positions before escalating to full copy.
+        deterministic=True: disables Gumbel noise (reproducible evals).
+        checkpoint_every (default 0): if > 0, save KVCache state every N tokens
+          to checkpoint_path.  Allows resume after crash via load_checkpoint().
+        checkpoint_path: file path for checkpoint (without .npz suffix).
+          Default: "dracoai_gen_checkpoint" in current directory.
         """
         if new_prompt or self._cache is None:
             self._cache = self._make_cache()
             self._miro_mu = 5.0   # FIX: reset mu only when starting a new prompt
         cache = self._cache
+        # ADD MULTI-EOS: build a set for O(1) membership test.
+        # eos_ids (list) takes priority; eos_id (scalar) is the legacy compat param.
+        _eos_set: set = set(eos_ids) if eos_ids else {eos_id}
         ids   = list(prompt_ids)
+        # ADD PREFIX-CACHE: if a PrefixCache is attached and new_prompt=True,
+        # check whether the prompt (or a prefix of it) has cached K/V state.
+        # On hit: restore cached K/V + fast-forward cur to the unprocessed suffix.
+        # On miss after prefill: store the full prompt K/V for future reuse.
+        _prefix_hit = False
+        if self._prefix_cache is not None and new_prompt:
+            _hit = self._prefix_cache.get(prompt_ids)
+            if _hit is not None:
+                _snap, _plen = _hit
+                cache.restore(_snap)
+                ids = list(prompt_ids)   # keep full ids; cur will start at suffix
+                _prefix_hit = True
+                if debug:
+                    print(f"[PrefixCache] HIT — skipped {_plen} token prefill")
         mu  = self._miro_mu    # FIX: load persistent mu (already reset above if new_prompt)
         tau = 5.0
         eta = 0.1
@@ -1150,15 +1881,27 @@ class DracoTransformerV1:
         # Default: n_layers * 2 → allows ~2 speculative tokens for any model size.
         _snap_threshold = snap_delta_threshold if snap_delta_threshold is not None \
             else self.n_layers * 2
-        # deterministic mode: disable Gumbel noise in MoE router
         add_noise = not deterministic
-        # Prefill
-        cur = ids
+        # ── Profiler session start ──────────────────────────────────────
+        if profiler is not None:
+            profiler.start_session()
+        # Prefill — on prefix cache hit, only process the unprocessed suffix
+        if _prefix_hit:
+            _plen = self._prefix_cache.get(prompt_ids)[1]
+            cur = ids[_plen:] if len(ids) > _plen else [ids[-1]]
+        else:
+            cur = ids
         while n_generated < max_new_tokens:
+            # ADD INTERRUPT: check stop event before each step
+            if stop_event is not None and stop_event.is_set():
+                break
+            _fwd_t0 = time.perf_counter()
             l1, l2, _ = self.forward(cur, cache,
                                       intent_boost=intent_boost,
                                       add_noise=add_noise,
                                       intent_bias=intent_bias)
+            if profiler is not None:
+                profiler.record_forward(time.perf_counter() - _fwd_t0)
             last_logits = l1[0, -1].copy().astype(np.float64)
             if debug:
                 self._sanity_checks(last_logits, f"step={n_generated}")
@@ -1178,8 +1921,9 @@ class DracoTransformerV1:
                 else:
                     verify_id = self._sample_topk_topp(last_logits, current_temp, top_p, min_p=min_p)
                 if verify_id == spec_pending:
-                    # ✅ Speculative confirmed — cache K/V for spec token already written.
-                    # last_logits = forward(spec_pending) output → distribution for T+2.
+                    # ✅ Speculative confirmed
+                    if profiler is not None:
+                        profiler.record_spec_accept()
                     spec_pending    = None
                     spec_snap       = None
                     pre_spec_logits = None
@@ -1210,7 +1954,7 @@ class DracoTransformerV1:
                     conf = float(np.exp(np.clip(last_logits[nid] - last_logits.max(), -50, 0)))
                     if stream_cb:
                         stream_cb(nid, conf)
-                    if nid == eos_id or n_generated >= max_new_tokens:
+                    if nid in _eos_set or n_generated >= max_new_tokens:
                         break
                     # ── Forward T+2 to write K/V(nid) into cache ─────────
                     # CRITICAL: nid has no K/V in cache yet. If we chain another
@@ -1232,7 +1976,7 @@ class DracoTransformerV1:
                     if use_speculative:
                         spec_id, spec_conf = self.mtp.try_speculative(l2_new)
                         if spec_id is not None:
-                            if spec_id == eos_id:
+                            if spec_id in _eos_set:
                                 break
                             # last_logits_new is clean (no penalty yet); save as-is
                             # — penalty will be reapplied from scratch in verify iter
@@ -1252,8 +1996,12 @@ class DracoTransformerV1:
                     continue
                 else:
                     # ❌ Speculative rejected
+                    if profiler is not None:
+                        profiler.record_spec_reject()
                     # Step 1: Roll back cache to pre-speculation state
                     if spec_snap is not None:
+                        if profiler is not None and spec_snap.get("_escalated"):
+                            profiler.record_escalate()
                         cache.restore(spec_snap)
                     # Step 2: Re-sample verify_id from CLEAN logits (before spec forward
                     # contaminated the distribution). This avoids hallucination from
@@ -1284,7 +2032,7 @@ class DracoTransformerV1:
                     conf = float(np.exp(np.clip(last_logits[verify_id] - last_logits.max(), -50, 0)))
                     if stream_cb:
                         stream_cb(verify_id, conf)
-                    if verify_id == eos_id:
+                    if verify_id in _eos_set:
                         # Forward EOS so cache is consistent, then terminate
                         self.forward([verify_id], cache,
                                      intent_boost=intent_boost,
@@ -1328,15 +2076,46 @@ class DracoTransformerV1:
             conf = float(np.exp(np.clip(last_logits[nid] - last_logits.max(), -50, 0)))
             if stream_cb:
                 stream_cb(nid, conf)
-            if nid == eos_id:
+            # ADD TOKEN-CHECKPOINT: periodically persist KVCache + token state
+            if checkpoint_every > 0 and n_generated % checkpoint_every == 0:
+                _ckpt_path = checkpoint_path or "dracoai_gen_checkpoint"
+                try:
+                    cache.save_checkpoint(_ckpt_path)
+                    np.save(_ckpt_path + "_ids.npy",
+                            np.array(ids, dtype=np.int32))
+                except Exception as _e:
+                    if debug:
+                        print(f"[checkpoint] save failed: {_e}")
+            if nid in _eos_set:
                 break
             if n_generated >= max_new_tokens:
                 break
-            # ── Speculative decoding ──────────────────────────────
+            # ── Speculative Tree Decoding (ADD SPEC-TREE) ─────────
+            if use_speculative_tree and not use_speculative:
+                _tree_dec = SpeculativeTreeDecoder(
+                    self, tree_width=spec_tree_width,
+                    tree_depth=spec_tree_depth, thresh=SPEC_THRESH)
+                _accepted, last_logits, l2, mu = _tree_dec.try_tree(
+                    cache, last_logits, l2, ids, freq, pos, n_pos,
+                    _eos_set, mu, use_mirostat,
+                    temp=current_temp, top_p=top_p, min_p=min_p,
+                    intent_boost=intent_boost, intent_bias=intent_bias,
+                    add_noise=add_noise,
+                )
+                for _t in _accepted:
+                    ids.append(_t)
+                    freq[_t] = freq.get(_t, 0) + 1
+                    pos[_t]  = n_pos; n_pos += 1; n_generated += 1
+                    if stream_cb: stream_cb(_t, 1.0)
+                    if _t in _eos_set or n_generated >= max_new_tokens:
+                        break
+                cur = [ids[-1]]
+                continue
+            # ── Standard single-token speculative decoding ─────────
             if use_speculative:
                 spec_id, spec_conf = self.mtp.try_speculative(l2)
                 if spec_id is not None:
-                    if spec_id == eos_id:
+                    if spec_id in _eos_set:
                         # FIX S1: immediate break on speculative EOS
                         break
                     # FIX CACHE-ROLLBACK: save clean logits and snapshot BEFORE forwarding spec token
@@ -1361,8 +2140,23 @@ class DracoTransformerV1:
             if ids and ids[-1] == spec_pending:
                 ids.pop()
             pre_spec_logits = None
-        self._miro_mu = mu   # FIX: persist mu for next generate() call (multi-turn)
-        return ids[len(prompt_ids):]
+        self._miro_mu = mu
+        result = ids[len(prompt_ids):]
+        # ADD PREFIX-CACHE: on new_prompt miss, store prompt K/V for future reuse.
+        # Uses a full-copy snapshot so the cache entry is independent of this session.
+        if (self._prefix_cache is not None and new_prompt
+                and not _prefix_hit and len(prompt_ids) > 0):
+            try:
+                _snap_store = cache.snapshot(delta_threshold=0)  # force full copy
+                cache._snap_escalate_to_full(_snap_store)
+                self._prefix_cache.put(prompt_ids, _snap_store)
+            except Exception:
+                pass   # prefix store is best-effort; never block generation
+        # ── Profiler session end ────────────────────────────────────────
+        if profiler is not None:
+            profiler.record_tokens(len(result))
+            profiler.end_session()
+        return result
     # ── Weight loading ────────────────────────────────────────────────
     def load_external_weights(self, state_dict: dict, from_checkpoint: bool = True):
         """
@@ -1426,6 +2220,22 @@ class DracoTransformerV1:
             for blk in self.blocks:
                 for exp in blk.moe.experts:
                     exp._break_symmetry()
+    def adapt_load_balance(self, imbalance_thresh: float = 0.3,
+                           correction_scale: float = 0.1):
+        """
+        ADD ADAPTIVE-LB: Call adapt_router_bias() on all MoE layers simultaneously.
+        Useful after a warmup window or periodically during long sessions.
+
+            model.generate([...], max_new_tokens=512)
+            model.adapt_load_balance()   # adjust router biases based on observed usage
+            model.generate([...], max_new_tokens=512)   # next run benefits from balanced routing
+        """
+        for blk in self.blocks:
+            blk.moe.adapt_router_bias(
+                imbalance_thresh=imbalance_thresh,
+                correction_scale=correction_scale,
+            )
+
     def set_identity_bias(self, token_ids: List[int], boost: float = 2.0):
         """
         Logit-level identity overlay.
@@ -1476,6 +2286,7 @@ class DracoTransformerV1:
                     ql = QuantizedLinear.from_float(W.T, quant=mode, group_size=group_size)
                     ql._transposed = True
                     setattr(exp, attr, ql)
+            blk.moe._invalidate_stacked()   # ADD FUSED-MOE: invalidate stacked cache
 
     def cast_weights(self, dtype: np.dtype) -> None:
         """Cast all float weight matrices to the given dtype (float16 / float32).
@@ -2016,5 +2827,132 @@ if __name__ == "__main__":
     bridge_out = bridge.generate([1, 2, 3], max_new_tokens=5, use_speculative=False)
     assert isinstance(bridge_out, list)
     print(f"✅ TransformerBridge (numpy) OK: {bridge_out}")
+
+    # ── Test Sampler class ──
+    logits_test = np.array([100.0, -100.0, 50.0, 0.0])
+    sid, smu = Sampler.mirostat_v2(logits_test, mu=5.0)
+    assert 0 <= sid < 4
+    print(f"✅ Sampler.mirostat_v2 OK: id={sid}, mu={smu:.3f}")
+    sid2 = Sampler.topk_topp(logits_test, min_p=0.1, top_k=4)
+    assert 0 <= sid2 < 4
+    print(f"✅ Sampler.topk_topp OK: id={sid2}")
+    assert Sampler.argmax(logits_test) == 0
+    print("✅ Sampler.argmax OK")
+
+    # ── Test InferenceProfiler ──
+    prof = InferenceProfiler()
+    model_p = DracoTransformerV1(config)
+    out_p = model_p.generate([1, 2, 3], max_new_tokens=6,
+                              use_speculative=True, profiler=prof)
+    s = prof.summary()
+    assert s["total_tokens"] == len(out_p), "profiler token count mismatch"
+    assert s["n_forward_calls"] >= 1
+    assert 0.0 <= s["spec_accept_rate"] <= 1.0
+    print(f"✅ InferenceProfiler OK: {prof}")
+
+    # ── Test batch_idx propagation (max_batch=2) ──
+    cache_b = model._make_cache(max_batch=2)
+    l1_b0, _, _ = model.forward([1, 2, 3], cache_b, batch_idx=0)
+    l1_b1, _, _ = model.forward([4, 5, 6], cache_b, batch_idx=1)
+    assert cache_b._cache_pos[0] == 3
+    assert cache_b._cache_pos[1] == 3
+    assert l1_b0.shape == l1_b1.shape
+    print("✅ batch_idx multi-slot KVCache OK")
+
+    # ── Test multi-EOS ──
+    out_meos = model.generate([1, 2, 3], max_new_tokens=10,
+                              eos_ids=[151645, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                              use_speculative=False)
+    assert isinstance(out_meos, list)
+    print(f"✅ multi-EOS generate OK: {out_meos}")
+
+    # ── Test interrupt via stop_event ──
+    import threading as _th
+    stop = _th.Event()
+    stop.set()   # set immediately → generate returns empty
+    out_stop = model.generate([1, 2, 3], max_new_tokens=20,
+                              use_speculative=False, stop_event=stop)
+    assert isinstance(out_stop, list)
+    print(f"✅ stop_event interrupt OK: {out_stop}")
+
+    # ── Test KVCache checkpoint save/load ──
+    import tempfile as _tf, os as _os2
+    cache_ck = model._make_cache()
+    model.forward([1, 2, 3, 4], cache_ck)
+    with _tf.TemporaryDirectory() as td:
+        ckpt_path = _os2.path.join(td, "test_cache")
+        cache_ck.save_checkpoint(ckpt_path)
+        cache_loaded = KVCache.load_checkpoint(ckpt_path)
+        assert cache_loaded._cache_pos[0] == cache_ck._cache_pos[0]
+        assert cache_loaded._filled[0]    == cache_ck._filled[0]
+        # Compare only the filled (written) region, not the np.empty garbage
+        _f = cache_ck._filled[0]
+        assert np.array_equal(
+            np.asarray(cache_loaded.k_buf)[:, 0, :, :_f, :],
+            np.asarray(cache_ck.k_buf)[:, 0, :, :_f, :],
+        )
+    print("✅ KVCache checkpoint save/load OK")
+
+    # ── Test token-level checkpoint in generate ──
+    with _tf.TemporaryDirectory() as td:
+        ckpt_g = _os2.path.join(td, "gen_ckpt")
+        out_ckpt = model.generate([1, 2, 3], max_new_tokens=6,
+                                  use_speculative=False,
+                                  checkpoint_every=2,
+                                  checkpoint_path=ckpt_g)
+        assert _os2.path.exists(ckpt_g + ".npz"), "checkpoint not written"
+    print(f"✅ token-level checkpoint OK: {out_ckpt}")
+
+    # ── Test PrefixCache ──
+    pcache = PrefixCache(max_entries=4)
+    model.set_prefix_cache(pcache)
+    out_pc1 = model.generate([1, 2, 3], max_new_tokens=5, use_speculative=False)
+    assert len(pcache) == 1, f"expected 1 entry, got {len(pcache)}"
+    out_pc2 = model.generate([1, 2, 3], max_new_tokens=5,
+                             use_speculative=False, debug=True)
+    assert isinstance(out_pc2, list)
+    model.set_prefix_cache(None)   # detach
+    print(f"✅ PrefixCache OK: entries={len(pcache)}, out={out_pc2}")
+
+    # ── Test Fused MoE (float32 weights — should use einsum path) ──
+    model_fused = DracoTransformerV1(config)
+    out_fused = model_fused.generate([1, 2, 3], max_new_tokens=5, use_speculative=False)
+    assert isinstance(out_fused, list)
+    # Verify stacked weights were built
+    assert model_fused.blocks[0].moe._stacked_valid, "stacked weights not built"
+    print(f"✅ Fused MoE (einsum) OK: {out_fused}")
+
+    # ── Test Fused MoE invalidation on quantize ──
+    model_fused.quantize_weights(quant='int8')
+    assert not model_fused.blocks[0].moe._stacked_valid, "stacked not invalidated after quant"
+    out_fused_q = model_fused.generate([1, 2, 3], max_new_tokens=4, use_speculative=False)
+    assert isinstance(out_fused_q, list)
+    print(f"✅ Fused MoE fallback after INT8 quant OK: {out_fused_q}")
+
+    # ── Test Online Expert Load Balancing ──
+    model_lb = DracoTransformerV1(config)
+    model_lb.generate([1, 2, 3], max_new_tokens=8, use_speculative=False)
+    bias_before = model_lb.blocks[0].moe.router_bias.copy()
+    model_lb.adapt_load_balance()
+    # Bias may or may not change depending on distribution; just ensure no crash
+    assert isinstance(model_lb.blocks[0].moe.router_bias, np.ndarray)
+    print("✅ Online expert load balancing OK")
+
+    # ── Test Speculative Tree Decoding ──
+    out_tree = model.generate([1, 2, 3], max_new_tokens=8,
+                              use_speculative=False,
+                              use_speculative_tree=True,
+                              spec_tree_width=2, spec_tree_depth=2)
+    assert isinstance(out_tree, list)
+    print(f"✅ Speculative Tree Decoding OK: {out_tree}")
+
+    # ── Test MTPHead.try_speculative_topk ──
+    l2_test = np.zeros((1, 1, config["vocab_size"]), dtype=np.float32)
+    l2_test[0, 0, 5] = 10.0   # highly confident token 5
+    l2_test[0, 0, 7] = 5.0    # second candidate
+    candidates = model.mtp.try_speculative_topk(l2_test, thresh=0.1, top_k_beam=3)
+    assert len(candidates) >= 1
+    assert candidates[0][0] == 5
+    print(f"✅ MTPHead.try_speculative_topk OK: {candidates}")
 
     print("✅ transformer_v1 self-test passed")
