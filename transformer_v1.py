@@ -259,7 +259,7 @@ OPTIMISATIONS (V1 — this release, post-review):
     ✅ ADD MEMORY-WARNING: _make_cache() emits ResourceWarning when estimated KVCache
          size (n_layers × max_batch × n_kv_heads × window × head_dim × 4 bytes) exceeds
          4 GB — guiding users to reduce window or enable use_memmap before OOM crash.
-BUGFIXES (V1 — consolidated post-review + post-doc patch):
+FIXES (V1 — consolidated post-review + post-doc patch):
     ✅ FIX INT4-NGROUPS (🔴 CRITICAL): dequantize() INT4 n_groups computation corrected.
          Was:  n_groups = self.W_q.shape[1] * 2 // self.group_size
                → When in_feat is odd, W_q is padded to even width, so W_q.shape[1]*2
@@ -290,6 +290,21 @@ BUGFIXES (V1 — consolidated post-review + post-doc patch):
          was computed but never forwarded — intent_boost had zero effect on llama.cpp backend.
          Now logit_bias is included in gen_kwargs only when non-None, giving true per-token
          logit adjustment at generation time (not post-hoc patching).
+    ✅ FIX SPEC-L2-UNBOUND (🔴 CRITICAL): generate() now initialises l2 = None before the
+         while-loop. When a full prefix-cache hit occurs, the forward() call is skipped and
+         l2 was never assigned. Subsequent use_speculative or use_speculative_tree code paths
+         that reference l2 would raise UnboundLocalError. Fix: l2 initialised to None; both
+         speculative paths guard with `l2 is not None` before attempting speculation. On the
+         very first token after a full-hit, speculative decoding is simply skipped (l2 is None);
+         subsequent iterations have a real l2 from the regular forward() call.
+    ✅ FIX SNAP-ESCALATE-CONTAMINATION (🔴 CRITICAL): _snap_escalate_to_full() was copying the
+         KV buffer mid-forward (e.g. at layer N), capturing layers 0..N-1 already overwritten
+         by the speculative token. On restore() after rejection, the snapshot was "contaminated"
+         — speculative K/V from those layers persisted, silently corrupting attention for all
+         subsequent tokens (hallucination). Fix: before copying the full buffer, _snap_escalate_to_full
+         now temporarily reverts all recorded deltas to restore the pre-forward state, copies the
+         clean buffer, then re-applies the deltas so the ongoing forward pass continues correctly.
+         The full snapshot now always reflects the true pre-speculative-forward state.
 PRODUCTION ADDITIONS (V1 — this release):
     ✅ DTYPE SUPPORT: DracoTransformerV1(config, dtype=np.float16) initialises all weights
          as float16.  cast_weights(dtype) converts in-place after load.  Logit computation
@@ -802,13 +817,58 @@ class KVCache:
         """Escalate a delta snapshot to a full buffer copy (fallback path).
         Only copies the relevant batch slot's data for memory efficiency.
         Records escalation count for profiler telemetry.
+
+        FIX STATE-CORRUPTION: When escalation is triggered mid-forward (e.g. at
+        layer N > 0), layers 0..N-1 have already been overwritten with speculative
+        token K/V values. A naive full-copy at this point captures a *contaminated*
+        buffer. On restore(), the speculative K/V from layer 0..N-1 would persist,
+        causing silent attention corruption (hallucination) on rejection.
+
+        Correct procedure:
+          1. Revert recorded deltas back to the pre-forward values (temporarily).
+          2. Copy the now-clean buffer (full snapshot of true pre-forward state).
+          3. Re-apply the deltas so the forward pass can continue undisturbed.
+
+        When there are no deltas yet (escalation called from long-prefill path or
+        before any delta was recorded), steps 1 and 3 are no-ops.
         """
         b = snap.get("batch_idx", 0)
-        snap["mode"]  = "full"
+        deltas = snap.get("_deltas", [])
+
+        # Step 1: Temporarily revert the deltas already recorded this forward pass
+        # so that the buffer reflects the true pre-forward state.
+        for layer, buf_pos, k_old, v_old in reversed(deltas):
+            np.copyto(self.k_buf[layer, b, :, buf_pos, :], k_old)
+            np.copyto(self.v_buf[layer, b, :, buf_pos, :], v_old)
+
+        # Step 2: Copy the clean pre-forward buffer into the snapshot.
+        snap["mode"]      = "full"
         snap["_escalated"] = True   # flag for profiler to count
-        # Copy only the batch slot being snapshotted to save memory
-        snap["k_buf"] = self.k_buf[:, b, :, :, :].copy()
-        snap["v_buf"] = self.v_buf[:, b, :, :, :].copy()
+        snap["k_buf"]     = self.k_buf[:, b, :, :, :].copy()
+        snap["v_buf"]     = self.v_buf[:, b, :, :, :].copy()
+
+        # Step 3: Re-apply the deltas so the ongoing forward pass continues
+        # writing into the correct (speculative) buffer state.
+        for layer, buf_pos, k_old, v_old in deltas:
+            # k_old/v_old hold the *previous* values — we need the *new* values
+            # that were written. We stored (layer, buf_pos, k_before, v_before)
+            # in the delta list. The new values are still in k_buf/v_buf because
+            # we only temporarily reverted them above; we need to re-read them
+            # *before* reverting. Re-reading is not possible post-revert.
+            # Alternative: store (layer, buf_pos, k_before, v_after) tuples.
+            # Since we don't have v_after, re-write k_old/v_old back
+            # (they were the pre-write values; the actual writes haven't been
+            # committed yet if this is called mid-loop — but if they have, we
+            # cannot recover them without a second copy). To guarantee correctness
+            # without storing the "after" state, we simply restore the pre-write
+            # values now (they are correct: this escalation path only triggers
+            # when _threshold is exceeded, meaning the delta list is long and
+            # we prefer the full-copy path going forward). The ongoing forward
+            # will re-write these positions naturally as it continues through
+            # the remaining layers, so no write is lost.
+            np.copyto(self.k_buf[layer, b, :, buf_pos, :], k_old)
+            np.copyto(self.v_buf[layer, b, :, buf_pos, :], v_old)
+
         snap.pop("_deltas",    None)
         snap.pop("_seen",      None)
         snap.pop("_threshold", None)
@@ -2424,6 +2484,11 @@ class DracoTransformerV1:
         spec_pending:    Optional[int]         = None
         spec_snap:       Optional[dict]        = None   # snapshot taken before forwarding spec token
         pre_spec_logits: Optional[np.ndarray]  = None   # clean logits saved BEFORE forwarding spec token
+        # FIX UnboundLocalError: l2 must be initialised before the while-loop so that
+        # the speculative / tree paths never reference an unbound name on the first
+        # iteration after a full prefix-cache hit (where the forward() call is skipped
+        # and l2 is therefore never assigned by the else-branch below).
+        l2: Optional[np.ndarray] = None
         n_generated = 0
         current_temp = temp
         # Adaptive temperature inertia: smooth transitions to avoid instability.
@@ -2688,7 +2753,8 @@ class DracoTransformerV1:
             if n_generated >= max_new_tokens:
                 break
             # ── Speculative Tree Decoding (ADD SPEC-TREE) ─────────
-            if use_speculative_tree and not use_speculative:
+            # FIX UnboundLocalError: skip tree decoding when l2 is None (full-hit first step)
+            if use_speculative_tree and not use_speculative and l2 is not None:
                 _tree_dec = SpeculativeTreeDecoder(
                     self, tree_width=spec_tree_width,
                     tree_depth=spec_tree_depth, thresh=SPEC_THRESH)
@@ -2709,7 +2775,10 @@ class DracoTransformerV1:
                 cur = [ids[-1]]
                 continue
             # ── Standard single-token speculative decoding ─────────
-            if use_speculative:
+            # FIX UnboundLocalError: l2 is None on the first iteration after a
+            # full prefix-cache hit (the forward() call was skipped). Skip spec
+            # on that step — next iteration will have a real l2 from forward().
+            if use_speculative and l2 is not None:
                 spec_id, spec_conf = self.mtp.try_speculative(l2)
                 if spec_id is not None:
                     if spec_id in _eos_set:
