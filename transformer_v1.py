@@ -1165,8 +1165,7 @@ class DracoTransformerV1:
             # FIX LOGITS-PIPELINE step 1: clip
             last_logits = np.clip(last_logits, -50.0, 50.0)
             # FIX LOGITS-PIPELINE step 2: soft repetition penalty (distance-decayed log formula)
-            # penalty = alpha * log(1 + cnt) / dist  — softer than linear, avoids over-suppression
-            REP_ALPHA = 0.5
+            # penalty = rep_alpha * log(1 + cnt) / dist — softer than linear, avoids over-suppression
             for tid, cnt in freq.items():
                 if cnt > 0:
                     dist_penalty = n_pos - pos.get(tid, 0) + 1
