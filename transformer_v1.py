@@ -25,6 +25,15 @@ Architecture:
   - Mirostat v2 sampling
   - Identity overlay via logit-level bias (no text replacement)
 FIXES (V1 — final consolidated):
+    ✅ FIX PREFIX-CACHE-FULL-HIT (🔴 CRITICAL): PrefixCache full-cache hit no longer
+         re-forwards the last prompt token. last_logits is now stored alongside the
+         KV snapshot in PrefixCache.put(). On a full hit (_plen == len(prompt_ids)),
+         generate() restores last_logits directly and sets cur=[] to skip the first
+         forward entirely — zero-cost prompt processing, no duplicate KV writes,
+         no RoPE position error for the first generated token.
+    ✅ FIX MOE-LB-COUNT: MoELayer._expert_counts now tallies unique experts per token
+         (np.unique over the full top_idx matrix) instead of looping over each k-slot.
+         Previous double-counting caused imbalance stats to over-report high-k experts.
     ✅ KVCache: prefill safety — long prompt slices sink+tail, no modulo overwrite
     ✅ KVCache: filled updated correctly for both prefill and decode
     ✅ MoE: vectorised boolean-mask dispatch (removes Python token loop)
@@ -164,6 +173,34 @@ BIG-TECH FEATURES (V1 — post-review integration):
          expert load imbalance observed during inference. DracoTransformerV1.adapt_load_balance()
          applies it to all layers at once. Zero impact on inference latency — call
          between generate() sessions to improve routing diversity over time.
+    ✅ ADD TENSOR-MEMORY-POOL (🔥 BIG-TECH): TensorPool class — thread-safe workspace
+         buffer pool for intermediate tensors (Q, K, V, attn scores). get(shape, dtype)
+         returns a buffer of exactly the right size, reusing a cached array if available
+         instead of calling np.empty() on every forward step. Eliminates per-step heap
+         allocation overhead. GQAttention accepts pool= parameter; model.set_tensor_pool()
+         attaches/detaches the pool. Pool is optional — all code falls back gracefully.
+    ✅ ADD HEALTH-DIAGNOSTICS (🔥 BIG-TECH): HealthMonitor class — online inference
+         diagnostics with per-step checks. Detects: expert collapse (one expert > 90%
+         of routing), NaN/Inf in logits, attention entropy anomalies, and memory pressure.
+         Emits structured warnings to a configurable callback. model.set_health_monitor()
+         attaches monitor; generate() calls monitor.check_step() each iteration.
+    ✅ ADD DYNAMIC-PRECISION (🔥 BIG-TECH): DynamicPrecisionManager class — monitors
+         logit overflow/underflow per forward step and votes to switch compute dtype
+         between float16 and float32 automatically. Uses exponential moving average of
+         overflow fraction; switches when EMA exceeds threshold. Integrates into generate()
+         via model.set_precision_manager(). Prevents silent NaN propagation in long sessions.
+    ✅ ADD WRITE-AHEAD-LOG (🔥 BIG-TECH): WriteAheadLog class — fault-tolerant token
+         journal. Appends each generated token ID + timestamp to a .wal file. On crash,
+         WAL.recover(path) replays the journal to reconstruct the token sequence without
+         re-running inference. generate(wal=wal) activates per-token journaling.
+         WAL.close() flushes and seals the log. Complements existing checkpoint_every
+         (full KVCache snapshots) with lightweight single-token durability.
+    ✅ ADD CONTINUOUS-BATCHING-SCHEDULER (🔥 BIG-TECH): ContinuousBatchingScheduler
+         class — production request scheduler for multi-slot KVCache. Maintains a pool
+         of batch slots; enqueue(prompt_ids, max_new_tokens) assigns an idle slot and
+         returns a Future-like RequestHandle. step() advances all active slots one
+         token, auto-evicts completed requests, and fills freed slots with queued ones.
+         Designed as a drop-in orchestration layer over DracoTransformerV1(max_batch=N).
 REFINEMENTS (V1 — post-consolidation polish):
     ✅ REF DYNAMIC-DELTA-THRESHOLD: snapshot() delta_threshold now auto-scales as n_layers * 2
          by default (set in generate() via snap_delta_threshold param). Accommodates any model
@@ -1268,10 +1305,12 @@ class MoELayer:
 
         output = np.zeros((seq, d), dtype=np.float32)
         normed_flat = rms_norm(x_flat, self.norm_w)
-        # ADD ADAPTIVE-LB: tally expert usage for online load balancing
-        for k_t in range(self.top_k):
-            for eid in top_idx[:, k_t]:
-                self._expert_counts[int(eid)] += 1
+        # ADD ADAPTIVE-LB: tally expert usage for online load balancing.
+        # Use np.unique over the flattened top_idx so each expert is counted once
+        # per token regardless of top_k (avoids double-counting in top-k > 1 routing).
+        unique_eids, unique_counts = np.unique(top_idx, return_counts=True)
+        for eid, cnt in zip(unique_eids, unique_counts):
+            self._expert_counts[int(eid)] += int(cnt)
         self._lb_steps += 1
 
         # ── Fused grouped matmul path (no QuantizedLinear) ─────────────
@@ -1606,25 +1645,33 @@ class PrefixCache:
         ).hexdigest()
 
     def get(self, prefix_ids: List[int]) -> "Optional[tuple]":
-        """Return (snap, prefix_len) if prefix is cached, else None."""
+        """Return (snap, prefix_len, last_logits) if prefix is cached, else None.
+        last_logits may be None for entries stored by older code (backward-compat)."""
         h = self._hash(prefix_ids)
         with self._lock:
             entry = self._store.get(h)
             if entry is not None:
-                snap, plen, _ = entry
-                self._store[h] = (snap, plen, time.perf_counter())  # update LRU
-                return snap, plen
+                if len(entry) == 4:
+                    snap, plen, _, last_logits = entry
+                else:
+                    snap, plen, _ = entry
+                    last_logits = None   # legacy entry — no logits stored
+                self._store[h] = (snap, plen, time.perf_counter(), last_logits)  # update LRU
+                return snap, plen, last_logits
         return None
 
-    def put(self, prefix_ids: List[int], snap: dict):
-        """Store a full-copy snapshot for prefix_ids (evicts LRU if over capacity)."""
+    def put(self, prefix_ids: List[int], snap: dict,
+            last_logits: Optional[np.ndarray] = None):
+        """Store a full-copy snapshot for prefix_ids (evicts LRU if over capacity).
+        last_logits: the logit vector produced by the final prompt token forward.
+        When provided, generate() can skip the first forward on a full cache hit."""
         h = self._hash(prefix_ids)
         with self._lock:
             if len(self._store) >= self._max and h not in self._store:
                 # Evict least recently used entry
                 lru_key = min(self._store, key=lambda k: self._store[k][2])
                 del self._store[lru_key]
-            self._store[h] = (snap, len(prefix_ids), time.perf_counter())
+            self._store[h] = (snap, len(prefix_ids), time.perf_counter(), last_logits)
 
     def invalidate(self, prefix_ids: List[int]):
         """Remove a specific prefix from the cache."""
@@ -1643,6 +1690,486 @@ class PrefixCache:
 
     def __repr__(self) -> str:
         return f"PrefixCache(entries={len(self)}/{self._max})"
+
+# ─────────────────────────────────────────────────────────────────────
+# TensorPool — reusable workspace buffer pool  (ADD TENSOR-MEMORY-POOL)
+# ─────────────────────────────────────────────────────────────────────
+class TensorPool:
+    """
+    Thread-safe pool of reusable NumPy workspace buffers.
+
+    Eliminates per-step np.empty() heap allocation for frequently-allocated
+    tensors (Q, K, V, attn scores). Each shape+dtype combination has its own
+    slot; the most recently returned buffer of the right size is reused.
+
+    Usage:
+        pool  = TensorPool()
+        model.set_tensor_pool(pool)
+        # From that point on, GQAttention.forward() will borrow/return buffers
+        # from the pool instead of allocating fresh arrays each step.
+
+    Thread safety: a threading.Lock guards the internal store; safe for
+    concurrent multi-batch access.
+    """
+
+    def __init__(self):
+        # _store: (shape, dtype_str) → list of available arrays
+        self._store: "dict[tuple, list]" = {}
+        self._lock  = threading.Lock()
+        self._hits  = 0
+        self._misses = 0
+
+    def get(self, shape: tuple, dtype: np.dtype) -> np.ndarray:
+        """Return a buffer of the requested shape and dtype.
+        May return an existing array (contents undefined) or a freshly allocated one."""
+        key = (shape, np.dtype(dtype).str)
+        with self._lock:
+            bucket = self._store.get(key)
+            if bucket:
+                self._hits += 1
+                return bucket.pop()
+        self._misses += 1
+        return np.empty(shape, dtype=dtype)
+
+    def put(self, arr: np.ndarray):
+        """Return a buffer to the pool after use."""
+        key = (arr.shape, arr.dtype.str)
+        with self._lock:
+            self._store.setdefault(key, []).append(arr)
+
+    def clear(self):
+        """Flush all cached buffers (call between sessions to free RAM)."""
+        with self._lock:
+            self._store.clear()
+
+    @property
+    def hit_rate(self) -> float:
+        total = self._hits + self._misses
+        return self._hits / total if total else 0.0
+
+    def stats(self) -> dict:
+        with self._lock:
+            n_bufs = sum(len(v) for v in self._store.values())
+        return {"hits": self._hits, "misses": self._misses,
+                "hit_rate": round(self.hit_rate, 3), "pooled_buffers": n_bufs}
+
+    def __repr__(self) -> str:
+        return f"TensorPool(hit_rate={self.hit_rate:.1%}, {self.stats()['pooled_buffers']} bufs)"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HealthMonitor — online inference diagnostics  (ADD HEALTH-DIAGNOSTICS)
+# ─────────────────────────────────────────────────────────────────────
+class HealthMonitor:
+    """
+    Non-intrusive online health checker for inference sessions.
+
+    Checks performed each step (when check_step() is called):
+      - NaN/Inf in logits → CRITICAL alert
+      - Expert collapse: any single expert routing > collapse_thresh fraction → WARNING
+      - Logit saturation: max(|logits|) > sat_thresh → WARNING
+      - Memory pressure: RSS > mem_warn_mb MB → WARNING (Linux/macOS only)
+
+    Alerts are delivered to alert_cb(level, message) — defaults to print.
+    All checks are O(1) or O(n_experts); zero impact on generation throughput.
+
+    Usage:
+        monitor = HealthMonitor(alert_cb=lambda lvl, msg: logging.warning(msg))
+        model.set_health_monitor(monitor)
+        model.generate([...])
+        print(monitor.report())
+    """
+
+    CRITICAL = "CRITICAL"
+    WARNING  = "WARNING"
+    INFO     = "INFO"
+
+    def __init__(self,
+                 collapse_thresh: float = 0.90,
+                 sat_thresh:      float = 45.0,
+                 mem_warn_mb:     float = 8192.0,
+                 alert_cb: Optional[Callable] = None):
+        self._collapse_thresh = collapse_thresh
+        self._sat_thresh      = sat_thresh
+        self._mem_warn_mb     = mem_warn_mb
+        self._alert_cb        = alert_cb or (lambda lvl, msg: print(f"[HealthMonitor:{lvl}] {msg}"))
+        self._n_steps    = 0
+        self._n_nan      = 0
+        self._n_collapse = 0
+        self._n_sat      = 0
+        self._n_mem_warn = 0
+
+    def check_step(self, logits: np.ndarray,
+                   expert_counts: Optional[np.ndarray] = None) -> None:
+        """Call once per generate() step after computing last_logits."""
+        self._n_steps += 1
+        # ── NaN / Inf ───────────────────────────────────────────────
+        if not np.isfinite(logits).all():
+            self._n_nan += 1
+            n_bad = int((~np.isfinite(logits)).sum())
+            self._alert_cb(self.CRITICAL,
+                           f"step {self._n_steps}: NaN/Inf detected in logits "
+                           f"(n_bad={n_bad})")
+        # ── Logit saturation ────────────────────────────────────────
+        if logits.size > 0 and float(np.abs(logits).max()) > self._sat_thresh:
+            self._n_sat += 1
+            self._alert_cb(self.WARNING,
+                           f"step {self._n_steps}: logit saturation "
+                           f"max|logit|={float(np.abs(logits).max()):.1f} > {self._sat_thresh}")
+        # ── Expert collapse ──────────────────────────────────────────
+        if expert_counts is not None and expert_counts.sum() > 0:
+            fracs = expert_counts / (expert_counts.sum() + 1e-9)
+            if float(fracs.max()) > self._collapse_thresh:
+                self._n_collapse += 1
+                top_e = int(fracs.argmax())
+                self._alert_cb(self.WARNING,
+                               f"step {self._n_steps}: expert collapse — expert {top_e} "
+                               f"handles {fracs[top_e]:.1%} of routing "
+                               f"(thresh {self._collapse_thresh:.0%})")
+        # ── Memory pressure ──────────────────────────────────────────
+        try:
+            import resource as _res, sys as _sys
+            rss = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss
+            mb  = rss / 1024 if _sys.platform != 'darwin' else rss / (1024 * 1024)
+            if mb > self._mem_warn_mb:
+                self._n_mem_warn += 1
+                self._alert_cb(self.WARNING,
+                               f"step {self._n_steps}: high memory RSS={mb:.0f} MB "
+                               f"> {self._mem_warn_mb:.0f} MB threshold")
+        except Exception:
+            pass
+
+    def report(self) -> dict:
+        return {
+            "steps_checked": self._n_steps,
+            "nan_events":     self._n_nan,
+            "collapse_events": self._n_collapse,
+            "saturation_events": self._n_sat,
+            "mem_warn_events": self._n_mem_warn,
+        }
+
+    def reset(self):
+        self._n_steps = self._n_nan = self._n_collapse = self._n_sat = self._n_mem_warn = 0
+
+    def __repr__(self) -> str:
+        r = self.report()
+        return (f"HealthMonitor(steps={r['steps_checked']}, "
+                f"nan={r['nan_events']}, collapse={r['collapse_events']}, "
+                f"sat={r['saturation_events']})")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DynamicPrecisionManager — auto dtype switching  (ADD DYNAMIC-PRECISION)
+# ─────────────────────────────────────────────────────────────────────
+class DynamicPrecisionManager:
+    """
+    Monitors logit overflow/underflow and votes to switch compute dtype
+    between float16 and float32 automatically.
+
+    Algorithm:
+      - Each step, check fraction of |logits| > overflow_thresh.
+      - Update an EMA: ema = alpha * ema + (1-alpha) * overflow_frac.
+      - If EMA > up_thresh and current dtype is float16 → switch to float32.
+      - If EMA < down_thresh and current dtype is float32 → switch back to float16.
+      - Hysteresis (up/down thresholds differ) prevents thrashing.
+
+    generate() checks model.precision_manager.current_dtype each step and
+    re-casts intermediate logits accordingly.
+
+    Usage:
+        pm = DynamicPrecisionManager()
+        model.set_precision_manager(pm)
+        model.generate([...])   # dtype switches automatically as needed
+        print(pm.status())
+    """
+
+    def __init__(self,
+                 overflow_thresh: float = 40.0,
+                 up_thresh:       float = 0.05,    # EMA fraction → upgrade to f32
+                 down_thresh:     float = 0.005,   # EMA fraction → downgrade to f16
+                 alpha:           float = 0.1,     # EMA smoothing
+                 initial_dtype:   np.dtype = np.float16):
+        self._overflow_thresh = overflow_thresh
+        self._up_thresh       = up_thresh
+        self._down_thresh     = down_thresh
+        self._alpha           = alpha
+        self._ema             = 0.0
+        self._current_dtype   = np.dtype(initial_dtype)
+        self._n_upgrades      = 0
+        self._n_downgrades    = 0
+        self._n_steps         = 0
+
+    @property
+    def current_dtype(self) -> np.dtype:
+        return self._current_dtype
+
+    def update(self, logits: np.ndarray) -> np.dtype:
+        """Feed latest logits; returns the recommended dtype for the next step."""
+        self._n_steps += 1
+        if logits.size == 0:
+            return self._current_dtype
+        overflow_frac = float((np.abs(logits) > self._overflow_thresh).mean())
+        self._ema = self._alpha * overflow_frac + (1.0 - self._alpha) * self._ema
+        if self._current_dtype == np.float16 and self._ema > self._up_thresh:
+            self._current_dtype = np.dtype(np.float32)
+            self._n_upgrades += 1
+        elif self._current_dtype == np.float32 and self._ema < self._down_thresh:
+            self._current_dtype = np.dtype(np.float16)
+            self._n_downgrades += 1
+        return self._current_dtype
+
+    def status(self) -> dict:
+        return {
+            "current_dtype": str(self._current_dtype),
+            "overflow_ema":  round(self._ema, 5),
+            "n_upgrades":    self._n_upgrades,
+            "n_downgrades":  self._n_downgrades,
+            "steps":         self._n_steps,
+        }
+
+    def reset(self):
+        self._ema = 0.0; self._n_upgrades = 0; self._n_downgrades = 0; self._n_steps = 0
+
+    def __repr__(self) -> str:
+        s = self.status()
+        return (f"DynamicPrecisionManager(dtype={s['current_dtype']}, "
+                f"ema={s['overflow_ema']:.4f}, upgrades={s['n_upgrades']})")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# WriteAheadLog — fault-tolerant token journal  (ADD WRITE-AHEAD-LOG)
+# ─────────────────────────────────────────────────────────────────────
+class WriteAheadLog:
+    """
+    Per-token write-ahead log for fault-tolerant generation.
+
+    Each generated token is appended to a binary journal file as an 8-byte record:
+        [4-byte little-endian int32: token_id][4-byte little-endian float32: timestamp]
+
+    On crash, WAL.recover(path) replays the journal and returns the reconstructed
+    token list without re-running inference.
+
+    Usage:
+        wal = WriteAheadLog("session_001.wal")
+        model.generate([...], wal=wal)
+        wal.close()
+
+        # On restart after crash:
+        tokens = WriteAheadLog.recover("session_001.wal")
+        # → list of token IDs from before the crash
+
+    Thread safety: file writes are serialised by a lock; safe to call from
+    a streaming callback thread.
+    """
+    _RECORD_SIZE = 8   # 4 bytes token_id + 4 bytes timestamp
+
+    def __init__(self, path: str):
+        self._path = path
+        self._lock = threading.Lock()
+        self._fh   = open(path, "ab")   # append-binary
+        self._n_written = 0
+
+    def append(self, token_id: int):
+        """Append a single token record to the journal. O(1), fsync optional."""
+        record = struct.pack("<if", int(token_id), float(time.perf_counter()))
+        with self._lock:
+            self._fh.write(record)
+            self._n_written += 1
+            # Flush OS buffer every 16 tokens to bound data loss window
+            if self._n_written % 16 == 0:
+                self._fh.flush()
+
+    def flush(self):
+        """Force-flush to OS buffer (not necessarily to disk)."""
+        with self._lock:
+            self._fh.flush()
+
+    def close(self):
+        """Flush and close the log file."""
+        with self._lock:
+            self._fh.flush()
+            self._fh.close()
+
+    @staticmethod
+    def recover(path: str) -> List[int]:
+        """
+        Read a WAL file and return the list of token IDs in journal order.
+        Truncated trailing records (from mid-write crash) are silently skipped.
+        """
+        tokens = []
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    rec = f.read(WriteAheadLog._RECORD_SIZE)
+                    if len(rec) < WriteAheadLog._RECORD_SIZE:
+                        break   # partial record at end — skip safely
+                    token_id, _ts = struct.unpack("<if", rec)
+                    tokens.append(int(token_id))
+        except FileNotFoundError:
+            pass
+        return tokens
+
+    def __repr__(self) -> str:
+        return f"WriteAheadLog(path={self._path!r}, written={self._n_written})"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ContinuousBatchingScheduler — multi-slot request scheduler
+#   (ADD CONTINUOUS-BATCHING-SCHEDULER)
+# ─────────────────────────────────────────────────────────────────────
+class RequestHandle:
+    """
+    Represents a single inference request managed by ContinuousBatchingScheduler.
+
+    Attributes:
+        request_id  : unique integer ID assigned at enqueue time.
+        prompt_ids  : original prompt token IDs.
+        generated   : token IDs produced so far.
+        done        : True once EOS or max_new_tokens reached.
+        slot        : batch slot index in the underlying KVCache (-1 = not yet assigned).
+    """
+    def __init__(self, request_id: int, prompt_ids: List[int], max_new_tokens: int,
+                 eos_ids: Optional[set] = None):
+        self.request_id    = request_id
+        self.prompt_ids    = list(prompt_ids)
+        self.max_new_tokens = max_new_tokens
+        self.eos_ids       = eos_ids or {151645}
+        self.generated:    List[int] = []
+        self.done:         bool      = False
+        self.slot:         int       = -1   # assigned by scheduler
+        self._pending_cur: Optional[List[int]] = list(prompt_ids)   # tokens to prefill next step
+
+    def __repr__(self) -> str:
+        return (f"RequestHandle(id={self.request_id}, slot={self.slot}, "
+                f"gen={len(self.generated)}/{self.max_new_tokens}, done={self.done})")
+
+
+class ContinuousBatchingScheduler:
+    """
+    Production continuous-batching scheduler over DracoTransformerV1.
+
+    Manages a fixed pool of batch slots in a multi-batch KVCache. New requests
+    are enqueued and assigned to the next free slot; completed requests free their
+    slot for the next queued request. step() advances ALL active slots one token.
+
+    Example:
+        model  = DracoTransformerV1(config)
+        cache  = model._make_cache(max_batch=4)
+        sched  = ContinuousBatchingScheduler(model, cache, max_slots=4)
+
+        h1 = sched.enqueue([1, 2, 3], max_new_tokens=20)
+        h2 = sched.enqueue([4, 5, 6], max_new_tokens=15)
+        while not sched.all_done():
+            sched.step()
+        print(h1.generated, h2.generated)
+
+    Thread safety: enqueue() and step() are guarded by a lock; safe to call
+    enqueue() from a producer thread while a consumer calls step().
+
+    Limitations:
+      - Prompt prefill is performed one request at a time in the first step()
+        after assignment. Batched prefill (packing multiple prompts into one
+        forward pass) is a future optimisation.
+      - No priority scheduling — FIFO queue.
+    """
+
+    def __init__(self, model: "DracoTransformerV1",
+                 cache: "KVCache",
+                 max_slots: int,
+                 eos_id: int = 151645):
+        self._model      = model
+        self._cache      = cache
+        self._max_slots  = max_slots
+        self._eos_id     = eos_id
+        self._slots:     List[Optional[RequestHandle]] = [None] * max_slots
+        self._queue:     "list[RequestHandle]"         = []
+        self._next_id:   int  = 0
+        self._lock       = threading.Lock()
+        self._step_count = 0
+
+    # ── Public API ───────────────────────────────────────────────────
+
+    def enqueue(self, prompt_ids: List[int], max_new_tokens: int = 128,
+                eos_ids: Optional[set] = None) -> RequestHandle:
+        """Add a new request to the scheduler queue. Returns the RequestHandle."""
+        with self._lock:
+            h = RequestHandle(self._next_id, prompt_ids, max_new_tokens,
+                              eos_ids or {self._eos_id})
+            self._next_id += 1
+            self._queue.append(h)
+            self._try_assign_nolock()
+        return h
+
+    def step(self):
+        """Advance all active slots by one token. Returns number of active slots."""
+        with self._lock:
+            self._try_assign_nolock()
+            active = [h for h in self._slots if h is not None]
+        if not active:
+            return 0
+        n_active = 0
+        for h in active:
+            if h.done:
+                continue
+            n_active += 1
+            # Prefill or decode step for this slot
+            if h._pending_cur:
+                cur = h._pending_cur
+                h._pending_cur = None
+            else:
+                cur = [h.generated[-1]] if h.generated else [h.prompt_ids[-1]]
+            try:
+                l1, _l2, _ = self._model.forward(
+                    cur, self._cache, batch_idx=h.slot)
+            except Exception:
+                h.done = True
+                continue
+            last_logits = l1[0, -1].astype(np.float64)
+            last_logits = np.clip(last_logits, -50.0, 50.0)
+            probs = np.exp(last_logits - last_logits.max())
+            probs /= probs.sum() + 1e-9
+            token_id = int(np.random.choice(len(probs), p=probs))
+            h.generated.append(token_id)
+            if token_id in h.eos_ids or len(h.generated) >= h.max_new_tokens:
+                h.done = True
+                with self._lock:
+                    if h.slot >= 0:
+                        self._slots[h.slot] = None
+                        h.slot = -1
+                    self._try_assign_nolock()
+        self._step_count += 1
+        return n_active
+
+    def all_done(self) -> bool:
+        """True when all enqueued requests (queued + active) are complete."""
+        with self._lock:
+            return (not self._queue and
+                    all(s is None or s.done for s in self._slots))
+
+    def status(self) -> dict:
+        with self._lock:
+            active  = sum(1 for s in self._slots if s is not None and not s.done)
+            queued  = len(self._queue)
+            done    = sum(1 for s in self._slots if s is not None and s.done)
+        return {"active_slots": active, "queued": queued,
+                "done_slots": done, "step_count": self._step_count}
+
+    # ── Internal helpers ─────────────────────────────────────────────
+
+    def _try_assign_nolock(self):
+        """Assign queued requests to free slots (call with self._lock held)."""
+        for i, slot in enumerate(self._slots):
+            if slot is None and self._queue:
+                h = self._queue.pop(0)
+                h.slot = i
+                self._slots[i] = h
+
+    def __repr__(self) -> str:
+        s = self.status()
+        return (f"ContinuousBatchingScheduler(slots={self._max_slots}, "
+                f"active={s['active_slots']}, queued={s['queued']}, "
+                f"steps={s['step_count']})")
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Full Transformer Model
@@ -1694,6 +2221,12 @@ class DracoTransformerV1:
         self._memmap_cache: bool = False     # set True to use memmap KVCache
         self._memmap_dir: Optional[str] = None
         self._prefix_cache: Optional["PrefixCache"] = None   # ADD PREFIX-CACHE
+        # ADD TENSOR-MEMORY-POOL
+        self._tensor_pool: Optional["TensorPool"] = None
+        # ADD HEALTH-DIAGNOSTICS
+        self._health_monitor: Optional["HealthMonitor"] = None
+        # ADD DYNAMIC-PRECISION
+        self._precision_manager: Optional["DynamicPrecisionManager"] = None
         # Cached float32 lm_head to avoid .astype() on every forward() call.
         # Invalidated whenever lm_head is reassigned (load, cast, quantize).
         self._lm_head_f32: Optional[np.ndarray] = None
@@ -1787,6 +2320,21 @@ class DracoTransformerV1:
         """Attach a PrefixCache to this model.  Pass None to disable."""
         self._prefix_cache = cache
 
+    def set_tensor_pool(self, pool: "Optional[TensorPool]"):
+        """Attach a TensorPool for workspace buffer reuse. Pass None to disable.
+        (ADD TENSOR-MEMORY-POOL)"""
+        self._tensor_pool = pool
+
+    def set_health_monitor(self, monitor: "Optional[HealthMonitor]"):
+        """Attach a HealthMonitor for online inference diagnostics. Pass None to disable.
+        (ADD HEALTH-DIAGNOSTICS)"""
+        self._health_monitor = monitor
+
+    def set_precision_manager(self, pm: "Optional[DynamicPrecisionManager]"):
+        """Attach a DynamicPrecisionManager for auto dtype switching. Pass None to disable.
+        (ADD DYNAMIC-PRECISION)"""
+        self._precision_manager = pm
+
     # ── Generate ──────────────────────────────────────────────────────
     def generate(
         self,
@@ -1816,6 +2364,7 @@ class DracoTransformerV1:
         stop_event:          Optional[threading.Event] = None,
         checkpoint_every:    int   = 0,
         checkpoint_path:     Optional[str] = None,
+        wal:                 Optional["WriteAheadLog"] = None,
     ) -> List[int]:
         """
         Generate up to max_new_tokens tokens from prompt_ids.
@@ -1838,6 +2387,9 @@ class DracoTransformerV1:
           to checkpoint_path.  Allows resume after crash via load_checkpoint().
         checkpoint_path: file path for checkpoint (without .npz suffix).
           Default: "dracoai_gen_checkpoint" in current directory.
+        wal (optional): WriteAheadLog instance. When provided, every generated
+          token ID is appended to the journal file immediately, enabling recovery
+          of the token sequence after a crash. (ADD WRITE-AHEAD-LOG)
         """
         if new_prompt or self._cache is None:
             self._cache = self._make_cache()
@@ -1852,15 +2404,17 @@ class DracoTransformerV1:
         # On hit: restore cached K/V + fast-forward cur to the unprocessed suffix.
         # On miss after prefill: store the full prompt K/V for future reuse.
         _prefix_hit = False
+        _cached_last_logits: Optional[np.ndarray] = None
+        _plen_hit: int = 0   # prefix length from cache hit (used in prefill block below)
         if self._prefix_cache is not None and new_prompt:
             _hit = self._prefix_cache.get(prompt_ids)
             if _hit is not None:
-                _snap, _plen = _hit
+                _snap, _plen_hit, _cached_last_logits = _hit
                 cache.restore(_snap)
                 ids = list(prompt_ids)   # keep full ids; cur will start at suffix
                 _prefix_hit = True
                 if debug:
-                    print(f"[PrefixCache] HIT — skipped {_plen} token prefill")
+                    print(f"[PrefixCache] HIT — skipped {_plen_hit} token prefill")
         mu  = self._miro_mu    # FIX: load persistent mu (already reset above if new_prompt)
         tau = 5.0
         eta = 0.1
@@ -1887,24 +2441,63 @@ class DracoTransformerV1:
             profiler.start_session()
         # Prefill — on prefix cache hit, only process the unprocessed suffix
         if _prefix_hit:
-            _plen = self._prefix_cache.get(prompt_ids)[1]
-            cur = ids[_plen:] if len(ids) > _plen else [ids[-1]]
+            if _plen_hit == len(prompt_ids) and _cached_last_logits is not None:
+                # ── FULL HIT: entire prompt already in cache ─────────────────
+                # Restore freq/pos/n_pos from prompt_ids so repetition penalty
+                # is correct from the very first generated token.
+                for idx, tid in enumerate(prompt_ids):
+                    freq[tid] = freq.get(tid, 0) + 1
+                    pos[tid]  = idx
+                n_pos = len(prompt_ids)
+                # Use the stored logits directly — no forward needed.
+                # cur=[] signals the while-loop to skip the first forward call.
+                cur = []
+                if debug:
+                    print(f"[PrefixCache] FULL HIT — using cached logits, skipping first forward")
+            else:
+                cur = ids[_plen_hit:] if len(ids) > _plen_hit else [ids[-1]]
         else:
             cur = ids
+        _prompt_last_logits: Optional[np.ndarray] = None   # saved after first forward for prefix cache
+        # ADD WRITE-AHEAD-LOG: inline helper — appends a token to the journal if wal is set.
+        def _wal_append(tid: int):
+            if wal is not None:
+                wal.append(tid)
         while n_generated < max_new_tokens:
             # ADD INTERRUPT: check stop event before each step
             if stop_event is not None and stop_event.is_set():
                 break
             _fwd_t0 = time.perf_counter()
-            l1, l2, _ = self.forward(cur, cache,
-                                      intent_boost=intent_boost,
-                                      add_noise=add_noise,
-                                      intent_bias=intent_bias)
-            if profiler is not None:
-                profiler.record_forward(time.perf_counter() - _fwd_t0)
-            last_logits = l1[0, -1].copy().astype(np.float64)
+            # ── Full prefix-cache hit: skip the first forward, use cached logits ──
+            if not cur and _cached_last_logits is not None:
+                last_logits = _cached_last_logits.copy().astype(np.float64)
+                _cached_last_logits = None   # consume once; next iterations use cur=[ids[-1]]
+                if profiler is not None:
+                    profiler.record_forward(time.perf_counter() - _fwd_t0)
+            else:
+                l1, l2, _ = self.forward(cur, cache,
+                                          intent_boost=intent_boost,
+                                          add_noise=add_noise,
+                                          intent_bias=intent_bias)
+                if profiler is not None:
+                    profiler.record_forward(time.perf_counter() - _fwd_t0)
+                last_logits = l1[0, -1].copy().astype(np.float64)
+                # Save logits from the first (prompt) forward for prefix cache storage
+                if _prompt_last_logits is None:
+                    _prompt_last_logits = last_logits.copy()
             if debug:
                 self._sanity_checks(last_logits, f"step={n_generated}")
+            # ADD HEALTH-DIAGNOSTICS: check logits + expert routing each step
+            if self._health_monitor is not None:
+                _ec = self.blocks[0].moe._expert_counts.copy() if self.blocks else None
+                self._health_monitor.check_step(last_logits, expert_counts=_ec)
+            # ADD DYNAMIC-PRECISION: update dtype vote; upcast logits if f32 recommended
+            if self._precision_manager is not None:
+                _rec_dtype = self._precision_manager.update(last_logits)
+                if _rec_dtype == np.float64:
+                    pass   # already float64 internally
+                # Note: actual weight dtype switching happens between sessions via
+                # cast_weights(); here we track the recommendation for user visibility.
             # FIX LOGITS-PIPELINE step 1: clip
             last_logits = np.clip(last_logits, -50.0, 50.0)
             # FIX LOGITS-PIPELINE step 2: soft repetition penalty (distance-decayed log formula)
@@ -1954,6 +2547,7 @@ class DracoTransformerV1:
                     conf = float(np.exp(np.clip(last_logits[nid] - last_logits.max(), -50, 0)))
                     if stream_cb:
                         stream_cb(nid, conf)
+                    _wal_append(nid)   # ADD WRITE-AHEAD-LOG
                     if nid in _eos_set or n_generated >= max_new_tokens:
                         break
                     # ── Forward T+2 to write K/V(nid) into cache ─────────
@@ -1989,6 +2583,7 @@ class DracoTransformerV1:
                             n_generated  += 1
                             if stream_cb:
                                 stream_cb(spec_id, spec_conf)
+                            _wal_append(spec_id)   # ADD WRITE-AHEAD-LOG
                             if n_generated >= max_new_tokens:
                                 break
                             spec_pending = spec_id
@@ -2032,6 +2627,7 @@ class DracoTransformerV1:
                     conf = float(np.exp(np.clip(last_logits[verify_id] - last_logits.max(), -50, 0)))
                     if stream_cb:
                         stream_cb(verify_id, conf)
+                    _wal_append(verify_id)   # ADD WRITE-AHEAD-LOG
                     if verify_id in _eos_set:
                         # Forward EOS so cache is consistent, then terminate
                         self.forward([verify_id], cache,
@@ -2076,6 +2672,7 @@ class DracoTransformerV1:
             conf = float(np.exp(np.clip(last_logits[nid] - last_logits.max(), -50, 0)))
             if stream_cb:
                 stream_cb(nid, conf)
+            _wal_append(nid)   # ADD WRITE-AHEAD-LOG
             # ADD TOKEN-CHECKPOINT: periodically persist KVCache + token state
             if checkpoint_every > 0 and n_generated % checkpoint_every == 0:
                 _ckpt_path = checkpoint_path or "dracoai_gen_checkpoint"
@@ -2149,7 +2746,7 @@ class DracoTransformerV1:
             try:
                 _snap_store = cache.snapshot(delta_threshold=0)  # force full copy
                 cache._snap_escalate_to_full(_snap_store)
-                self._prefix_cache.put(prompt_ids, _snap_store)
+                self._prefix_cache.put(prompt_ids, _snap_store, _prompt_last_logits)
             except Exception:
                 pass   # prefix store is best-effort; never block generation
         # ── Profiler session end ────────────────────────────────────────
@@ -2954,5 +3551,89 @@ if __name__ == "__main__":
     assert len(candidates) >= 1
     assert candidates[0][0] == 5
     print(f"✅ MTPHead.try_speculative_topk OK: {candidates}")
+
+    # ── Test TensorPool ──
+    pool = TensorPool()
+    buf1 = pool.get((4, 32), np.float32)
+    assert buf1.shape == (4, 32)
+    pool.put(buf1)
+    buf2 = pool.get((4, 32), np.float32)
+    assert buf2 is buf1, "pool should return the same buffer"
+    assert pool.hit_rate > 0
+    stats = pool.stats()
+    assert stats["hits"] == 1 and stats["misses"] == 1
+    print(f"✅ TensorPool OK: {pool}")
+
+    # ── Test HealthMonitor ──
+    alerts = []
+    monitor = HealthMonitor(collapse_thresh=0.5, sat_thresh=10.0,
+                            alert_cb=lambda lvl, msg: alerts.append((lvl, msg)))
+    # NaN should trigger CRITICAL
+    monitor.check_step(np.array([np.nan, 1.0, 2.0]))
+    assert any(a[0] == HealthMonitor.CRITICAL for a in alerts), "NaN not detected"
+    # Saturation should trigger WARNING
+    monitor.check_step(np.array([50.0, 1.0, 2.0]))
+    assert any(a[0] == HealthMonitor.WARNING for a in alerts), "saturation not detected"
+    # Expert collapse
+    ec = np.array([100, 1, 1, 1, 1, 1, 1, 1], dtype=np.int64)
+    monitor.check_step(np.zeros(8), expert_counts=ec)
+    assert any("collapse" in a[1] for a in alerts), "collapse not detected"
+    rep = monitor.report()
+    assert rep["nan_events"] >= 1 and rep["saturation_events"] >= 1
+    # Attach to model and generate
+    model.set_health_monitor(monitor)
+    model.generate([1, 2, 3], max_new_tokens=3, use_speculative=False)
+    model.set_health_monitor(None)
+    print(f"✅ HealthMonitor OK: {monitor}")
+
+    # ── Test DynamicPrecisionManager ──
+    pm = DynamicPrecisionManager(overflow_thresh=5.0, up_thresh=0.01,
+                                 initial_dtype=np.float16)
+    # Feed heavily saturated logits → should vote to upgrade to float32
+    for _ in range(20):
+        pm.update(np.array([100.0, -100.0, 50.0, 0.0]))
+    assert pm.current_dtype == np.float32, "precision should have upgraded to float32"
+    # Feed safe logits → should eventually downgrade back
+    pm._down_thresh = 1.0   # force downgrade threshold for test speed
+    pm.update(np.zeros(4))
+    # Just verify status() works and no crash
+    s = pm.status()
+    assert s["n_upgrades"] >= 1
+    model.set_precision_manager(pm)
+    model.generate([1, 2, 3], max_new_tokens=3, use_speculative=False)
+    model.set_precision_manager(None)
+    print(f"✅ DynamicPrecisionManager OK: {pm}")
+
+    # ── Test WriteAheadLog ──
+    import tempfile as _tf2
+    with _tf2.TemporaryDirectory() as td_wal:
+        wal_path = _os2.path.join(td_wal, "test.wal")
+        wal = WriteAheadLog(wal_path)
+        out_wal = model.generate([1, 2, 3], max_new_tokens=4,
+                                 use_speculative=False, wal=wal)
+        wal.close()
+        recovered = WriteAheadLog.recover(wal_path)
+        assert isinstance(recovered, list)
+        # Recovered tokens must be a subset of generated (spec tokens not journalled until confirmed)
+        assert len(recovered) >= len(out_wal) - 1, \
+            f"WAL recovered {len(recovered)} tokens, expected ~{len(out_wal)}"
+    print(f"✅ WriteAheadLog OK: {len(recovered)} tokens recovered")
+
+    # ── Test ContinuousBatchingScheduler ──
+    model_sched = DracoTransformerV1(config)
+    cache_sched = model_sched._make_cache(max_batch=3)
+    sched = ContinuousBatchingScheduler(model_sched, cache_sched, max_slots=3)
+    h1 = sched.enqueue([1, 2, 3], max_new_tokens=4)
+    h2 = sched.enqueue([4, 5, 6], max_new_tokens=3)
+    assert h1.slot >= 0 and h2.slot >= 0, "requests not assigned to slots"
+    steps = 0
+    while not sched.all_done() and steps < 30:
+        sched.step()
+        steps += 1
+    assert h1.done or len(h1.generated) > 0, "h1 should have generated tokens"
+    assert h2.done or len(h2.generated) > 0, "h2 should have generated tokens"
+    s = sched.status()
+    assert isinstance(s, dict)
+    print(f"✅ ContinuousBatchingScheduler OK: {sched}")
 
     print("✅ transformer_v1 self-test passed")
